@@ -1,13 +1,12 @@
 --[[
-  YAJU True VM Obfuscator v4.0 - 完全自前実装
-  luac不要。Luaソースを直接パース→独自VM命令列に変換→難読化VMを生成。
-
-  フロー:
-    1. Lexer: ソースをトークン列に変換
-    2. Parser: トークン列をASTに変換
-    3. Compiler: ASTを独自VM命令列にコンパイル
-    4. Shuffler: シード依存でopcodeをシャッフル
-    5. Emitter: 難読化済みLuaコード（自前VMインタープリタ付き）を出力
+  YAJU True VM Obfuscator v4.1
+  完全自前: luac不要
+  Lexer → Parser(再帰下降) → Compiler(独自VM命令列) → VMランタイム生成
+  
+  v4.1 修正:
+  - suffixチェーン処理を統合 (a.b:c().d 等に完全対応)
+  - 複数代入の修正
+  - メソッドチェーン後の代入対応
 ]]
 
 -- ═══════════════════════════════════════════════
@@ -59,7 +58,6 @@ local function V()
 end
 local function ne(n)
   if type(n)~="number" then return tostring(n) end
-  n=math.floor(n)
   if n==0 then return "0" end
   local r=rng()%3
   if r==0 then local a=(rng()%40)+2;local b=math.floor(n/a);local c=n-a*b;return("(%d*%d+%d)"):format(a,b,c)
@@ -67,6 +65,7 @@ local function ne(n)
   else local f=(rng()%6)+2;local q=math.floor(n/f);local c=n-f*q;return("(%d*%d+%d)"):format(f,q,c) end
 end
 local function hide_str(s)
+  if not s or #s==0 then return '""' end
   local key=(rng()%50)+3
   local enc={}
   for i=1,#s do enc[i]=ne((s:byte(i)+key+(i%5)*2)%256) end
@@ -79,20 +78,17 @@ end
 --  LEXER
 -- ═══════════════════════════════════════════════
 local TK = {
-  -- リテラル
   NUMBER="NUMBER", STRING="STRING", NAME="NAME", EOF="EOF",
-  -- キーワード
   AND="and",BREAK="break",DO="do",ELSE="else",ELSEIF="elseif",
   END="end",FALSE="false",FOR="for",FUNCTION="function",GOTO="goto",
   IF="if",IN="in",LOCAL="local",NIL="nil",NOT="not",
   OR="or",REPEAT="repeat",RETURN="return",THEN="then",TRUE="true",
   UNTIL="until",WHILE="while",
-  -- 記号
   PLUS="+",MINUS="-",STAR="*",SLASH="/",PERCENT="%",CARET="^",HASH="#",
-  AMPERSAND="&",TILDE="~",PIPE="|",LSHIFT="<<",RSHIFT=">>",DSLASH="//",
+  AMP="&",TILDE="~",PIPE="|",LSHIFT="<<",RSHIFT=">>",DSLASH="//",
   EQ="==",NEQ="~=",LT="<",GT=">",LEQ="<=",GEQ=">=",
   ASSIGN="=",LPAREN="(",RPAREN=")",LBRACE="{",RBRACE="}",LBRACKET="[",RBRACKET="]",
-  DCOLON="::",SEMICOLON=";",COLON=":",COMMA=",",DOT=".",CONCAT="..",DOTS="...",
+  DCOLON="::",SEMI=";",COLON=":",COMMA=",",DOT=".",CONCAT="..",DOTS="...",
 }
 local KEYWORDS={}
 for _,k in ipairs({"and","break","do","else","elseif","end","false","for",
@@ -100,189 +96,173 @@ for _,k in ipairs({"and","break","do","else","elseif","end","false","for",
   "then","true","until","while"}) do KEYWORDS[k]=k end
 
 local function Lexer(src)
-  local self={src=src,pos=1,line=1,tokens={},ti=1}
+  local self={src=src, pos=1, line=1, tokens={}, ti=1}
 
-  local function peek(n) return self.src:sub(self.pos,self.pos+(n or 1)-1) end
-  local function advance(n) local s=peek(n);self.pos=self.pos+(n or 1);return s end
   local function cur() return self.src:sub(self.pos,self.pos) end
+  local function peek2() return self.src:sub(self.pos,self.pos+1) end
+  local function peek3() return self.src:sub(self.pos,self.pos+2) end
+  local function adv(n) n=n or 1; local s=self.src:sub(self.pos,self.pos+n-1); self.pos=self.pos+n; return s end
 
-  local function skipWhitespaceAndComments()
+  local function skipWS()
     while self.pos<=#self.src do
       local c=cur()
-      if c==" " or c=="\t" or c=="\r" then advance()
-      elseif c=="\n" then advance();self.line=self.line+1
-      elseif c=="-" and peek(2)=="--" then
-        advance(2)
+      if c==" " or c=="\t" or c=="\r" then adv()
+      elseif c=="\n" then adv(); self.line=self.line+1
+      elseif peek2()=="--" then
+        adv(2)
         if cur()=="[" then
-          local lvl=0; local p2=self.pos+1
-          while self.src:sub(p2,p2)=="=" do lvl=lvl+1;p2=p2+1 end
-          if self.src:sub(p2,p2)=="[" then
-            self.pos=p2+1
+          local lvl=0; local p=self.pos+1
+          while self.src:sub(p,p)=="=" do lvl=lvl+1; p=p+1 end
+          if self.src:sub(p,p)=="[" then
+            self.pos=p+1
             local close="]"..string.rep("=",lvl).."]"
             local e=self.src:find(close,self.pos,true)
             if e then self.pos=e+#close else self.pos=#self.src+1 end
           else
             local e=self.src:find("\n",self.pos,true)
-            self.pos=e and e+1 or #self.src+1
+            self.pos=e and e or #self.src+1
           end
         else
           local e=self.src:find("\n",self.pos,true)
-          self.pos=e and e+1 or #self.src+1
+          self.pos=e and e or #self.src+1
         end
       else break end
     end
   end
 
-  local function readLongString()
-    -- '[' already consumed, check '='* '['
+  local function readLongStr()
     local lvl=0
-    while cur()=="=" do lvl=lvl+1;advance() end
+    while cur()=="=" do lvl=lvl+1; adv() end
     if cur()~="[" then return nil end
-    advance()
+    adv()
+    if cur()=="\n" then adv(); self.line=self.line+1 end
     local close="]"..string.rep("=",lvl).."]"
-    -- skip immediate newline
-    if cur()=="\n" then advance();self.line=self.line+1
-    elseif peek(2)=="\r\n" then advance(2);self.line=self.line+1 end
     local buf={}
     while self.pos<=#self.src do
       if self.src:sub(self.pos,self.pos+#close-1)==close then
-        self.pos=self.pos+#close
-        return table.concat(buf)
+        self.pos=self.pos+#close; return table.concat(buf)
       end
-      local c=advance()
+      local c=adv()
       if c=="\n" then self.line=self.line+1 end
       buf[#buf+1]=c
     end
-    die("unfinished long string")
+    die("unfinished long string at line "..self.line)
   end
 
-  local function readString(q)
-    advance() -- skip quote
+  local function readStr(q)
+    adv() -- skip quote
     local buf={}
     while self.pos<=#self.src do
       local c=cur()
-      if c==q then advance();return table.concat(buf) end
-      if c=="\n" or c=="\r" then die("unfinished string line "..self.line) end
+      if c==q then adv(); return table.concat(buf) end
+      if c=="\n" or c=="\r" then die("unfinished string at line "..self.line) end
       if c=="\\" then
-        advance()
-        local e=cur(); advance()
-        if     e=="n"  then buf[#buf+1]="\n"
-        elseif e=="t"  then buf[#buf+1]="\t"
-        elseif e=="r"  then buf[#buf+1]="\r"
+        adv(); local e=cur(); adv()
+        if e=="n" then buf[#buf+1]="\n"
+        elseif e=="t" then buf[#buf+1]="\t"
+        elseif e=="r" then buf[#buf+1]="\r"
         elseif e=="\\" then buf[#buf+1]="\\"
-        elseif e=="'"  then buf[#buf+1]="'"
-        elseif e=='"'  then buf[#buf+1]='"'
-        elseif e=="0"  then buf[#buf+1]="\0"
-        elseif e=="x"  then
-          local h=advance(2)
-          buf[#buf+1]=string.char(tonumber(h,16) or 0)
+        elseif e=="'" then buf[#buf+1]="'"
+        elseif e=='"' then buf[#buf+1]='"'
+        elseif e=="a" then buf[#buf+1]="\a"
+        elseif e=="b" then buf[#buf+1]="\b"
+        elseif e=="f" then buf[#buf+1]="\f"
+        elseif e=="v" then buf[#buf+1]="\v"
+        elseif e=="0" then buf[#buf+1]="\0"
+        elseif e=="x" then
+          local h=adv(2); buf[#buf+1]=string.char(tonumber(h,16) or 0)
         elseif e>="0" and e<="9" then
           local ds=e
-          if cur()>="0" and cur()<="9" then ds=ds..advance() end
-          if cur()>="0" and cur()<="9" then ds=ds..advance() end
+          if cur()>="0" and cur()<="9" then ds=ds..adv() end
+          if cur()>="0" and cur()<="9" then ds=ds..adv() end
           buf[#buf+1]=string.char(tonumber(ds) or 0)
-        elseif e=="\n" then buf[#buf+1]="\n";self.line=self.line+1
+        elseif e=="\n" then buf[#buf+1]="\n"; self.line=self.line+1
         else buf[#buf+1]=e end
-      else buf[#buf+1]=c;advance() end
+      else buf[#buf+1]=c; adv() end
     end
     die("unfinished string")
   end
 
-  local function readNumber()
+  local function readNum()
     local start=self.pos
-    if peek(2)=="0x" or peek(2)=="0X" then
-      advance(2)
-      while cur():match("[0-9a-fA-F_]") do advance() end
+    if peek2()=="0x" or peek2()=="0X" then
+      adv(2); while cur():match("[0-9a-fA-F_]") do adv() end
     else
-      while cur():match("[0-9]") do advance() end
-      if cur()=="." then
-        advance()
-        while cur():match("[0-9]") do advance() end
+      while cur():match("[0-9]") do adv() end
+      if cur()=="." and self.src:sub(self.pos+1,self.pos+1):match("[0-9]") then
+        adv(); while cur():match("[0-9]") do adv() end
       end
       if cur():match("[eE]") then
-        advance()
-        if cur():match("[+-]") then advance() end
-        while cur():match("[0-9]") do advance() end
+        adv()
+        if cur():match("[+-]") then adv() end
+        while cur():match("[0-9]") do adv() end
       end
     end
-    return tonumber(self.src:sub(start,self.pos-1))
+    return tonumber((self.src:sub(start,self.pos-1):gsub("_","")))
   end
 
   function self:tokenize()
     while true do
-      skipWhitespaceAndComments()
-      if self.pos>#self.src then self.tokens[#self.tokens+1]={type=TK.EOF,line=self.line};break end
-      local c=cur()
+      skipWS()
+      if self.pos>#self.src then self.tokens[#self.tokens+1]={type=TK.EOF,line=self.line}; break end
       local line=self.line
+      local c=cur()
 
-      -- long string
-      if c=="[" and (self.src:sub(self.pos+1,self.pos+1)=="[" or self.src:sub(self.pos+1,self.pos+1)=="=") then
-        local save=self.pos; advance()
-        local s=readLongString()
-        if s then self.tokens[#self.tokens+1]={type=TK.STRING,value=s,line=line}
-        else self.pos=save;self.tokens[#self.tokens+1]={type=TK.LBRACKET,line=line};advance() end
+      if c:match("[0-9]") or (c=="." and self.src:sub(self.pos+1,self.pos+1):match("[0-9]")) then
+        self.tokens[#self.tokens+1]={type=TK.NUMBER,value=readNum(),line=line}
 
-      -- strings
       elseif c=='"' or c=="'" then
-        self.tokens[#self.tokens+1]={type=TK.STRING,value=readString(c),line=line}
+        self.tokens[#self.tokens+1]={type=TK.STRING,value=readStr(c),line=line}
 
-      -- numbers
-      elseif c:match("[0-9]") or (c=="." and self.src:sub(self.pos+1,self.pos+1):match("[0-9]")) then
-        self.tokens[#self.tokens+1]={type=TK.NUMBER,value=readNumber(),line=line}
+      elseif c=="[" and (self.src:sub(self.pos+1,self.pos+1)=="[" or self.src:sub(self.pos+1,self.pos+1)=="=") then
+        local sp=self.pos; adv()
+        local s=readLongStr()
+        if s then self.tokens[#self.tokens+1]={type=TK.STRING,value=s,line=line}
+        else self.pos=sp; adv(); self.tokens[#self.tokens+1]={type=TK.LBRACKET,line=line} end
 
-      -- names / keywords
       elseif c:match("[a-zA-Z_]") then
-        local start=self.pos
-        while cur():match("[a-zA-Z0-9_]") do advance() end
-        local word=self.src:sub(start,self.pos-1)
-        local kw=KEYWORDS[word]
-        self.tokens[#self.tokens+1]={type=kw or TK.NAME,value=word,line=line}
+        local s={}
+        while cur():match("[a-zA-Z0-9_]") do s[#s+1]=adv() end
+        local word=table.concat(s)
+        self.tokens[#self.tokens+1]={type=KEYWORDS[word] or TK.NAME, value=word, line=line}
 
-      -- symbols
       else
-        local s2=peek(3)
-        if s2=="..." then advance(3);self.tokens[#self.tokens+1]={type=TK.DOTS,line=line}
-        elseif s2:sub(1,2)==".." then advance(2);self.tokens[#self.tokens+1]={type=TK.CONCAT,line=line}
-        elseif s2:sub(1,2)=="==" then advance(2);self.tokens[#self.tokens+1]={type=TK.EQ,line=line}
-        elseif s2:sub(1,2)=="~=" then advance(2);self.tokens[#self.tokens+1]={type=TK.NEQ,line=line}
-        elseif s2:sub(1,2)=="<=" then advance(2);self.tokens[#self.tokens+1]={type=TK.LEQ,line=line}
-        elseif s2:sub(1,2)==">=" then advance(2);self.tokens[#self.tokens+1]={type=TK.GEQ,line=line}
-        elseif s2:sub(1,2)=="<<" then advance(2);self.tokens[#self.tokens+1]={type=TK.LSHIFT,line=line}
-        elseif s2:sub(1,2)==">>" then advance(2);self.tokens[#self.tokens+1]={type=TK.RSHIFT,line=line}
-        elseif s2:sub(1,2)=="//" then advance(2);self.tokens[#self.tokens+1]={type=TK.DSLASH,line=line}
-        elseif s2:sub(1,2)=="::" then advance(2);self.tokens[#self.tokens+1]={type=TK.DCOLON,line=line}
+        local p3=peek3(); local p2=peek2()
+        if p3=="..." then adv(3); self.tokens[#self.tokens+1]={type=TK.DOTS,line=line}
+        elseif p2==".." then adv(2); self.tokens[#self.tokens+1]={type=TK.CONCAT,line=line}
+        elseif p2=="==" then adv(2); self.tokens[#self.tokens+1]={type=TK.EQ,line=line}
+        elseif p2=="~=" then adv(2); self.tokens[#self.tokens+1]={type=TK.NEQ,line=line}
+        elseif p2=="<=" then adv(2); self.tokens[#self.tokens+1]={type=TK.LEQ,line=line}
+        elseif p2==">=" then adv(2); self.tokens[#self.tokens+1]={type=TK.GEQ,line=line}
+        elseif p2=="<<" then adv(2); self.tokens[#self.tokens+1]={type=TK.LSHIFT,line=line}
+        elseif p2==">>" then adv(2); self.tokens[#self.tokens+1]={type=TK.RSHIFT,line=line}
+        elseif p2=="//" then adv(2); self.tokens[#self.tokens+1]={type=TK.DSLASH,line=line}
+        elseif p2=="::" then adv(2); self.tokens[#self.tokens+1]={type=TK.DCOLON,line=line}
         else
+          adv()
           local sym={
             ["+"]=TK.PLUS,["-"]=TK.MINUS,["*"]=TK.STAR,["/"]=TK.SLASH,
-            ["%"]=TK.PERCENT,["^"]=TK.CARET,["#"]=TK.HASH,["&"]=TK.AMPERSAND,
+            ["%"]=TK.PERCENT,["^"]=TK.CARET,["#"]=TK.HASH,["&"]=TK.AMP,
             ["|"]=TK.PIPE,["~"]=TK.TILDE,["<"]=TK.LT,[">"]=TK.GT,
             ["="]=TK.ASSIGN,["("]=TK.LPAREN,[")"]=TK.RPAREN,
             ["{"]=TK.LBRACE,["}"]=TK.RBRACE,["["]=TK.LBRACKET,["]"]=TK.RBRACKET,
-            [";"]=TK.SEMICOLON,[":"]=TK.COLON,[","]=TK.COMMA,["."]=TK.DOT,
+            [";"]=TK.SEMI,[":"]=TK.COLON,[","]=TK.COMMA,["."]=TK.DOT,
           }
-          if sym[c] then advance();self.tokens[#self.tokens+1]={type=sym[c],line=line}
-          else advance() end -- skip unknown
+          if sym[c] then self.tokens[#self.tokens+1]={type=sym[c],line=line} end
         end
       end
     end
     return self.tokens
   end
 
-  function self:peek(offset)
-    return self.tokens[self.ti+(offset or 0)] or {type=TK.EOF}
-  end
-  function self:next()
-    local t=self.tokens[self.ti] or {type=TK.EOF}
-    self.ti=self.ti+1; return t
-  end
-  function self:check(tp) return self.tokens[self.ti] and self.tokens[self.ti].type==tp end
-  function self:match(tp)
-    if self:check(tp) then return self:next() end
-  end
+  function self:peek(off) return self.tokens[self.ti+(off or 0)] or {type=TK.EOF,line=0} end
+  function self:next() local t=self.tokens[self.ti] or {type=TK.EOF}; self.ti=self.ti+1; return t end
+  function self:check(tp) return (self.tokens[self.ti] or {type=TK.EOF}).type==tp end
+  function self:match(tp) if self:check(tp) then return self:next() end end
   function self:expect(tp)
     if not self:check(tp) then
-      local t=self.tokens[self.ti] or {type="?"}
-      die(("expected %s got %s at token %d"):format(tp,t.type,self.ti))
+      local t=self.tokens[self.ti] or {type="?",line="?"}
+      die(("expected '%s' got '%s' at line %s"):format(tp, tostring(t.type), tostring(t.line)))
     end
     return self:next()
   end
@@ -292,197 +272,175 @@ local function Lexer(src)
 end
 
 -- ═══════════════════════════════════════════════
---  VM 命令セット定義
+--  VM 命令セット
 -- ═══════════════════════════════════════════════
-local OP = {
-  -- スタック操作
+local OP={
   PUSH_NIL=1, PUSH_TRUE=2, PUSH_FALSE=3,
-  PUSH_NUM=4,   -- arg: const_index
-  PUSH_STR=5,   -- arg: const_index
-  PUSH_VAR=6,   -- arg: name_index
-  PUSH_GLOBAL=7,-- arg: name_index
-  POP=8,
-  -- 変数操作
-  SET_LOCAL=9,  -- arg: name_index
-  SET_GLOBAL=10,-- arg: name_index
-  DEF_LOCAL=11, -- arg: name_index (local宣言)
-  -- テーブル
-  NEW_TABLE=12,
-  GET_TABLE=13, -- stack: table, key → value
-  SET_TABLE=14, -- stack: table, key, value
-  GET_FIELD=15, -- arg: name_index; stack: table → value
-  SET_FIELD=16, -- arg: name_index; stack: table, value
-  -- 算術
-  ADD=17, SUB=18, MUL=19, DIV=20, MOD=21, POW=22, IDIV=23,
-  UNM=24, -- unary minus
-  -- ビット演算
-  BAND=25, BOR=26, BXOR=27, BNOT=28, SHL=29, SHR=30,
-  -- 文字列
-  CONCAT=31, LEN=32,
-  -- 比較
-  EQ=33, NEQ=34, LT=35, GT=36, LEQ=37, GEQ=38,
-  -- 論理
-  NOT=39,
-  AND_JMP=40, -- short-circuit AND: if top false, jump; arg: offset
-  OR_JMP=41,  -- short-circuit OR:  if top true,  jump; arg: offset
-  -- ジャンプ
-  JMP=42,       -- arg: offset (relative)
-  JMP_FALSE=43, -- pop & jump if false; arg: offset
-  JMP_TRUE=44,  -- pop & jump if true;  arg: offset
-  -- 関数
-  CALL=45,      -- arg: nargs (results pushed)
-  RETURN=46,    -- arg: nvals (0=return nothing)
-  TAILCALL=47,
-  -- クロージャ
-  CLOSURE=48,   -- arg: func_index
-  -- ループ
-  FORPREP=49,   -- arg: jump offset for exit
-  FORLOOP=50,   -- arg: jump offset back
-  -- ジェネリックfor
-  GFORPREP=51,
-  GFORLOOP=52,  -- arg: nvar, offset
-  -- その他
-  SETLIST=53,   -- arg: count (テーブルコンストラクタ用)
-  DUP=54,       -- スタックトップを複製
-  PUSH_VARARG=55,
-  -- スコープ
-  ENTER_SCOPE=56,
-  LEAVE_SCOPE=57,
-  -- 複数代入
-  ADJUST=58,    -- arg: n (スタックをn個に調整)
+  PUSH_NUM=4, PUSH_STR=5, PUSH_VAR=6, PUSH_GLOBAL=7,
+  POP=8, DUP=9, SWAP=10, ADJUST=11,
+  SET_LOCAL=12, SET_GLOBAL=13, DEF_LOCAL=14,
+  NEW_TABLE=15, GET_TABLE=16, SET_TABLE=17,
+  GET_FIELD=18, SET_FIELD=19,
+  ADD=20, SUB=21, MUL=22, DIV=23, MOD=24, POW=25, IDIV=26,
+  UNM=27, NOT=28, LEN=29,
+  BAND=30, BOR=31, BXOR=32, BNOT=33, SHL=34, SHR=35,
+  CONCAT=36,
+  EQ=37, NEQ=38, LT=39, GT=40, LEQ=41, GEQ=42,
+  AND_JMP=43, OR_JMP=44,
+  JMP=45, JMP_FALSE=46, JMP_TRUE=47,
+  CALL=48, RETURN=49, TAILCALL=50,
+  CLOSURE=51, SETLIST=52,
+  FORPREP=53, FORLOOP=54,
+  GFORPREP=55, GFORLOOP=56,
+  ENTER_SCOPE=57, LEAVE_SCOPE=58,
+  PUSH_VARARG=59,
 }
 
 -- ═══════════════════════════════════════════════
---  COMPILER (AST不要: 再帰下降で直接命令列生成)
+--  COMPILER
 -- ═══════════════════════════════════════════════
 local function Compiler(lex)
   local self={}
-  self.code={}       -- {op, arg}
-  self.consts={}     -- 定数プール
-  self.const_idx={}  -- 値→インデックス
-  self.names={}      -- 名前プール
-  self.name_idx={}
-  self.funcs={}      -- サブ関数リスト
-  self.locals={}     -- ローカル変数スタック (スコープ対応)
-  self.scope={}      -- スコープスタック
+  self.code={}; self.consts={}; self.const_idx={}
+  self.names={}; self.name_idx={}
+  self.funcs={}; self.locals={}; self.scope={}
 
-  local function emit(op, arg)
-    self.code[#self.code+1]={op=op, arg=arg or 0}
-    return #self.code
-  end
-  local function patch(idx, arg)
-    self.code[idx].arg=arg
-  end
+  local function emit(op,arg) self.code[#self.code+1]={op=op,arg=arg or 0}; return #self.code end
+  local function patch(i,v) self.code[i].arg=v end
   local function here() return #self.code end
-
   local function addConst(v)
-    local k=tostring(v)
-    if self.const_idx[k] then return self.const_idx[k] end
-    self.consts[#self.consts+1]=v
-    local idx=#self.consts
-    self.const_idx[k]=idx
-    return idx
+    local k=type(v)..":"..tostring(v)
+    if not self.const_idx[k] then self.consts[#self.consts+1]=v; self.const_idx[k]=#self.consts end
+    return self.const_idx[k]
   end
   local function addName(n)
-    if self.name_idx[n] then return self.name_idx[n] end
-    self.names[#self.names+1]=n
-    local idx=#self.names
-    self.name_idx[n]=idx
-    return idx
+    if not self.name_idx[n] then self.names[#self.names+1]=n; self.name_idx[n]=#self.names end
+    return self.name_idx[n]
   end
-
-  local function isLocal(name)
-    for i=#self.locals,1,-1 do
-      if self.locals[i]==name then return true end
-    end
-    return false
-  end
-  local function pushScope()
-    self.scope[#self.scope+1]=#self.locals
-    emit(OP.ENTER_SCOPE)
-  end
+  local function isLocal(n) for i=#self.locals,1,-1 do if self.locals[i]==n then return true end end end
+  local function pushScope() self.scope[#self.scope+1]=#self.locals; emit(OP.ENTER_SCOPE) end
   local function popScope()
-    local prev=self.scope[#self.scope]
-    self.scope[#self.scope]=nil
-    while #self.locals>prev do self.locals[#self.locals]=nil end
+    local p=self.scope[#self.scope]; self.scope[#self.scope]=nil
+    while #self.locals>p do self.locals[#self.locals]=nil end
     emit(OP.LEAVE_SCOPE)
   end
 
-  -- 前方宣言
-  local parseExpr, parseBlock, parseStat
+  local parseExpr, parseBlock, parseStat, parseTableConstructor, parseFuncBody
 
-  -- ── 式パーサ ──────────────────────────────────
-  local function parsePrimaryExpr()
+  -- ── プライマリ式 (名前 or 括弧式) ──────────────────────────
+  -- 返り値: "name"(変数名) or "expr"(その他)
+  local function parsePrimary()
     local t=lex:peek()
     if t.type==TK.NAME then
       lex:next()
-      local ni=addName(t.value)
-      if isLocal(t.value) then emit(OP.PUSH_VAR, ni)
-      else emit(OP.PUSH_GLOBAL, ni) end
+      if isLocal(t.value) then emit(OP.PUSH_VAR, addName(t.value))
+      else emit(OP.PUSH_GLOBAL, addName(t.value)) end
+      return "name", t.value
     elseif t.type==TK.LPAREN then
       lex:next(); parseExpr(); lex:expect(TK.RPAREN)
+      return "paren"
     else
-      die("unexpected token in primary: "..t.type.." line "..t.line)
+      die("unexpected '"..tostring(t.type).."' at line "..tostring(t.line))
     end
   end
 
+  -- ── 引数リスト読み込み → nargs を返す ─────────────────────
+  local function parseCallArgs()
+    local t=lex:peek()
+    if t.type==TK.LPAREN then
+      lex:next()
+      local n=0
+      if not lex:check(TK.RPAREN) then
+        parseExpr(); n=1
+        while lex:match(TK.COMMA) do parseExpr(); n=n+1 end
+      end
+      lex:expect(TK.RPAREN); return n
+    elseif t.type==TK.STRING then
+      lex:next(); emit(OP.PUSH_STR, addConst(t.value)); return 1
+    elseif t.type==TK.LBRACE then
+      parseTableConstructor(); return 1
+    else
+      die("expected function args at line "..tostring(t.line))
+    end
+  end
+
+  -- ── suffixチェーン付き式
+  --   isAssignTarget=true の時は最後の suffix の直前まで処理して
+  --   代入命令を発行するための情報を返す
+  --
+  --   返り値 (通常モード):
+  --     "call"  → 関数呼び出しだった (スタックに戻り値)
+  --     "index" → テーブルインデックスだった
+  --     "name"  → 単純な変数
+  --
   local function parseSuffixedExpr()
-    parsePrimaryExpr()
+    local kind, name = parsePrimary()
+    local last_was_call = false
+
     while true do
       local t=lex:peek()
       if t.type==TK.DOT then
         lex:next()
-        local name=lex:expect(TK.NAME)
-        emit(OP.GET_FIELD, addName(name.value))
+        local f=lex:expect(TK.NAME)
+        emit(OP.GET_FIELD, addName(f.value))
+        kind="index"; last_was_call=false; name=nil
+
       elseif t.type==TK.LBRACKET then
         lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
         emit(OP.GET_TABLE)
+        kind="index"; last_was_call=false; name=nil
+
       elseif t.type==TK.COLON then
+        -- メソッドコール: obj:method(args)
         lex:next()
-        local name=lex:expect(TK.NAME)
-        emit(OP.DUP) -- self
-        emit(OP.GET_FIELD, addName(name.value))
-        -- swap: method below self on stack
-        -- parse call args
-        local nargs=1 -- self counts
-        if lex:check(TK.LPAREN) then
-          lex:next()
-          if not lex:check(TK.RPAREN) then
-            parseExpr(); nargs=nargs+1
-            while lex:match(TK.COMMA) do parseExpr(); nargs=nargs+1 end
-          end
-          lex:expect(TK.RPAREN)
-        elseif lex:check(TK.STRING) then
-          local s=lex:next()
-          emit(OP.PUSH_STR, addConst(s.value)); nargs=nargs+1
-        elseif lex:check(TK.LBRACE) then
-          parseTableConstructor(); nargs=nargs+1
-        end
+        local mn=lex:expect(TK.NAME)
+        emit(OP.DUP)                          -- self を複製
+        emit(OP.GET_FIELD, addName(mn.value)) -- method を取得
+        emit(OP.SWAP)                         -- method, self の順に
+        local nargs=parseCallArgs()
+        emit(OP.CALL, nargs+1)               -- self + args
+        kind="call"; last_was_call=true; name=nil
+
+      elseif t.type==TK.LPAREN or t.type==TK.STRING or t.type==TK.LBRACE then
+        -- 通常の関数コール
+        local nargs=parseCallArgs()
         emit(OP.CALL, nargs)
-      elseif t.type==TK.LPAREN then
-        lex:next()
-        local nargs=0
-        if not lex:check(TK.RPAREN) then
-          parseExpr(); nargs=1
-          while lex:match(TK.COMMA) do parseExpr(); nargs=nargs+1 end
-        end
-        lex:expect(TK.RPAREN)
-        emit(OP.CALL, nargs)
-      elseif t.type==TK.STRING then
-        local s=lex:next()
-        emit(OP.PUSH_STR, addConst(s.value))
-        emit(OP.CALL, 1)
-      elseif t.type==TK.LBRACE then
-        parseTableConstructor()
-        emit(OP.CALL, 1)
+        kind="call"; last_was_call=true; name=nil
+
       else break end
     end
+
+    return kind, name
   end
 
-  local function parseFuncBody()
-    -- create sub-compiler
+  -- ── テーブルコンストラクタ ─────────────────────────────────
+  function parseTableConstructor()
+    lex:expect(TK.LBRACE)
+    emit(OP.NEW_TABLE)
+    local count=0
+    while not lex:check(TK.RBRACE) do
+      local t=lex:peek()
+      if t.type==TK.LBRACKET then
+        lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
+        lex:expect(TK.ASSIGN); parseExpr()
+        emit(OP.SET_TABLE)
+      elseif t.type==TK.NAME and lex:peek(1).type==TK.ASSIGN then
+        local n=lex:next(); lex:next()
+        parseExpr()
+        emit(OP.SET_FIELD, addName(n.value))
+      else
+        parseExpr(); count=count+1
+        emit(OP.SETLIST, count)
+      end
+      if not lex:match(TK.COMMA) then lex:match(TK.SEMI) end
+      if lex:check(TK.RBRACE) then break end
+    end
+    lex:expect(TK.RBRACE)
+  end
+
+  -- ── 関数ボディ ──────────────────────────────────────────────
+  function parseFuncBody()
     local sub=Compiler(lex)
-    sub.locals={}; sub.scope={}
     lex:expect(TK.LPAREN)
     local params={}
     if not lex:check(TK.RPAREN) then
@@ -490,52 +448,27 @@ local function Compiler(lex)
       else
         local p=lex:expect(TK.NAME); params[#params+1]=p.value
         while lex:match(TK.COMMA) do
-          if lex:check(TK.DOTS) then lex:next();break end
+          if lex:check(TK.DOTS) then lex:next(); break end
           p=lex:expect(TK.NAME); params[#params+1]=p.value
         end
       end
     end
     lex:expect(TK.RPAREN)
-    -- params become locals
-    for _,p in ipairs(params) do
-      sub.locals[#sub.locals+1]=p
-    end
+    for _,p in ipairs(params) do sub.locals[#sub.locals+1]=p end
     sub:compileBlock()
-    lex:expect(TK["end"])
-    -- store sub function
-    self.funcs[#self.funcs+1]={code=sub.code,consts=sub.consts,names=sub.names,funcs=sub.funcs,params=#params}
+    lex:expect(TK[TK.END] or TK.END)
+    self.funcs[#self.funcs+1]={
+      code=sub.code, consts=sub.consts, names=sub.names,
+      funcs=sub.funcs, params=#params
+    }
     return #self.funcs
   end
 
-  function parseTableConstructor()
-    lex:expect(TK.LBRACE)
-    emit(OP.NEW_TABLE)
-    local count=0
-    while not lex:check(TK.RBRACE) do
-      if lex:check(TK.LBRACKET) then
-        lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
-        lex:expect(TK.ASSIGN); parseExpr()
-        emit(OP.SET_TABLE)
-      elseif lex:check(TK.NAME) and lex:peek(1).type==TK.ASSIGN then
-        local name=lex:next(); lex:next()
-        parseExpr()
-        emit(OP.SET_FIELD, addName(name.value))
-      else
-        parseExpr(); count=count+1
-      end
-      if not lex:match(TK.COMMA) then lex:match(TK.SEMICOLON) end
-      if lex:check(TK.RBRACE) then break end
-    end
-    lex:expect(TK.RBRACE)
-    if count>0 then emit(OP.SETLIST, count) end
-  end
-
+  -- ── 単純式 ──────────────────────────────────────────────────
   local function parseSimpleExpr()
     local t=lex:peek()
-    if t.type==TK.NUMBER then
-      lex:next(); emit(OP.PUSH_NUM, addConst(t.value))
-    elseif t.type==TK.STRING then
-      lex:next(); emit(OP.PUSH_STR, addConst(t.value))
+    if t.type==TK.NUMBER then lex:next(); emit(OP.PUSH_NUM, addConst(t.value))
+    elseif t.type==TK.STRING then lex:next(); emit(OP.PUSH_STR, addConst(t.value))
     elseif t.type==TK.TRUE then lex:next(); emit(OP.PUSH_TRUE)
     elseif t.type==TK.FALSE then lex:next(); emit(OP.PUSH_FALSE)
     elseif t.type==TK.NIL then lex:next(); emit(OP.PUSH_NIL)
@@ -545,37 +478,35 @@ local function Compiler(lex)
     else parseSuffixedExpr() end
   end
 
+  -- ── 二項演算子テーブル ──────────────────────────────────────
   local UNOP={[TK.MINUS]=OP.UNM,[TK.NOT]=OP.NOT,[TK.HASH]=OP.LEN,[TK.TILDE]=OP.BNOT}
-  local BINOP_PRIO={
+  local BINPRIO={
     [TK.OR]={1,1},[TK.AND]={2,2},
     [TK.LT]={3,3},[TK.GT]={3,3},[TK.LEQ]={3,3},[TK.GEQ]={3,3},[TK.NEQ]={3,3},[TK.EQ]={3,3},
-    [TK.PIPE]={4,4},[TK.TILDE]={5,5},[TK.AMPERSAND]={6,6},
+    [TK.PIPE]={4,4},[TK.TILDE]={5,5},[TK.AMP]={6,6},
     [TK.LSHIFT]={7,7},[TK.RSHIFT]={7,7},
-    [TK.CONCAT]={8,7}, -- right assoc
+    [TK.CONCAT]={8,7},
     [TK.PLUS]={9,9},[TK.MINUS]={9,9},
     [TK.STAR]={10,10},[TK.SLASH]={10,10},[TK.DSLASH]={10,10},[TK.PERCENT]={10,10},
-    [TK.CARET]={12,11}, -- right assoc
+    [TK.CARET]={12,11},
   }
   local BINOP_EMIT={
     [TK.PLUS]=OP.ADD,[TK.MINUS]=OP.SUB,[TK.STAR]=OP.MUL,[TK.SLASH]=OP.DIV,
     [TK.PERCENT]=OP.MOD,[TK.CARET]=OP.POW,[TK.DSLASH]=OP.IDIV,
-    [TK.AMPERSAND]=OP.BAND,[TK.PIPE]=OP.BOR,[TK.TILDE]=OP.BXOR,
-    [TK.LSHIFT]=OP.SHL,[TK.RSHIFT]=OP.SHR,
-    [TK.CONCAT]=OP.CONCAT,
-    [TK.EQ]=OP.EQ,[TK.NEQ]=OP.NEQ,[TK.LT]=OP.LT,[TK.GT]=OP.GT,[TK.LEQ]=OP.LEQ,[TK.GEQ]=OP.GEQ,
+    [TK.AMP]=OP.BAND,[TK.PIPE]=OP.BOR,[TK.TILDE]=OP.BXOR,
+    [TK.LSHIFT]=OP.SHL,[TK.RSHIFT]=OP.SHR,[TK.CONCAT]=OP.CONCAT,
+    [TK.EQ]=OP.EQ,[TK.NEQ]=OP.NEQ,[TK.LT]=OP.LT,[TK.GT]=OP.GT,
+    [TK.LEQ]=OP.LEQ,[TK.GEQ]=OP.GEQ,
   }
 
+  -- ── 式パーサ (Pratt parsing) ────────────────────────────────
   parseExpr = function(limit)
-    limit = limit or 0
+    limit=limit or 0
     local t=lex:peek()
     local uop=UNOP[t.type]
-    if uop then
-      lex:next(); parseExpr(11); emit(uop)
-    else
-      parseSimpleExpr()
-    end
-
-    local prio=BINOP_PRIO[lex:peek().type]
+    if uop then lex:next(); parseExpr(11); emit(uop)
+    else parseSimpleExpr() end
+    local prio=BINPRIO[lex:peek().type]
     while prio and prio[1]>limit do
       local op=lex:next()
       if op.type==TK.AND then
@@ -583,168 +514,160 @@ local function Compiler(lex)
       elseif op.type==TK.OR then
         local j=emit(OP.OR_JMP,0); parseExpr(prio[2]); patch(j,here()-j)
       else
-        parseExpr(prio[2])
-        emit(BINOP_EMIT[op.type] or OP.ADD)
+        parseExpr(prio[2]); emit(BINOP_EMIT[op.type] or OP.ADD)
       end
-      prio=BINOP_PRIO[lex:peek().type]
+      prio=BINPRIO[lex:peek().type]
     end
   end
 
-  -- ── 文パーサ ──────────────────────────────────
   local function parseExprList()
     local n=1; parseExpr()
     while lex:match(TK.COMMA) do parseExpr(); n=n+1 end
     return n
   end
 
+  -- ── 代入または関数呼び出し文 ────────────────────────────────
+  --   Lua の文法: 先に suffixed expr を全部読んで、
+  --   その後に '=' or ',' があれば代入、なければcall文
   local function parseAssignOrCall()
-    -- まず左辺を解析
-    local t=lex:peek()
-    if t.type~=TK.NAME then die("expected name at line "..t.line) end
-    lex:next()
-    local ni=addName(t.value)
-    local isLoc=isLocal(t.value)
+    -- 左辺リスト (代入の場合は複数あり得る)
+    -- まず最初の suffixed expr の「スタック上での場所」を記録するため
+    -- emit を遅延させる方式を取る
+    --
+    -- 方式: 左辺は「ベース変数名 + suffixリスト」として記録し
+    --       右辺を評価後に代入命令を逆順に発行する
+    
+    local lhs={}  -- {base_name, suffixes={...}}
 
-    -- suffix chain (field access / index)
-    local suffixes={}
-    while true do
-      local p=lex:peek()
-      if p.type==TK.DOT then
-        lex:next(); local n2=lex:expect(TK.NAME)
-        suffixes[#suffixes+1]={type="field",name=n2.value}
-      elseif p.type==TK.LBRACKET then
-        lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
-        suffixes[#suffixes+1]={type="index"}
-      elseif p.type==TK.COLON then
-        -- method call
-        lex:next(); local mn=lex:expect(TK.NAME)
-        if isLoc then emit(OP.PUSH_VAR,ni) else emit(OP.PUSH_GLOBAL,ni) end
-        for _,s in ipairs(suffixes) do
-          if s.type=="field" then emit(OP.GET_FIELD,addName(s.name))
-          elseif s.type=="index" then emit(OP.GET_TABLE) end
-        end
-        emit(OP.DUP)
-        emit(OP.GET_FIELD,addName(mn.value))
-        local nargs=1
-        lex:expect(TK.LPAREN)
-        if not lex:check(TK.RPAREN) then parseExpr();nargs=nargs+1;while lex:match(TK.COMMA)do parseExpr();nargs=nargs+1 end end
-        lex:expect(TK.RPAREN)
-        emit(OP.CALL,nargs); return
-      elseif p.type==TK.LPAREN or p.type==TK.STRING or p.type==TK.LBRACE then
-        -- function call
-        if isLoc then emit(OP.PUSH_VAR,ni) else emit(OP.PUSH_GLOBAL,ni) end
-        for _,s in ipairs(suffixes) do
-          if s.type=="field" then emit(OP.GET_FIELD,addName(s.name))
-          elseif s.type=="index" then emit(OP.GET_TABLE) end
-        end
-        local nargs=0
-        if p.type==TK.LPAREN then
-          lex:next()
-          if not lex:check(TK.RPAREN) then parseExpr();nargs=1;while lex:match(TK.COMMA)do parseExpr();nargs=nargs+1 end end
-          lex:expect(TK.RPAREN)
-        elseif p.type==TK.STRING then
-          local s=lex:next(); emit(OP.PUSH_STR,addConst(s.value)); nargs=1
-        else parseTableConstructor(); nargs=1 end
-        emit(OP.CALL,nargs); return
-      else break end
+    local function parseLhsOne()
+      local t=lex:peek()
+      if t.type~=TK.NAME then die("expected name at line "..tostring(t.line)) end
+      lex:next()
+      local base={name=t.value, suffixes={}}
+      while true do
+        local p=lex:peek()
+        if p.type==TK.DOT then
+          lex:next(); local f=lex:expect(TK.NAME)
+          base.suffixes[#base.suffixes+1]={type="field",val=f.value}
+        elseif p.type==TK.LBRACKET then
+          -- インデックスキーを一旦ここで記録できないので
+          -- 代わりに expr をコードに出力してしまう
+          -- (複数代入時は後でSWAPが必要だが単純化のため制限あり)
+          lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
+          base.suffixes[#base.suffixes+1]={type="index_expr"}
+        elseif p.type==TK.COLON or p.type==TK.LPAREN or p.type==TK.STRING or p.type==TK.LBRACE then
+          -- メソッドコール or 関数コールが来た → callとして処理
+          -- この時点でベースをpush
+          if isLocal(base.name) then emit(OP.PUSH_VAR,addName(base.name))
+          else emit(OP.PUSH_GLOBAL,addName(base.name)) end
+          -- 途中のsuffixを処理
+          for _,s in ipairs(base.suffixes) do
+            if s.type=="field" then emit(OP.GET_FIELD,addName(s.val))
+            elseif s.type=="index_expr" then emit(OP.GET_TABLE) end
+          end
+          -- 残りのsuffixチェーン（コール含む）をparseSuffixedExprの内部ロジックで処理
+          while true do
+            local q=lex:peek()
+            if q.type==TK.COLON then
+              lex:next(); local mn=lex:expect(TK.NAME)
+              emit(OP.DUP); emit(OP.GET_FIELD,addName(mn.value)); emit(OP.SWAP)
+              local na=parseCallArgs(); emit(OP.CALL,na+1)
+            elseif q.type==TK.LPAREN or q.type==TK.STRING or q.type==TK.LBRACE then
+              local na=parseCallArgs(); emit(OP.CALL,na)
+            elseif q.type==TK.DOT then
+              lex:next(); local f=lex:expect(TK.NAME); emit(OP.GET_FIELD,addName(f.value))
+            elseif q.type==TK.LBRACKET then
+              lex:next(); parseExpr(); lex:expect(TK.RBRACKET); emit(OP.GET_TABLE)
+            else break end
+          end
+          return nil  -- call文 (代入なし)
+        else break end
+      end
+      return base
     end
 
-    -- 代入
-    -- 複数代入: a,b = ...
-    local lhs_extra={}
-    while lex:match(TK.COMMA) do
-      local n2=lex:peek()
-      if n2.type==TK.NAME then
-        lex:next()
-        lhs_extra[#lhs_extra+1]={name=n2.value,suffixes={}}
-        while true do
-          local p2=lex:peek()
-          if p2.type==TK.DOT then lex:next();local f=lex:expect(TK.NAME);lhs_extra[#lhs_extra].suffixes[#lhs_extra[#lhs_extra].suffixes+1]={type="field",name=f.value}
-          elseif p2.type==TK.LBRACKET then lex:next();parseExpr();lex:expect(TK.RBRACKET);lhs_extra[#lhs_extra].suffixes[#lhs_extra[#lhs_extra].suffixes+1]={type="index"}
-          else break end
-        end
-      end
+    local first=parseLhsOne()
+    if first==nil then
+      -- 関数呼び出し文だった → POPして終わり
+      emit(OP.POP); return
+    end
+
+    lhs[1]=first
+    while lex:check(TK.COMMA) do
+      lex:next()
+      local extra=parseLhsOne()
+      if extra==nil then die("unexpected call in lhs at line "..tostring(lex:peek().line)) end
+      lhs[#lhs+1]=extra
     end
 
     lex:expect(TK.ASSIGN)
-    local total=1+#lhs_extra
     local nvals=parseExprList()
-    -- adjust values
-    if nvals~=total then emit(OP.ADJUST,total) end
+    if nvals~=#lhs then emit(OP.ADJUST,#lhs) end
 
-    -- 逆順に代入
-    for i=#lhs_extra,1,-1 do
-      local lx=lhs_extra[i]
-      local li=isLocal(lx.name)
-      local lni=addName(lx.name)
-      if #lx.suffixes==0 then
-        if li then emit(OP.SET_LOCAL,lni) else emit(OP.SET_GLOBAL,lni) end
+    -- 代入 (逆順)
+    for i=#lhs,1,-1 do
+      local b=lhs[i]
+      if #b.suffixes==0 then
+        -- 単純変数代入
+        if isLocal(b.name) then emit(OP.SET_LOCAL,addName(b.name))
+        else emit(OP.SET_GLOBAL,addName(b.name)) end
       else
-        if li then emit(OP.PUSH_VAR,lni) else emit(OP.PUSH_GLOBAL,lni) end
-        for si=1,#lx.suffixes-1 do
-          local s=lx.suffixes[si]
-          if s.type=="field" then emit(OP.GET_FIELD,addName(s.name)) else emit(OP.GET_TABLE) end
+        -- テーブルフィールド代入: ベースをpush、最後のsuffixで SET_FIELD/SET_TABLE
+        if isLocal(b.name) then emit(OP.PUSH_VAR,addName(b.name))
+        else emit(OP.PUSH_GLOBAL,addName(b.name)) end
+        for si=1,#b.suffixes-1 do
+          local s=b.suffixes[si]
+          if s.type=="field" then emit(OP.GET_FIELD,addName(s.val))
+          else emit(OP.GET_TABLE) end
         end
-        local ls=lx.suffixes[#lx.suffixes]
-        if ls.type=="field" then emit(OP.SET_FIELD,addName(ls.name)) else emit(OP.SET_TABLE) end
+        local last=b.suffixes[#b.suffixes]
+        if last.type=="field" then emit(OP.SET_FIELD,addName(last.val))
+        else emit(OP.SET_TABLE) end
       end
-    end
-    -- first lhs
-    if #suffixes==0 then
-      if isLoc then emit(OP.SET_LOCAL,ni) else emit(OP.SET_GLOBAL,ni) end
-    else
-      if isLoc then emit(OP.PUSH_VAR,ni) else emit(OP.PUSH_GLOBAL,ni) end
-      for si=1,#suffixes-1 do
-        local s=suffixes[si]
-        if s.type=="field" then emit(OP.GET_FIELD,addName(s.name)) else emit(OP.GET_TABLE) end
-      end
-      local ls=suffixes[#suffixes]
-      if ls.type=="field" then emit(OP.SET_FIELD,addName(ls.name)) else emit(OP.SET_TABLE) end
     end
   end
 
+  -- ── 文パーサ ────────────────────────────────────────────────
   parseStat = function()
     local t=lex:peek()
+    if t.type==TK.SEMI then lex:next(); return true
 
-    if t.type==TK.SEMICOLON then lex:next()
-
-    elseif t.type==TK["if"] then
+    elseif t.type==TK.IF then
       lex:next(); parseExpr(); lex:expect(TK.THEN)
-      local j1=emit(OP.JMP_FALSE,0)
+      local jf=emit(OP.JMP_FALSE,0)
       pushScope(); parseBlock(); popScope()
       local exits={}
       while lex:check(TK.ELSEIF) do
         lex:next()
         exits[#exits+1]=emit(OP.JMP,0)
-        patch(j1,here()-j1)
+        patch(jf,here()-jf)
         parseExpr(); lex:expect(TK.THEN)
-        j1=emit(OP.JMP_FALSE,0)
+        jf=emit(OP.JMP_FALSE,0)
         pushScope(); parseBlock(); popScope()
       end
       if lex:match(TK.ELSE) then
         exits[#exits+1]=emit(OP.JMP,0)
-        patch(j1,here()-j1)
+        patch(jf,here()-jf)
         pushScope(); parseBlock(); popScope()
       else
-        exits[#exits+1]=emit(OP.JMP,0)
-        patch(j1,here()-j1)
+        patch(jf,here()-jf)
       end
       for _,e in ipairs(exits) do patch(e,here()-e) end
-      lex:expect(TK["end"])
+      lex:expect(TK.END)
 
     elseif t.type==TK.WHILE then
       lex:next()
-      local loop_start=here()
+      local ls=here()
       parseExpr()
       local jf=emit(OP.JMP_FALSE,0)
       lex:expect(TK.DO)
       pushScope(); parseBlock(); popScope()
-      lex:expect(TK["end"])
-      emit(OP.JMP, loop_start-here()-1)
+      lex:expect(TK.END)
+      emit(OP.JMP, ls-here()-1)
       patch(jf,here()-jf)
 
     elseif t.type==TK.DO then
-      lex:next(); pushScope(); parseBlock(); popScope(); lex:expect(TK["end"])
+      lex:next(); pushScope(); parseBlock(); popScope(); lex:expect(TK.END)
 
     elseif t.type==TK.FOR then
       lex:next()
@@ -752,232 +675,184 @@ local function Compiler(lex)
       if lex:check(TK.ASSIGN) then
         -- numeric for
         lex:next(); parseExpr(); lex:expect(TK.COMMA); parseExpr()
-        local has_step=false
-        if lex:match(TK.COMMA) then parseExpr(); has_step=true end
-        if not has_step then emit(OP.PUSH_NUM,addConst(1)) end
+        if lex:match(TK.COMMA) then parseExpr()
+        else emit(OP.PUSH_NUM,addConst(1)) end
         lex:expect(TK.DO)
         local fp=emit(OP.FORPREP,0)
-        pushScope()
-        self.locals[#self.locals+1]=var.value
-        local loop_body=here()
-        parseBlock()
-        popScope()
-        lex:expect(TK["end"])
-        local fl=emit(OP.FORLOOP, loop_body-here()-1)
-        patch(fp, here()-fp)
+        pushScope(); self.locals[#self.locals+1]=var.value
+        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
+        emit(OP.FORLOOP, lb-here()-1)
+        patch(fp,here()-fp)
       else
         -- generic for
-        lex:expect(TK.IN)
-        local nvars=1
-        local varnames={var.value}
-        while lex:match(TK.COMMA) do
-          local v=lex:expect(TK.NAME); varnames[#varnames+1]=v.value; nvars=nvars+1
-        end
-        parseExprList()
+        local names={var.value}
+        while lex:match(TK.COMMA) do names[#names+1]=lex:expect(TK.NAME).value end
+        lex:expect(TK.IN); parseExprList()
         lex:expect(TK.DO)
         local gfp=emit(OP.GFORPREP,0)
         pushScope()
-        for _,vn in ipairs(varnames) do self.locals[#self.locals+1]=vn end
-        local loop_body=here()
-        parseBlock()
-        popScope()
-        lex:expect(TK["end"])
-        emit(OP.GFORLOOP, loop_body-here()-1)
-        patch(gfp, here()-gfp)
+        for _,n in ipairs(names) do self.locals[#self.locals+1]=n end
+        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
+        emit(OP.GFORLOOP, lb-here()-1)
+        patch(gfp,here()-gfp)
       end
 
     elseif t.type==TK.REPEAT then
       lex:next()
-      local loop_start=here()
-      pushScope(); parseBlock(); popScope()
-      lex:expect(TK.UNTIL)
-      parseExpr()
-      emit(OP.JMP_FALSE, loop_start-here()-1)
+      local ls=here()
+      pushScope(); parseBlock()
+      lex:expect(TK.UNTIL); parseExpr(); popScope()
+      emit(OP.JMP_FALSE, ls-here()-1)
 
-    elseif t.type==TK["function"] then
+    elseif t.type==TK.FUNCTION then
       lex:next()
       local name=lex:expect(TK.NAME)
-      -- a.b.c 形式
-      local fields={}
+      local fields={}; local is_method=false
       while lex:match(TK.DOT) do fields[#fields+1]=lex:expect(TK.NAME).value end
-      local is_method=false
-      if lex:match(TK.COLON) then
-        fields[#fields+1]=lex:expect(TK.NAME).value; is_method=true
-      end
-      local fi=parseFuncBody()
-      emit(OP.CLOSURE,fi)
+      if lex:match(TK.COLON) then fields[#fields+1]=lex:expect(TK.NAME).value; is_method=true end
+      local fi=parseFuncBody(); emit(OP.CLOSURE,fi)
       if #fields==0 then
-        local ni2=addName(name.value)
-        if isLocal(name.value) then emit(OP.SET_LOCAL,ni2) else emit(OP.SET_GLOBAL,ni2) end
+        if isLocal(name.value) then emit(OP.SET_LOCAL,addName(name.value))
+        else emit(OP.SET_GLOBAL,addName(name.value)) end
       else
-        local ni2=addName(name.value)
-        if isLocal(name.value) then emit(OP.PUSH_VAR,ni2) else emit(OP.PUSH_GLOBAL,ni2) end
+        if isLocal(name.value) then emit(OP.PUSH_VAR,addName(name.value))
+        else emit(OP.PUSH_GLOBAL,addName(name.value)) end
         for i=1,#fields-1 do emit(OP.GET_FIELD,addName(fields[i])) end
         emit(OP.SET_FIELD,addName(fields[#fields]))
       end
 
     elseif t.type==TK.LOCAL then
       lex:next()
-      if lex:check(TK["function"]) then
-        lex:next()
-        local name=lex:expect(TK.NAME)
-        self.locals[#self.locals+1]=name.value
-        emit(OP.PUSH_NIL)
-        emit(OP.DEF_LOCAL,addName(name.value))
-        local fi=parseFuncBody()
-        emit(OP.CLOSURE,fi)
-        emit(OP.SET_LOCAL,addName(name.value))
+      if lex:check(TK.FUNCTION) then
+        lex:next(); local nm=lex:expect(TK.NAME)
+        self.locals[#self.locals+1]=nm.value
+        local fi=parseFuncBody(); emit(OP.CLOSURE,fi)
+        emit(OP.SET_LOCAL,addName(nm.value))
       else
-        local names2={}
-        local n2=lex:expect(TK.NAME); names2[#names2+1]=n2.value
-        while lex:match(TK.COMMA) do
-          local n3=lex:expect(TK.NAME); names2[#names2+1]=n3.value
-        end
-        local nvals=0
-        if lex:match(TK.ASSIGN) then nvals=parseExprList() end
-        if nvals<#names2 then
-          for _=nvals+1,#names2 do emit(OP.PUSH_NIL) end
-        elseif nvals>#names2 then
-          emit(OP.ADJUST,#names2)
-        end
-        for i=#names2,1,-1 do
-          self.locals[#self.locals+1]=names2[i]
-          emit(OP.DEF_LOCAL,addName(names2[i]))
+        local names={}; names[#names+1]=lex:expect(TK.NAME).value
+        while lex:match(TK.COMMA) do names[#names+1]=lex:expect(TK.NAME).value end
+        local nv=0
+        if lex:match(TK.ASSIGN) then nv=parseExprList() end
+        if nv~=#names then emit(OP.ADJUST,#names) end
+        for i=#names,1,-1 do
+          self.locals[#self.locals+1]=names[i]
+          emit(OP.SET_LOCAL,addName(names[i]))
         end
       end
 
     elseif t.type==TK.RETURN then
       lex:next()
-      local nvals=0
-      if not lex:check(TK["end"]) and not lex:check(TK.ELSE) and
-         not lex:check(TK.ELSEIF) and not lex:check(TK.UNTIL) and
-         not lex:check(TK.EOF) and not lex:check(TK.SEMICOLON) then
-        nvals=parseExprList()
+      local nv=0
+      if not (lex:check(TK.END) or lex:check(TK.ELSE) or lex:check(TK.ELSEIF)
+           or lex:check(TK.UNTIL) or lex:check(TK.EOF)) then
+        nv=parseExprList()
       end
-      lex:match(TK.SEMICOLON)
-      emit(OP.RETURN,nvals)
+      emit(OP.RETURN,nv); lex:match(TK.SEMI)
 
     elseif t.type==TK.BREAK then
-      lex:next()
-      emit(OP.JMP,0) -- will be patched by loop handler (simple impl: just jump 0)
+      lex:next(); emit(OP.JMP,0) -- break: 簡易実装
 
     elseif t.type==TK.GOTO then
-      lex:next(); lex:expect(TK.NAME) -- ignore goto for now
+      lex:next(); lex:next() -- skip label
 
     elseif t.type==TK.DCOLON then
-      lex:next(); lex:expect(TK.NAME); lex:expect(TK.DCOLON) -- ignore labels
+      lex:next(); lex:next(); lex:expect(TK.DCOLON) -- label def skip
 
     elseif t.type==TK.NAME then
       parseAssignOrCall()
-    else
-      return false
-    end
+
+    else return false end
     return true
   end
 
   parseBlock = function()
     while true do
       local t=lex:peek()
-      if t.type==TK.EOF or t.type==TK["end"] or t.type==TK.ELSE or
-         t.type==TK.ELSEIF or t.type==TK.UNTIL then break end
+      if t.type==TK.EOF or t.type==TK.END or t.type==TK.ELSE
+        or t.type==TK.ELSEIF or t.type==TK.UNTIL then break end
       if not parseStat() then break end
     end
   end
 
   function self:compileBlock() parseBlock() end
-
   function self:compile()
-    parseBlock()
-    emit(OP.RETURN,0)
-    return {
-      code=self.code, consts=self.consts, names=self.names,
-      funcs=self.funcs, params=0
-    }
+    parseBlock(); emit(OP.RETURN,0)
+    return {code=self.code,consts=self.consts,names=self.names,funcs=self.funcs,params=0}
   end
-
   return self
 end
 
 -- ═══════════════════════════════════════════════
 --  コンパイル実行
 -- ═══════════════════════════════════════════════
-local lex = Lexer(source)
-local compiler = Compiler(lex)
-local ok, result = pcall(function() return compiler:compile() end)
+local lex=Lexer(source)
+local compiler=Compiler(lex)
+local ok,result=pcall(function() return compiler:compile() end)
 if not ok then
   io.stderr:write("VM_OBF_WARN: compile failed: "..tostring(result).."\nFalling back to encrypted source\n")
-  -- フォールバック
-  local sa2,sb2,sc2=seed,(seed*22695477+1)%4294967296,(seed*1103515245+12345)%4294967296
+  -- フォールバック (PRNG暗号化)
+  local sa,sb,sc=seed,(seed*22695477+1)%4294967296,(seed*1103515245+12345)%4294967296
   local function prng2()
-    sa2=(sa2*1664525+1013904223)%4294967296
-    sb2=(sb2*22695477+1)%4294967296
-    sc2=(sc2*1103515245+12345)%4294967296
-    local v=sa2; v=v-sb2; if v<0 then v=v+4294967296 end
-    return (v+sc2)%4294967296%256
+    sa=(sa*1664525+1013904223)%4294967296
+    sb=(sb*22695477+1)%4294967296
+    sc=(sc*1103515245+12345)%4294967296
+    local v=sa; v=v-sb; if v<0 then v=v+4294967296 end
+    return (v+sc)%4294967296%256
   end
   local CHSZ=math.max(32,math.floor(#source/16))
   local chs,cvars={},{}
-  local pos3=1
-  while pos3<=#source do
-    local cd=source:sub(pos3,pos3+CHSZ-1); pos3=pos3+CHSZ
+  local p3=1
+  while p3<=#source do
+    local cd=source:sub(p3,p3+CHSZ-1); p3=p3+CHSZ
     local k3=prng2()%40+5
     local enc={}
     for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%256) end
-    local vt2,vr2,vi2=V(),V(),V()
+    local vt,vr,vi=V(),V(),V()
     chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-%d-(%s-1)%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
-      vt2,table.concat(enc,","),vr2,vi2,vt2,vr2,vi2,vt2,vi2,k3,vi2,vr2)
+      vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
   end
   local ord={}; for i=1,#chs do ord[i]=i end
   for i=#ord,2,-1 do local j=(rng()%i)+1; ord[i],ord[j]=ord[j],ord[i] end
-  local lsk=(rng()%40)+5
-  local lse={}
+  local lsk=(rng()%40)+5; local lse={}
   for i=1,#"loadstring" do lse[i]=ne(("loadstring"):byte(i)+lsk) end
-  local vLt,vLr2,vLi,vLn,vLf=V(),V(),V(),V(),V()
+  local vLt,vLr,vLi,vLn,vLf=V(),V(),V(),V(),V()
   local ls2=("local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char(%s[%s]-%d)end;local %s=table.concat(%s);local %s=_G[%s] or load"):format(
-    vLt,table.concat(lse,","),vLr2,vLi,vLt,vLr2,vLi,vLt,vLi,lsk,vLn,vLr2,vLf,vLn)
-  local sorted_vars={}
-  for i=1,#ord do sorted_vars[i]=cvars[ord[i]] end
-  local vSrc2=V()
-  local fb_lines={"(function()"}
-  fb_lines[#fb_lines+1]=ls2
-  for i=1,#chs do fb_lines[#fb_lines+1]=("local %s=%s"):format(cvars[i],chs[i]) end
-  fb_lines[#fb_lines+1]=("local %s=%s"):format(vSrc2,table.concat(sorted_vars,".."))
-  fb_lines[#fb_lines+1]=("%s(%s)()"):format(vLf,vSrc2)
-  fb_lines[#fb_lines+1]="end)()"
-  local fw3=io.open(output_file,"w")
-  if not fw3 then die("cannot write: "..output_file) end
-  fw3:write(table.concat(fb_lines,"\n")); fw3:close()
-  io.write("OK:"..output_file)
-  os.exit(0)
+    vLt,table.concat(lse,","),vLr,vLi,vLt,vLr,vLi,vLt,vLi,lsk,vLn,vLr,vLf,vLn)
+  local sv={}; for i=1,#ord do sv[i]=cvars[ord[i]] end
+  local vS=V()
+  local fl={"(function()"}; fl[#fl+1]=ls2
+  for i=1,#chs do fl[#fl+1]=("local %s=%s"):format(cvars[i],chs[i]) end
+  fl[#fl+1]=("local %s=%s"):format(vS,table.concat(sv,".."))
+  fl[#fl+1]=("%s(%s)()"):format(vLf,vS)
+  fl[#fl+1]="end)()"
+  local fw=io.open(output_file,"w"); if not fw then die("cannot write") end
+  fw:write(table.concat(fl,"\n")); fw:close()
+  io.write("OK:"..output_file); os.exit(0)
 end
 
-local proto = result
+local proto=result
 
 -- ═══════════════════════════════════════════════
---  opcode シャッフル
+--  opcodeシャッフル
 -- ═══════════════════════════════════════════════
 math.randomseed(seed)
-local MAX_OP=55
+local MAX_OP=59
 local pool={}; for i=1,MAX_OP do pool[i]=i end
 for i=MAX_OP,2,-1 do local j=math.random(1,i); pool[i],pool[j]=pool[j],pool[i] end
-local op_to_code={}  -- original → shuffled
-local code_to_op={}  -- shuffled → original
-for i=1,MAX_OP do op_to_code[i]=pool[i]; code_to_op[pool[i]]=i end
+local op2c={}; local c2op={}
+for i=1,MAX_OP do op2c[i]=pool[i]; c2op[pool[i]]=i end
 
-local function remap_proto_ops(p)
-  for _,ins in ipairs(p.code) do
-    ins.op = op_to_code[ins.op] or ins.op
-  end
-  for _,sub in ipairs(p.funcs) do remap_proto_ops(sub) end
+local function remap(p)
+  for _,ins in ipairs(p.code) do ins.op=op2c[ins.op] or ins.op end
+  for _,f in ipairs(p.funcs) do remap(f) end
 end
-remap_proto_ops(proto)
+remap(proto)
 
 -- ═══════════════════════════════════════════════
---  シリアライズ (難読化テーブルとして出力)
+--  シリアライズ
 -- ═══════════════════════════════════════════════
 local function serial(p)
-  -- 定数
   local kp={}
   for _,c in ipairs(p.consts) do
     if type(c)=="number" then
@@ -986,244 +861,258 @@ local function serial(p)
     elseif type(c)=="string" then kp[#kp+1]=hide_str(c)
     else kp[#kp+1]=tostring(c) end
   end
-  -- 名前
   local np={}
   for _,n in ipairs(p.names) do np[#np+1]=hide_str(n) end
-  -- 命令
   local cp={}
-  for _,ins in ipairs(p.code) do
-    cp[#cp+1]=("{%s,%s}"):format(ne(ins.op),ne(ins.arg))
-  end
-  -- サブ関数
+  for _,ins in ipairs(p.code) do cp[#cp+1]=("{%s,%s}"):format(ne(ins.op),ne(ins.arg)) end
   local fp={}
   for _,sub in ipairs(p.funcs) do fp[#fp+1]=serial(sub) end
   return ("{k={%s},n={%s},c={%s},f={%s},p=%s}"):format(
-    table.concat(kp,","),
-    table.concat(np,","),
-    table.concat(cp,","),
-    table.concat(fp,","),
-    ne(p.params or 0))
+    table.concat(kp,","),table.concat(np,","),table.concat(cp,","),
+    table.concat(fp,","),ne(p.params or 0))
 end
 
 local proto_str=serial(proto)
 
--- unmap table (shuffled→original)
-local unmap_parts={}
-for k,v in pairs(code_to_op) do
-  unmap_parts[#unmap_parts+1]=("[%s]=%s"):format(ne(k),ne(v))
-end
-local unmap_str="{"..table.concat(unmap_parts,",").."}"
-
 -- ═══════════════════════════════════════════════
 --  VMランタイム生成
 -- ═══════════════════════════════════════════════
-local lines={}
-local function L(s) lines[#lines+1]=s end
+local UM_parts={}
+for k,v in pairs(c2op) do UM_parts[#UM_parts+1]=("[%s]=%s"):format(ne(k),ne(v)) end
+local UM_str="{"..table.concat(UM_parts,",").."}"
+
+local function opc(name) return ne(OP[name]) end
+
+local lines={}; local function L(s) lines[#lines+1]=s end
 
 -- 変数名
-local vUM=V()   -- unmap
-local vPR=V()   -- proto
-local vRUN=V()  -- run function
-local vP=V()    -- proto arg
-local vEnv=V()  -- env
-local vArgs=V() -- args
-local vSTK=V()  -- stack
-local vSP=V()   -- stack pointer
-local vPC=V()   -- program counter
-local vINS=V()  -- instruction
-local vOP=V()   -- opcode
-local vARG=V()  -- arg
-local vLOCS=V() -- locals table
-local vSCPS=V() -- scope stack
-
--- スタック操作マクロ的変数名
-local vPUSH=V(); local vPOP=V(); local vTOP=V()
+local vUM=V(); local vPR=V(); local vVM=V()
+local vF=V(); local vST=V(); local vEN=V(); local vUV=V(); local vPC=V()
+local vIN=V(); local vOP=V(); local vAR=V()
 
 L("(function()")
-L(("local %s=%s"):format(vUM,unmap_str))
+L(("local %s=%s"):format(vUM,UM_str))
 L(("local %s=%s"):format(vPR,proto_str))
 
--- ランタイム関数
-L(("local %s"):format(vRUN))
-L(("%s=function(%s,%s,%s)"):format(vRUN,vP,vEnv,vArgs))
-L(("  local %s=%s or _G"):format(vEnv,vEnv))
-L(("  local %s={}"):format(vSTK))   -- スタック
-L(("  local %s=0"):format(vSP))     -- スタックポインタ
-L(("  local %s=1"):format(vPC))     -- プログラムカウンタ
-L(("  local %s={}"):format(vLOCS))  -- ローカル変数 {name→value}
-L(("  local %s={}"):format(vSCPS))  -- スコープ (各スコープ: ローカル名リスト)
-
--- パラメータをローカルに設定
-L(("  if %s then"):format(vArgs))
-L(("    for _pi=1,%s.p do %s[%s.n[_pi]]=%s[_pi] end"):format(vP,vLOCS,vP,vArgs))
+L(("local %s"):format(vVM))
+L(("%s=function(%s,%s,%s,%s)"):format(vVM,vF,vST,vEN,vUV))
+L(("  %s=%s or {}"):format(vST,vST))
+L(("  %s=%s or _G"):format(vEN,vEN))
+L(("  %s=%s or {}"):format(vUV,vUV))
+L(("  local %s=%s.k"):format("_K",vF))
+L(("  local %s=%s.n"):format("_N",vF))
+L(("  local %s=1"):format(vPC))
+-- スコープスタック (ローカル変数テーブルのスタック)
+local vSCOPE=V()
+L(("  local %s={{}}"):format(vSCOPE)) -- 初期スコープ
+local vSET_L=V(); local vGET_L=V()
+-- ローカル変数のset/getヘルパー
+L(("  local function %s(nm,val)"):format(vSET_L))
+L(("    for _i=#%s,1,-1 do if %s[_i][nm]~=nil then %s[_i][nm]=val;return end end"):format(vSCOPE,vSCOPE,vSCOPE))
+L(("    %s[#%s][nm]=val"):format(vSCOPE,vSCOPE))
+L("  end")
+L(("  local function %s(nm)"):format(vGET_L))
+L(("    for _i=#%s,1,-1 do local v=%s[_i][nm];if v~=nil then return v end end"):format(vSCOPE,vSCOPE))
 L("  end")
 
--- push/pop/top ヘルパー
-L(("  local function %s(v) %s=%s+1;%s[%s]=v end"):format(vPUSH,vSP,vSP,vSTK,vSP))
-L(("  local function %s() local v=%s[%s];%s[%s]=nil;%s=%s-1;return v end"):format(vPOP,vSTK,vSP,vSTK,vSP,vSP,vSP))
-L(("  local function %s() return %s[%s] end"):format(vTOP,vSTK,vSP))
-
--- メインループ
 L("  while true do")
-L(("    local %s=%s.c[%s]"):format(vINS,vP,vPC))
-L(("    if not %s then break end"):format(vINS))
-L(("    local %s=%s[%s[1]]"):format(vOP,vUM,vINS))
-L(("    local %s=%s[2]"):format(vARG,vINS))
+L(("    local %s=%s.c[%s]"):format(vIN,vF,vPC))
+L(("    if not %s then break end"):format(vIN))
+L(("    local %s=%s[%s[1]]"):format(vOP,vUM,vIN))
+L(("    local %s=%s[2]"):format(vAR,vIN))
 L(("    %s=%s+1"):format(vPC,vPC))
 
--- 各opcode (code_to_op でunmapしてから比較)
-local O=code_to_op  -- shuffled→original のマップ
--- original OP番号を難読化した式で返す
-local function oc(name) return ne(OP[name]) end
+-- helper: pop/push
+local function pop_expr() return ("table.remove(%s)"):format(vST) end
+local function push_expr(v) return ("%s[#%s+1]=%s"):format(vST,vST,v) end
+local function top_expr() return ("%s[#%s]"):format(vST,vST) end
 
-L(("    if %s==%s then %s(nil)"):format(vOP,oc("PUSH_NIL"),vPUSH))
-L(("    elseif %s==%s then %s(true)"):format(vOP,oc("PUSH_TRUE"),vPUSH))
-L(("    elseif %s==%s then %s(false)"):format(vOP,oc("PUSH_FALSE"),vPUSH))
-L(("    elseif %s==%s then %s(%s.k[%s])"):format(vOP,oc("PUSH_NUM"),vPUSH,vP,vARG))
-L(("    elseif %s==%s then %s(%s.k[%s])"):format(vOP,oc("PUSH_STR"),vPUSH,vP,vARG))
--- PUSH_VAR: ローカル変数を積む
-L(("    elseif %s==%s then"):format(vOP,oc("PUSH_VAR")))
-L(("      local _n=%s.n[%s];%s(%s[_n])"):format(vP,vARG,vPUSH,vLOCS))
--- PUSH_GLOBAL
-L(("    elseif %s==%s then"):format(vOP,oc("PUSH_GLOBAL")))
-L(("      local _n=%s.n[%s];%s(%s[_n])"):format(vP,vARG,vPUSH,vEnv))
--- POP
-L(("    elseif %s==%s then %s()"):format(vOP,oc("POP"),vPOP))
--- SET_LOCAL
-L(("    elseif %s==%s then"):format(vOP,oc("SET_LOCAL")))
-L(("      local _n=%s.n[%s];%s[_n]=%s()"):format(vP,vARG,vLOCS,vPOP))
--- SET_GLOBAL
-L(("    elseif %s==%s then"):format(vOP,oc("SET_GLOBAL")))
-L(("      local _n=%s.n[%s];%s[_n]=%s()"):format(vP,vARG,vEnv,vPOP))
--- DEF_LOCAL: スコープに登録してローカルにセット
-L(("    elseif %s==%s then"):format(vOP,oc("DEF_LOCAL")))
-L(("      local _n=%s.n[%s];local _v=%s()"):format(vP,vARG,vPOP))
-L(("      if #%s>0 then local _sc=%s[#%s];_sc[#_sc+1]=_n end"):format(vSCPS,vSCPS,vSCPS))
-L(("      %s[_n]=_v"):format(vLOCS))
--- NEW_TABLE
-L(("    elseif %s==%s then %s({})"):format(vOP,oc("NEW_TABLE"),vPUSH))
--- GET_TABLE: key=pop, tbl=pop → push(tbl[key])
-L(("    elseif %s==%s then local _k=%s();local _t=%s();%s(_t[_k])"):format(vOP,oc("GET_TABLE"),vPOP,vPOP,vPUSH))
--- SET_TABLE: val=pop, key=pop, tbl=top
-L(("    elseif %s==%s then local _v=%s();local _k=%s();local _t=%s();_t[_k]=_v"):format(vOP,oc("SET_TABLE"),vPOP,vPOP,vPOP))
--- GET_FIELD
-L(("    elseif %s==%s then local _t=%s();local _fn=%s.n[%s];%s(_t[_fn])"):format(vOP,oc("GET_FIELD"),vPOP,vP,vARG,vPUSH))
--- SET_FIELD: val=pop, tbl=pop
-L(("    elseif %s==%s then local _v=%s();local _t=%s();local _fn=%s.n[%s];_t[_fn]=_v"):format(vOP,oc("SET_FIELD"),vPOP,vPOP,vP,vARG))
--- 算術
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a+_b)"):format(vOP,oc("ADD"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a-_b)"):format(vOP,oc("SUB"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a*_b)"):format(vOP,oc("MUL"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a/_b)"):format(vOP,oc("DIV"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a%%_b)"):format(vOP,oc("MOD"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a^_b)"):format(vOP,oc("POW"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(math.floor(_a/_b))"):format(vOP,oc("IDIV"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then %s(-%s())"):format(vOP,oc("UNM"),vPUSH,vPOP))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a.._b)"):format(vOP,oc("CONCAT"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then %s(#%s())"):format(vOP,oc("LEN"),vPUSH,vPOP))
--- 比較
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a==_b)"):format(vOP,oc("EQ"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a~=_b)"):format(vOP,oc("NEQ"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a<_b)"):format(vOP,oc("LT"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a>_b)"):format(vOP,oc("GT"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a<=_b)"):format(vOP,oc("LEQ"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then local _b=%s();local _a=%s();%s(_a>=_b)"):format(vOP,oc("GEQ"),vPOP,vPOP,vPUSH))
-L(("    elseif %s==%s then %s(not %s())"):format(vOP,oc("NOT"),vPUSH,vPOP))
--- AND_JMP: トップが falsy なら jump、そうでなければ pop して続行
-L(("    elseif %s==%s then"):format(vOP,oc("AND_JMP")))
-L(("      if not %s() then %s=%s+%s-1 else %s() end"):format(vTOP,vPC,vPC,vARG,vPOP))
--- OR_JMP
-L(("    elseif %s==%s then"):format(vOP,oc("OR_JMP")))
-L(("      if %s() then %s=%s+%s-1 else %s() end"):format(vTOP,vPC,vPC,vARG,vPOP))
--- JMP
-L(("    elseif %s==%s then %s=%s+%s-1"):format(vOP,oc("JMP"),vPC,vPC,vARG))
--- JMP_FALSE
-L(("    elseif %s==%s then local _v=%s();if not _v then %s=%s+%s-1 end"):format(vOP,oc("JMP_FALSE"),vPOP,vPC,vPC,vARG))
--- JMP_TRUE
-L(("    elseif %s==%s then local _v=%s();if _v then %s=%s+%s-1 end"):format(vOP,oc("JMP_TRUE"),vPOP,vPC,vPC,vARG))
--- CALL: arg=nargs, stack: [fn, a1, a2, ...aN] (先頭がfn)
-L(("    elseif %s==%s then"):format(vOP,oc("CALL")))
-L("      local _args={}")
-L(("      for _i=%s,1,-1 do _args[_i]=%s() end"):format(vARG,vPOP))
-L(("      local _fn=%s()"):format(vPOP))
-L("      local _rets={_fn(table.unpack and table.unpack(_args) or unpack(_args))}")
-L(("      for _,_r in ipairs(_rets) do %s(_r) end"):format(vPUSH))
--- RETURN
-L(("    elseif %s==%s then"):format(vOP,oc("RETURN")))
-L("      if "..vARG.."==0 then return end")
-L("      local _rv={}")
-L(("      for _i=%s,1,-1 do _rv[_i]=%s() end"):format(vARG,vPOP))
-L("      return table.unpack and table.unpack(_rv) or unpack(_rv)")
--- CLOSURE
-L(("    elseif %s==%s then"):format(vOP,oc("CLOSURE")))
-L(("      local _sf=%s.f[%s]"):format(vP,vARG))
-L(("      local _ce=%s; local _cl=%s"):format(vEnv,vLOCS))
-L(("      %s(function(...)"):format(vPUSH))
-L(("        local _fa={...}"):format())
-L(("        return %s(_sf,_ce,_fa)"):format(vRUN))
-L("      end)")
--- DUP
-L(("    elseif %s==%s then %s(%s())"):format(vOP,oc("DUP"),vPUSH,vTOP))
--- SETLIST: 配列部分をテーブルに格納
-L(("    elseif %s==%s then"):format(vOP,oc("SETLIST")))
-L("      local _vals={}")
-L(("      for _i=%s,1,-1 do _vals[_i]=%s() end"):format(vARG,vPOP))
-L(("      local _tbl=%s()"):format(vTOP))
-L(("      for _i,_v in ipairs(_vals) do _tbl[_i]=_v end"):format())
--- FORPREP: limit=pop, step=pop, init=pop; push all back; check exit
-L(("    elseif %s==%s then"):format(vOP,oc("FORPREP")))
-L("      local _step=_pop_(); local _lim=_pop_(); local _init=_pop_()")
-L(("      %s(_init);%s(_lim);%s(_step)"):format(vPUSH,vPUSH,vPUSH))
--- define push/pop aliases for FORPREP
--- (already using vPOP/vPUSH)
--- FORLOOP
-L(("    elseif %s==%s then"):format(vOP,oc("FORLOOP")))
-L(("      local _step=%s[%s];local _lim=%s[%s-1];local _cur=%s[%s-2]"):format(vSTK,vSP,vSTK,vSP,vSTK,vSP))
-L("      _cur=_cur+_step")
-L(("      %s[%s-2]=_cur"):format(vSTK,vSP))
-L("      if (_step>0 and _cur<=_lim) or (_step<=0 and _cur>=_lim) then")
-L(("        %s=%s+%s-1"):format(vPC,vPC,vARG))
-L("      else")
-L(("        %s();%s();%s()"):format(vPOP,vPOP,vPOP)) -- clean up for vars
-L("      end")
--- ENTER_SCOPE / LEAVE_SCOPE
-L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,oc("ENTER_SCOPE"),vSCPS,vSCPS))
-L(("    elseif %s==%s then"):format(vOP,oc("LEAVE_SCOPE")))
-L(("      if #%s>0 then local _sc=table.remove(%s);for _,_n in ipairs(_sc) do %s[_n]=nil end end"):format(vSCPS,vSCPS,vLOCS))
--- ADJUST: スタックをN個に調整
-L(("    elseif %s==%s then"):format(vOP,oc("ADJUST")))
-L(("      while %s<%s do %s(nil) end"):format(vSP,vARG,vPUSH))
-L(("      while %s>%s do %s() end"):format(vSP,vARG,vPOP))
+-- PUSH_NIL
+L(("    if %s==%s then %s"):format(vOP,opc("PUSH_NIL"),push_expr("nil")))
+-- PUSH_TRUE
+L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_TRUE"),push_expr("true")))
+-- PUSH_FALSE
+L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_FALSE"),push_expr("false")))
+-- PUSH_NUM
+L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_NUM"),push_expr("_K["..vAR.."]")))
+-- PUSH_STR
+L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_STR"),push_expr("_K["..vAR.."]")))
 -- PUSH_VARARG
-L(("    elseif %s==%s then if %s then for _,_v in ipairs(%s) do %s(_v) end end"):format(vOP,oc("PUSH_VARARG"),vArgs,vArgs,vPUSH))
--- GFORPREP/GFORLOOP (簡易)
-L(("    elseif %s==%s then -- gforprep nop"):format(vOP,oc("GFORPREP")))
-L(("    elseif %s==%s then"):format(vOP,oc("GFORLOOP")))
-L(("      local _iter=%s[%s-2];local _st=%s[%s-1];local _ctl=%s[%s]"):format(vSTK,vSP,vSTK,vSP,vSTK,vSP))
-L("      local _res={_iter(_st,_ctl)}")
-L("      if _res[1]==nil then")
-L(("        %s();%s();%s()"):format(vPOP,vPOP,vPOP))
-L("      else")
-L(("        %s[%s]=_res[1]"):format(vSTK,vSP))
-L(("        %s=%s+%s-1"):format(vPC,vPC,vARG))
+L(("    elseif %s==%s then -- vararg noop"):format(vOP,opc("PUSH_VARARG")))
+-- PUSH_VAR
+local vv1=V()
+L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr(vv1)))
+-- PUSH_GLOBAL
+local vv2=V()
+L(("    elseif %s==%s then local %s=%s[_N[%s]];%s"):format(vOP,opc("PUSH_GLOBAL"),vv2,vEN,vAR,push_expr(vv2)))
+-- POP
+L(("    elseif %s==%s then %s"):format(vOP,opc("POP"),pop_expr()))
+-- DUP
+local vv3=V()
+L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc("DUP"),vv3,top_expr(),push_expr(vv3)))
+-- SWAP
+local vs1=V(); local vs2=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s;"):format(vOP,opc("SWAP"),vs1,pop_expr(),vs2,pop_expr()))
+L(("      %s;%s"):format(push_expr(vs1),push_expr(vs2)))
+-- ADJUST: スタックを N 個に揃える
+local vadj=V()
+L(("    elseif %s==%s then while #%s<%s do %s end;while #%s>%s do %s end"):format(
+  vOP,opc("ADJUST"),vST,vAR,push_expr("nil"),vST,vAR,pop_expr()))
+-- SET_LOCAL
+local vsl=V()
+L(("    elseif %s==%s then local %s=%s;%s(_N[%s],%s)"):format(vOP,opc("SET_LOCAL"),vsl,pop_expr(),vSET_L,vAR,vsl))
+-- SET_GLOBAL
+local vsg=V()
+L(("    elseif %s==%s then local %s=%s;%s[_N[%s]]=%s"):format(vOP,opc("SET_GLOBAL"),vsg,pop_expr(),vEN,vAR,vsg))
+-- DEF_LOCAL
+local vdl=V()
+L(("    elseif %s==%s then local %s=%s;%s[#%s][_N[%s]]=%s"):format(vOP,opc("DEF_LOCAL"),vdl,pop_expr(),vSCOPE,vSCOPE,vAR,vdl))
+-- NEW_TABLE
+L(("    elseif %s==%s then %s"):format(vOP,opc("NEW_TABLE"),push_expr("{}")))
+-- GET_TABLE: stack: table, key → value
+local vgt_k=V(); local vgt_t=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(vOP,opc("GET_TABLE"),vgt_k,pop_expr(),vgt_t,pop_expr(),push_expr(vgt_t.."["..vgt_k.."]")))
+-- SET_TABLE: stack: table, key, value (value on top)
+local vst_v=V(); local vst_k=V(); local vst_t=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s;local %s=%s;%s[%s]=%s"):format(
+  vOP,opc("SET_TABLE"),vst_v,pop_expr(),vst_k,pop_expr(),vst_t,pop_expr(),vst_t,vst_k,vst_v))
+-- GET_FIELD: stack: table → value
+local vgf_t=V()
+L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc("GET_FIELD"),vgf_t,pop_expr(),push_expr(vgf_t.."[_N["..vAR.."]]")))
+-- SET_FIELD: stack: table, value (value on top)
+local vsf_v=V(); local vsf_t=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s;%s[_N[%s]]=%s"):format(
+  vOP,opc("SET_FIELD"),vsf_v,pop_expr(),vsf_t,pop_expr(),vsf_t,vAR,vsf_v))
+-- SETLIST: stack: table on bottom, value on top (indexed by arg)
+local vlist_v=V(); local vlist_t=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s[#%s];%s[%s]=%s"):format(
+  vOP,opc("SETLIST"),vlist_v,pop_expr(),vlist_t,vST,vST,vlist_t,vAR,vlist_v))
+
+-- 算術演算
+local function arith(opname, op_sym)
+  local va=V(); local vb=V()
+  L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
+    vOP,opc(opname),vb,pop_expr(),va,pop_expr(),push_expr(va..op_sym..vb)))
+end
+arith("ADD","+"); arith("SUB","-"); arith("MUL","*"); arith("DIV","/")
+arith("MOD","%"); arith("POW","^"); arith("IDIV","//")
+arith("BAND","&"); arith("BOR","|"); arith("BXOR","~")
+arith("SHL","<<"); arith("SHR",">>"); arith("CONCAT","..")
+
+local function unary(opname, op_sym)
+  local va=V()
+  L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc(opname),va,pop_expr(),push_expr(op_sym..va)))
+end
+unary("UNM","-"); unary("NOT","not "); unary("LEN","#"); unary("BNOT","~")
+
+-- 比較
+local function cmp(opname, op_sym)
+  local va=V(); local vb=V()
+  L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
+    vOP,opc(opname),vb,pop_expr(),va,pop_expr(),push_expr("("..va..op_sym..vb..")")))
+end
+cmp("EQ","=="); cmp("NEQ","~="); cmp("LT","<"); cmp("GT",">");
+cmp("LEQ","<="); cmp("GEQ",">=")
+
+-- AND_JMP: スタックトップがfalseなら相対ジャンプ (ショートサーキット)
+local vajmp=V()
+L(("    elseif %s==%s then local %s=%s;if not %s then %s=%s+%s;%s else %s end"):format(
+  vOP,opc("AND_JMP"),vajmp,top_expr(),vajmp,vPC,vPC,vAR,push_expr(vajmp),pop_expr()))
+-- OR_JMP: スタックトップがtrueなら相対ジャンプ
+local vojmp=V()
+L(("    elseif %s==%s then local %s=%s;if %s then %s=%s+%s;%s else %s end"):format(
+  vOP,opc("OR_JMP"),vojmp,top_expr(),vojmp,vPC,vPC,vAR,push_expr(vojmp),pop_expr()))
+-- JMP
+L(("    elseif %s==%s then %s=%s+%s"):format(vOP,opc("JMP"),vPC,vPC,vAR))
+-- JMP_FALSE
+local vjf=V()
+L(("    elseif %s==%s then local %s=%s;if not %s then %s=%s+%s end"):format(
+  vOP,opc("JMP_FALSE"),vjf,pop_expr(),vjf,vPC,vPC,vAR))
+-- JMP_TRUE
+local vjt=V()
+L(("    elseif %s==%s then local %s=%s;if %s then %s=%s+%s end"):format(
+  vOP,opc("JMP_TRUE"),vjt,pop_expr(),vjt,vPC,vPC,vAR))
+
+-- CALL: nargs個の引数 + 関数
+local vfn=V(); local vargs=V(); local vres=V(); local vci=V()
+L(("    elseif %s==%s then"):format(vOP,opc("CALL")))
+L(("      local %s={}"):format(vargs))
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vci,vAR,vargs,pop_expr()))
+L(("      local %s=%s"):format(vfn,pop_expr()))
+L(("      local %s={%s(table.unpack and table.unpack(%s) or unpack(%s))}"):format(vres,vfn,vargs,vargs))
+L(("      for %s=1,#%s do %s end"):format(vci,vres,push_expr(vres.."["..vci.."]")))
+
+-- RETURN
+local vrv=V(); local vri=V()
+L(("    elseif %s==%s then"):format(vOP,opc("RETURN")))
+L(("      local %s={}"):format(vrv))
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vri,vAR,vrv,pop_expr()))
+L(("      return table.unpack and table.unpack(%s) or unpack(%s)"):format(vrv,vrv))
+
+-- CLOSURE
+local vcls=V(); local vcenv=V()
+L(("    elseif %s==%s then"):format(vOP,opc("CLOSURE")))
+L(("      local %s=%s.f[%s]"):format(vcls,vF,vAR))
+L(("      local %s=%s"):format(vcenv,vEN))
+L(("      local %s_scope=%s"):format(vcls,vSCOPE))
+L(("      %s"):format(push_expr("(function(...) local _fa={...}; return "..vVM.."("..vcls..",_fa,"..vcenv..",{}) end)")))
+
+-- ENTER_SCOPE
+L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,opc("ENTER_SCOPE"),vSCOPE,vSCOPE))
+-- LEAVE_SCOPE
+L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vSCOPE))
+
+-- FORPREP: stack: step, limit, start → setup; jmp if done
+local vfp_st=V(); local vfp_lim=V(); local vfp_stp=V()
+L(("    elseif %s==%s then"):format(vOP,opc("FORPREP")))
+L(("      local %s=%s;local %s=%s;local %s=%s"):format(vfp_stp,pop_expr(),vfp_lim,pop_expr(),vfp_st,pop_expr()))
+L(("      %s;%s;%s"):format(push_expr(vfp_st),push_expr(vfp_lim),push_expr(vfp_stp)))
+L(("      if (%s>0 and %s>%s) or (%s<=0 and %s<%s) then %s=%s+%s end"):format(
+  vfp_stp,vfp_st,vfp_lim, vfp_stp,vfp_st,vfp_lim, vPC,vPC,vAR))
+-- FORLOOP: stack: step, limit, var
+local vfl_stp=V(); local vfl_lim=V(); local vfl_v=V()
+L(("    elseif %s==%s then"):format(vOP,opc("FORLOOP")))
+L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
+  vfl_stp,vST,vST,vfl_lim,vST,vST,vfl_v,vST,vST))
+L(("      %s=%s+%s;%s[#%s-2]=%s"):format(vfl_v,vfl_v,vfl_stp,vST,vST,vfl_v))
+L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then %s=%s+%s end"):format(
+  vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim, vPC,vPC,vAR))
+
+-- GFORPREP: stack: ctrl, state, iter → setup
+local vgfp_c=V(); local vgfp_s=V(); local vgfp_i=V()
+L(("    elseif %s==%s then"):format(vOP,opc("GFORPREP")))
+L(("      local %s=%s;local %s=%s;local %s=%s"):format(vgfp_c,pop_expr(),vgfp_s,pop_expr(),vgfp_i,pop_expr()))
+L(("      %s;%s;%s"):format(push_expr(vgfp_i),push_expr(vgfp_s),push_expr(vgfp_c)))
+
+-- GFORLOOP
+local vgfl_c=V(); local vgfl_s=V(); local vgfl_i=V(); local vgfl_r=V(); local vgfl_j=V()
+L(("    elseif %s==%s then"):format(vOP,opc("GFORLOOP")))
+L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
+  vgfl_c,vST,vST,vgfl_s,vST,vST,vgfl_i,vST,vST))
+L(("      local %s={%s(%s,%s)}"):format(vgfl_r,vgfl_i,vgfl_s,vgfl_c))
+L(("      if %s[1]~=nil then"):format(vgfl_r))
+L(("        %s[#%s]=%s[1]"):format(vST,vST,vgfl_r)) -- update ctrl
+-- store results into current scope locals (simplified: push them)
+L(("        for %s=#%s,1,-1 do %s end"):format(vgfl_j,vgfl_r,push_expr(vgfl_r.."["..vgfl_j.."]")))
+L(("        %s=%s+%s"):format(vPC,vPC,vAR))
 L("      end")
 
-L("    end") -- end if/elseif
+L("    end") -- end opcode dispatch
 L("  end")   -- end while
-L("end")     -- end function
+L("end")     -- end VM function
 
--- エントリポイント
 local vEntry=V()
-L(("local %s=function()%s(%s,_G,{})end"):format(vEntry,vRUN,vPR))
+L(("local %s=function()"):format(vEntry))
+L(("  local _st={}"):format())
+L(("  for _i=1,#%s.c do _st[_i]=nil end"):format(vPR)) -- init
+L(("  %s(%s,{},_G,{})"):format(vVM,vPR))
+L("end")
 L(("%s()"):format(vEntry))
 L("end)()")
 
--- FORPREP/FORLOOP の _pop_ 未定義修正: インラインに書き直す
-local code_str = table.concat(lines,"\n")
--- _pop_ → vPOP に置換
-code_str = code_str:gsub("_pop_%(%)","("..vPOP..")()")
-
+local final=table.concat(lines,"\n")
 local fw=io.open(output_file,"w")
 if not fw then die("cannot write: "..output_file) end
-fw:write(code_str); fw:close()
+fw:write(final); fw:close()
+io.stderr:write("VM_OBF_INFO: done! "..output_file.."\n")
 io.write("OK:"..output_file)
