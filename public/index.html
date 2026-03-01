@@ -685,38 +685,28 @@ function makeLCGConstants() {
   };
 }
 
-/**
- * loadstring / load の参照を難読化
- * ロブロックス(LocalScript)対応:
- *   loadstring → getfenv → require と複数の方法を試みる
- *   全部nilでも最後にpcallで安全に実行
- */
 function makeLoadstringRef(vRef, lite) {
   const sep = lite ? '' : '\n';
-  // ロブロックスではloadstringはServerScriptServiceで有効化が必要だが、
-  // getfenv().script を使ってrequireで代替できる場合もある。
-  // 最も確実なのは loadstring を直接 _G から探す方式。
+  // エクスプロイト環境(Synapse X, KRNL等)ではloadstringは常に使える
+  // 難読化のため文字列分割でアクセスする
   const patterns = [
-    // パターン1: ロブロックス対応 - 複数の取得方法をフォールバック
     () => {
       const parts = ['loa', 'dst', 'rin', 'g'];
       const escaped = parts.map(p => `"${p}"`).join('..');
-      return `(function()local _ok,_f=pcall(function()return assert(rawget(_G,${escaped}) or _G[${escaped}] or load or error())end);if _ok then return _f end;return function(_s)local _fn,_e=loadstring and loadstring(_s);if _fn then return _fn end;_fn,_e=load and load(_s);if _fn then return _fn end;error("loadstring unavailable")end end)()`;
+      return `(rawget(_G,${escaped}) or loadstring)`;
     },
-    // パターン2: string.byte でキー名を復元
     () => {
       const name = 'loadstring';
       const bytes = name.split('').map(c => c.charCodeAt(0));
       const key = Math.floor(Math.random() * 40) + 5;
       const enc = bytes.map(b => (b + key) % 256);
-      return `(function()local _k=${key};local _b={${enc.join(',')}};local _n={};for _i=1,#_b do _n[_i]=string.char(_b[_i]-_k)end;local _s=table.concat(_n);return _G[_s] or load or loadstring end)()`;
+      return `(function()local _k=${key};local _b={${enc.join(',')}};local _n={};for _i=1,#_b do _n[_i]=string.char(_b[_i]-_k)end;return rawget(_G,table.concat(_n)) or loadstring end)()`;
     },
-    // パターン3: シンプルなフォールバック
     () => {
       const mid = Math.floor(Math.random() * 5) + 3;
       const p1 = 'loadstring'.substring(0, mid);
       const p2 = 'loadstring'.substring(mid);
-      return `(_G["${p1}".."${p2}"] or loadstring or load)`;
+      return `(rawget(_G,"${p1}".."${p2}") or loadstring)`;
     },
   ];
   const chosen = patterns[Math.floor(Math.random() * patterns.length)]();
@@ -905,7 +895,7 @@ async function processObfuscation(inputCode, opts) {
     for (let i = 0; i < adjLayers; i++) steps.push(`${vStr}=${vLib}(${vStr})`);
     if (opts.useXor && vXorVar) steps.push(`${vStr}=${vXorVar}(${vStr})`);
     // loadstringの呼び出しも難読化参照を使う（nilチェック付き）
-    steps.push(`local f=type(${vLdRef})=="function" and ${vLdRef}(${vStr});if type(f)=="function" then f()end return`);
+    steps.push(`local _f,_e=${vLdRef}(${vStr});if _f then _f() else error(_e) end return`);
     let vm = '{'; for (let i = 0; i < steps.length; i++) vm += `[${i}]=function()${steps[i]} return ${i === steps.length - 1 ? -1 : i + 1}end,`; vm += '}';
     const vVmSt = generateVarName(lite);
     out += lite
@@ -914,8 +904,8 @@ async function processObfuscation(inputCode, opts) {
   } else {
     for (let i = 0; i < adjLayers; i++) out += lite ? `${vStr}=${vLib}(${vStr})` : `${vStr}=${vLib}(${vStr})\n`;
     if (opts.useXor && vXorVar) out += lite ? `${vStr}=${vXorVar}(${vStr})` : `${vStr}=${vXorVar}(${vStr})\n`;
-    // loadstring() の呼び出しをnilチェック付きで保護
-    out += `if type(${vLdRef})=="function" then local _f,_e=${vLdRef}(${vStr});if type(_f)=="function" then pcall(_f) end end`;
+    // loadstring() の呼び出し（エクスプロイト環境では直接実行）
+    out += `local _f,_e=${vLdRef}(${vStr});if _f then _f() else error(_e) end`;
   }
 
   if (adjJunk > 100) out = injectJunkIntoCode(out, adjJunk, lite, opts);
