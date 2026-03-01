@@ -650,7 +650,9 @@ function makeObfuscatedB64Alphabet(vAlpha, vParts, vConcat, lite) {
   const key = Math.floor(Math.random() * 60) + 3;
   const encChunks = chunks.map(chunk => {
     const bytes = chunk.split('').map(c => c.charCodeAt(0));
-    const enc = bytes.map(b => (b + key) % 128);
+    // % 128 を外してそのまま加算 → Lua側で引き算しても必ず正の値になる
+    // Base64アルファベットは ASCII 43～61 の範囲なので + 63 しても最大 124、安全
+    const enc = bytes.map(b => b + key);
     return `(function()local _t={${enc.join(',')}};local _r={};for _i=1,#_t do _r[_i]=string.char(_t[_i]-${key})end;return table.concat(_r)end)()`;
   });
   const sep = lite ? '' : '\n';
