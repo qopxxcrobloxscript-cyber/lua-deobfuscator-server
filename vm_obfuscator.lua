@@ -59,7 +59,9 @@ local function hide_str(s)
   local enc={}
   for i=1,#s do enc[i]=ne((s:byte(i)+key+(i%5)*2)%256) end
   local vt,vr,vi=V(),V(),V()
-  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-%d-(%s-1)%%5*2+512)%%256)end;return table.concat(%s)end)()"):format(
+  -- BUG FIX: デコード式を (vi%5)*2 に修正（エンコードと同じ式）
+  -- 旧: (%s-1)%%5*2 → i=1でエンコード:2、デコード:0となりズレていた
+  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-%d-%s%%5*2+512)%%256)end;return table.concat(%s)end)()"):format(
     vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
 end
 
@@ -701,7 +703,8 @@ if not ok then
     local enc={}
     for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%256) end
     local vt,vr,vi=V(),V(),V()
-    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-%d-(%s-1)%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
+    -- BUG FIX: フォールバック側も同様に (vi%7)*3 に修正
+    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-%d-%s%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
       vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
   end
@@ -868,7 +871,6 @@ local function arith(opname, op_sym)
     vOP,opc(opname),vb,pop_expr(),va,pop_expr(),push_expr(va..op_sym..vb)))
 end
 local function arith_fn(opname, fn_name)
-  -- ビット演算はヘルパー関数経由
   local va=V(); local vb=V()
   L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
     vOP,opc(opname),vb,pop_expr(),va,pop_expr(),push_expr(vBIT.."."..fn_name.."("..va..","..vb..")")))
@@ -880,13 +882,11 @@ end
 
 arith("ADD","+"); arith("SUB","-"); arith("MUL","*"); arith("DIV","/")
 arith("MOD","%"); arith("POW","^")
--- ★ IDIVもLua5.1互換に (// 演算子はLua5.3以上)
 do
   local va=V(); local vb=V()
   L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
     vOP,opc("IDIV"),vb,pop_expr(),va,pop_expr(),push_expr("math.floor("..va.."/"..vb..")")))
 end
--- ★ ビット演算はLua5.1互換ヘルパーを使う
 arith_fn("BAND","band"); arith_fn("BOR","bor"); arith_fn("BXOR","bxor")
 arith_fn("SHL","shl"); arith_fn("SHR","shr")
 arith("CONCAT","..")
@@ -896,7 +896,6 @@ local function unary(opname, op_sym)
   L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc(opname),va,pop_expr(),push_expr(op_sym..va)))
 end
 unary("UNM","-"); unary("NOT","not "); unary("LEN","#")
--- ★ BNOTもヘルパー経由
 unary_fn("BNOT","bnot")
 
 local function cmp(opname, op_sym)
