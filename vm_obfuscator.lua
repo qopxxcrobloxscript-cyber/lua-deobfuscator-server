@@ -55,21 +55,21 @@ local function ne(n)
 end
 local function hide_str(s)
   if not s or #s==0 then return '""' end
-  -- ★ FIX: keyの最小値を10に増やし、エンコード後に0が出にくくする
-  -- さらに各バイトが1～255の範囲に収まるよう+1オフセットを加える
-  local key=(rng()%40)+10
+  -- ★ FIX: マルチバイト文字(日本語等)対応
+  -- string.byte は生バイト列をそのまま返すので、エンコード/デコードはバイト単位で行う
+  -- ただし string.char(0) (ヌル文字) が生成されると Roblox が
+  -- "Attribute name is missing" を出すため、結果が 1～255 に収まるよう +1 オフセットを加える
+  local key=(rng()%50)+3
   local enc={}
   for i=1,#s do
-    -- ★ FIX: +1 して 1～256 の範囲にし、string.char(0) (ヌル文字) を防ぐ
-    local v = (s:byte(i)+key+(i%5)*2)%255 + 1
-    enc[i]=ne(v)
+    -- (byte + key + offset) % 255 + 1  → 値域 1..255、ヌル文字なし
+    enc[i]=ne((s:byte(i)+key+(i%7)*3)%255+1)
   end
   local vt,vr,vi=V(),V(),V()
-  -- デコード: エンコードの逆算 → (enc - 1 - key - (i%5)*2 + 255*N) % 255 が元のバイト値
-  -- enc = (orig + key + (i%5)*2) % 255 + 1
-  -- orig = (enc - 1 - key - (i%5)*2 + 255*N) % 255
-  -- +510 で確実に正の値にする (2*255=510)
-  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%5*2+510)%%255)end;return table.concat(%s)end)()"):format(
+  -- デコード: enc[i] = (orig + key + (i%7)*3) % 255 + 1
+  -- orig = (enc[i] - 1 - key - (i%7)*3 + 255*N) % 255
+  -- +510 (=255*2) で確実に正の値にする
+  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+510)%%255)end;return table.concat(%s)end)()"):format(
     vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
 end
 
@@ -707,12 +707,12 @@ if not ok then
   local p3=1
   while p3<=#source do
     local cd=source:sub(p3,p3+CHSZ-1); p3=p3+CHSZ
-    local k3=prng2()%30+10
+    local k3=prng2()%40+5
     local enc={}
-    -- ★ FIX: +1 オフセットでヌル文字回避、%255 で 1～255 の範囲に
+    -- ★ FIX: %255+1 でヌル文字(0)を回避
     for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%255+1) end
     local vt,vr,vi=V(),V(),V()
-    -- ★ FIX: デコード式も対応して修正
+    -- デコード: -1 して +510 で正値保証、%255 で元に戻す
     chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+510)%%255)end;return table.concat(%s)end)()"):format(
       vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
