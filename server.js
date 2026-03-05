@@ -99,286 +99,315 @@ async function tryDynamicExecution(code) {
   if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic' };
 
   const tempFile = path.join(tempDir, `obf_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
-
-  // コードをBase64でラップして安全に渡す (エスケープ問題を完全回避)
-  const codeB64 = Buffer.from(code, 'utf8').toString('base64');
+  const codeB64  = Buffer.from(code, 'utf8').toString('base64');
 
   const wrapper = `
--- ══════════════════════════════════════════════════════
---  YAJU VM Deobfuscator - Full Trace Wrapper v3
---  方針: loadstringに渡される文字列を全て順番に記録し
---        最後のものを最終結果として採用する
--- ══════════════════════════════════════════════════════
+-- ══════════════════════════════════════════════════════════════
+--  YAJU Full-Trace Deobfuscator v4
+--
+--  設計方針:
+--   1. loadstring/load フックで「渡された文字列」を全て記録
+--   2. キャプチャしたコードをさらに再帰実行 (最大15段)
+--   3. string.char / table.concat フックで数値配列→文字列も補足
+--   4. VM型: while+opcode ループが loadstring を呼ぶまで追跡
+--   5. 最終段階 (最後にキャプチャされたコード) を出力
+-- ══════════════════════════════════════════════════════════════
 
--- Base64デコーダ (コードを安全に復元)
+-- ── Base64デコーダ ───────────────────────────────────────────
 local function b64decode(s)
   local alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
   local map = {}
-  for i = 1, #alpha do map[string.byte(alpha, i, i)] = i - 1 end
-  local result, p = {}, 1
+  for i = 1, #alpha do map[string.byte(alpha,i,i)] = i-1 end
+  local out, p = {}, 1
   for i = 1, #s, 4 do
-    local a,b,c,d = map[string.byte(s,i,i)], map[string.byte(s,i+1,i+1)], map[string.byte(s,i+2,i+2)], map[string.byte(s,i+3,i+3)]
+    local a = map[string.byte(s,i,i)]
+    local b = map[string.byte(s,i+1,i+1)]
+    local c = map[string.byte(s,i+2,i+2)]
+    local d = map[string.byte(s,i+3,i+3)]
     if not a or not b then break end
-    result[p] = string.char((a*4 + math.floor(b/16)) % 256); p = p + 1
+    out[p]=string.char((a*4+math.floor(b/16))%256); p=p+1
     if not c then break end
-    result[p] = string.char(((b%16)*16 + math.floor(c/4)) % 256); p = p + 1
+    out[p]=string.char(((b%16)*16+math.floor(c/4))%256); p=p+1
     if not d then break end
-    result[p] = string.char(((c%4)*64 + d) % 256); p = p + 1
+    out[p]=string.char(((c%4)*64+d)%256); p=p+1
   end
-  return table.concat(result)
+  return table.concat(out)
 end
 
 local __obf_code = b64decode("${codeB64}")
 
--- ── キャプチャログ (順番が重要) ──────────────────────────────
--- captures[i] = { code=string, source=string }
--- sourceは "loadstring" / "load" / "string.char" / "table.concat"
-local captures = {}
+-- ── ログ ─────────────────────────────────────────────────────
+-- stage_log[i] = { code, source, depth }
+-- 順番が重要: 最後の要素が最終段階
+local stage_log  = {}
+local str_log    = {}   -- string.char/table.concat で生成された文字列
+local __running  = false
 
-local __orig_ls  = loadstring or load
-local __orig_ld  = load or loadstring
-
--- ── Luaスコア判定 ────────────────────────────────────────────
-local function score_lua(s)
-  if not s or #s < 5 then return -1 end
+-- ── Luaコードスコア ──────────────────────────────────────────
+local function lua_score(s)
+  if not s or #s < 4 then return 0 end
   local score = 0
-  local kws = {"local","function","end","if","then","else","return",
-               "for","do","while","print","table","string","math",
-               "loadstring","load","require","pcall","xpcall"}
-  for _, kw in ipairs(kws) do
-    local n = select(2, s:gsub("%f[%a]"..kw.."%f[%A]",""))
-    score = score + n * 10
+  for _, kw in ipairs({"local","function","end","if","then","return",
+                        "for","do","while","loadstring","load","require",
+                        "pcall","string","table","math","print"}) do
+    local _, n = s:gsub("%f[%a]"..kw.."%f[%A]","")
+    score = score + n * 8
   end
-  local sample = math.min(#s, 3000)
-  local printable = 0
+  local sample = math.min(#s, 2000)
+  local pr = 0
   for i = 1, sample do
     local c = s:byte(i)
-    if c >= 32 and c <= 126 then printable = printable + 1 end
+    if c >= 32 and c <= 126 then pr = pr + 1 end
   end
-  score = score + (printable / sample) * 100
-  return score
+  return score + (pr / sample) * 80
 end
 
--- ── 1. Roblox/エクスプロイト環境スタブ ──────────────────────
-local task = rawget(_G, "task") or {}
-task.wait   = function() end
-task.spawn  = function(f,...) pcall(f,...) end
-task.defer  = function(f,...) pcall(f,...) end
-task.delay  = function(t,f,...) pcall(f,...) end
-task.cancel = function() end
-rawset(_G, "task", task)
-
-rawset(_G, "wait",           function() end)
-rawset(_G, "spawn",          function(f,...) pcall(f,...) end)
-rawset(_G, "delay",          function(t,f,...) pcall(f,...) end)
-rawset(_G, "getgenv",        function() return _G end)
-rawset(_G, "getrenv",        function() return _G end)
-rawset(_G, "getsenv",        function() return _G end)
-rawset(_G, "hookfunction",   function(f,h) return f end)
-rawset(_G, "newcclosure",    function(f) return f end)
-rawset(_G, "iscclosure",     function() return false end)
-rawset(_G, "islclosure",     function() return true end)
-rawset(_G, "checkcaller",    function() return false end)
-rawset(_G, "isexecutorclosure", function() return false end)
-rawset(_G, "saveinstance",   function() end)
-rawset(_G, "dumpstring",     function() end)
-rawset(_G, "readfile",       function() return "" end)
-rawset(_G, "writefile",      function() end)
-rawset(_G, "appendfile",     function() end)
-rawset(_G, "listfiles",      function() return {} end)
-rawset(_G, "getrawmetatable",function(t) return getmetatable(t) end)
-rawset(_G, "setrawmetatable",function(t,m) return setmetatable(t,m) end)
-rawset(_G, "rconsoleprint",  function() end)
-rawset(_G, "rconsolewarn",   function() end)
-rawset(_G, "rconsoleerr",    function() end)
-
--- Instance系
-local function __stub_obj()
-  return setmetatable({}, {
-    __index    = function(t,k) return __stub_obj() end,
+-- ── スタブオブジェクト ────────────────────────────────────────
+local function stub()
+  return setmetatable({},{
+    __index    = function(t,k) return stub() end,
     __newindex = function() end,
-    __call     = function() return __stub_obj() end,
+    __call     = function(...) return stub() end,
+    __tostring = function() return "" end,
+    __len      = function() return 0 end,
   })
 end
-rawset(_G, "game",      __stub_obj())
-rawset(_G, "workspace", __stub_obj())
-rawset(_G, "script",    __stub_obj())
-rawset(_G, "Instance",  { new = function() return __stub_obj() end })
-rawset(_G, "Vector3",   { new = function(x,y,z) return {x=x or 0,y=y or 0,z=z or 0} end })
-rawset(_G, "CFrame",    { new = function(...) return __stub_obj() end })
-rawset(_G, "Color3",    { new = function(...) return {} end, fromRGB = function(...) return {} end })
-rawset(_G, "UDim2",     { new = function(...) return {} end })
-rawset(_G, "Enum",      setmetatable({},{__index=function(t,k) return setmetatable({},{__index=function(t2,k2) return k2 end}) end}))
-rawset(_G, "Players",   { LocalPlayer = { Character=nil, UserId=0, Name="Player", GetMouse=function() return {} end } })
-rawset(_G, "RunService",{
-  Heartbeat    = { Connect=function() return {Disconnect=function()end} end, Wait=function() return 0 end },
-  RenderStepped= { Connect=function() return {Disconnect=function()end} end, Wait=function() return 0 end },
-  Stepped      = { Connect=function() return {Disconnect=function()end} end, Wait=function() return 0 end },
-})
-rawset(_G, "UserInputService", __stub_obj())
-rawset(_G, "TweenService",     { Create=function() return {Play=function()end} end })
-rawset(_G, "HttpService",      { JSONDecode=function() return {} end, JSONEncode=function() return "{}" end })
 
--- ── 2. アンチデバッグ無効化 ─────────────────────────────────
+-- ── Roblox/エクスプロイト環境スタブ ─────────────────────────
+local stubs = {
+  wait=function()end, spawn=function(f,...)pcall(f,...)end,
+  delay=function(t,f,...)pcall(f,...)end,
+  getgenv=function()return _G end, getrenv=function()return _G end,
+  getsenv=function()return _G end,
+  hookfunction=function(f)return f end,
+  newcclosure=function(f)return f end,
+  iscclosure=function()return false end,
+  islclosure=function()return true end,
+  checkcaller=function()return false end,
+  isexecutorclosure=function()return false end,
+  saveinstance=function()end, dumpstring=function()end,
+  readfile=function()return""end, writefile=function()end,
+  appendfile=function()end, listfiles=function()return{}end,
+  getrawmetatable=function(t)return getmetatable(t)end,
+  setrawmetatable=function(t,m)return setmetatable(t,m)end,
+  rconsoleprint=function()end, rconsolewarn=function()end,
+  rconsoleerr=function()end,
+  printidentity=function()end,
+  identifyexecutor=function()return"",2 end,
+  getexecutorname=function()return""end,
+  game=stub(), workspace=stub(), script=stub(),
+  Instance={new=function()return stub()end},
+  Vector3={new=function(x,y,z)return{x=x or 0,y=y or 0,z=z or 0}end},
+  CFrame={new=function(...)return stub()end,fromEulerAnglesXYZ=function(...)return stub()end},
+  Color3={new=function(...)return{}end,fromRGB=function(...)return{}end},
+  UDim2={new=function(...)return{}end},
+  Enum=setmetatable({},{__index=function(t,k)return setmetatable({},{__index=function(t2,k2)return k2 end})end}),
+  Players={LocalPlayer={Character=nil,UserId=0,Name="Player",GetMouse=function()return stub()end}},
+  RunService={
+    Heartbeat={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
+    RenderStepped={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
+    Stepped={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
+    IsStudio=function()return false end,
+  },
+  UserInputService=stub(), TweenService={Create=function()return{Play=function()end}end},
+  HttpService={JSONDecode=function()return{}end,JSONEncode=function()return"{}"end},
+  task={wait=function()end,spawn=function(f,...)pcall(f,...)end,
+        defer=function(f,...)pcall(f,...)end,delay=function(t,f,...)pcall(f,...)end,cancel=function()end},
+}
+for k,v in pairs(stubs) do rawset(_G,k,v) end
+
+-- ── アンチデバッグ無効化 ─────────────────────────────────────
 pcall(function()
   if debug then
-    debug.sethook    = function() end
-    debug.getinfo    = function() return {} end
-    debug.getlocal   = function() return nil end
-    debug.setlocal   = function() end
-    debug.getupvalue = function() return nil end
-    debug.setupvalue = function() end
-    debug.traceback  = function() return "" end
+    debug.sethook=function()end
+    debug.getinfo=function()return{}end
+    debug.getlocal=function()return nil end
+    debug.setlocal=function()end
+    debug.getupvalue=function()return nil end
+    debug.setupvalue=function()end
+    debug.traceback=function()return""end
   end
 end)
 
--- ── 3. string.char / table.concat フック ────────────────────
---  VM内で生成される文字列を全て補足する
-local __orig_strchar  = string.char
-local __orig_tblconcat = table.concat
+-- ── 原本の関数を保存 ────────────────────────────────────────
+local __orig_ls      = loadstring or load
+local __orig_ld      = load or loadstring
+local __orig_strchar = string.char
+local __orig_concat  = table.concat
+local __orig_pcall   = pcall
+local __orig_xpcall  = xpcall
 
-string.char = function(...)
-  local r = __orig_strchar(...)
-  -- 長さ8以上でLuaスコアが高いものだけキャプチャ
-  if #r >= 8 then
-    local sc = score_lua(r)
-    if sc >= 30 then
-      captures[#captures+1] = { code=r, source="string.char", score=sc }
-    end
+-- ── 多段トレース実行エンジン ─────────────────────────────────
+-- depth: 現在の再帰深度
+-- seen:  既に実行したコードのハッシュ集合 (無限ループ防止)
+local MAX_DEPTH   = 15
+local MAX_INSTR   = 6000000
+local seen_codes  = {}
+
+local function simple_hash(s)
+  local h = 0
+  local step = math.max(1, math.floor(#s / 64))
+  for i = 1, #s, step do
+    h = (h * 31 + s:byte(i)) % 1000000007
   end
-  return r
+  return h .. "_" .. #s
 end
 
-table.concat = function(t, sep, i, j)
-  local r = __orig_tblconcat(t, sep, i, j)
-  if type(r) == "string" and #r >= 8 then
-    local sc = score_lua(r)
-    if sc >= 30 then
-      captures[#captures+1] = { code=r, source="table.concat", score=sc }
-    end
-  end
-  return r
-end
+-- 前方宣言
+local trace_execute
 
--- ── 4. loadstring/load 多重フック ───────────────────────────
---  全ての呼び出しを記録し、元の関数も呼び出す
---  ★ 多段VM対策: 返されたchunkも自動実行してさらに深くトレース
-local __hook_depth = 0
-local __MAX_DEPTH  = 10  -- 最大再帰深度
-
-local function __make_hook(orig_fn)
+-- loadstring/load フック生成
+local function make_ls_hook(depth)
   return function(code_str, chunkname, ...)
-    if type(code_str) == "string" and #code_str > 10 then
-      local sc = score_lua(code_str)
-      captures[#captures+1] = { code=code_str, source="loadstring", score=sc }
-    end
-    local chunk, err = orig_fn(code_str, chunkname, ...)
-    if chunk and type(chunk) == "function" and __hook_depth < __MAX_DEPTH then
-      -- 返されたchunkをラップして自動実行時もフックが効くようにする
-      local orig_chunk = chunk
-      chunk = function(...)
-        __hook_depth = __hook_depth + 1
-        local ok, res = pcall(orig_chunk, ...)
-        __hook_depth = __hook_depth - 1
-        if not ok then
-          -- エラーでも途中で生成されたキャプチャは保持
+    local chunk, err
+    if type(code_str) == "string" and #code_str > 8 then
+      -- ログに記録
+      local sc = lua_score(code_str)
+      stage_log[#stage_log+1] = { code=code_str, source="loadstring", depth=depth, score=sc }
+
+      -- コンパイル
+      chunk, err = __orig_ls(code_str, chunkname, ...)
+
+      -- 次段階を非同期に追跡 (再帰実行)
+      if chunk and depth < MAX_DEPTH then
+        local hash = simple_hash(code_str)
+        if not seen_codes[hash] then
+          seen_codes[hash] = true
+          trace_execute(code_str, depth + 1)
         end
-        return res
       end
+    else
+      chunk, err = __orig_ls(code_str, chunkname, ...)
     end
     return chunk, err
   end
 end
 
-local __hook = __make_hook(__orig_ls)
-rawset(_G, "loadstring", __hook)
-rawset(_G, "load",       __hook)
-
--- metatableでも捕捉
-pcall(function()
-  local mt = getmetatable(_G) or {}
-  local orig_idx = mt.__index
-  mt.__index = function(t, k)
-    if k == "loadstring" or k == "load" then return __hook end
-    if orig_idx then
-      if type(orig_idx) == "function" then return orig_idx(t, k) end
-      return orig_idx[k]
+-- string.charフック: 数値配列→文字列を補足
+string.char = function(...)
+  local r = __orig_strchar(...)
+  if #r >= 6 then
+    local sc = lua_score(r)
+    if sc >= 20 then
+      str_log[#str_log+1] = { code=r, source="string.char", score=sc }
     end
-    return rawget(t, k)
   end
-  setmetatable(_G, mt)
-end)
+  return r
+end
 
--- ── 5. 命令数制限付きで難読化コードを実行 ───────────────────
-local __instr = 0
-local __MAX_INSTR = 8000000
-local __limit_hit = false
-
-pcall(function()
-  if debug and debug.sethook then
-    debug.sethook(function()
-      __instr = __instr + 1
-      if __instr > __MAX_INSTR then
-        __limit_hit = true
-        error("__INSTR_LIMIT__")
+-- table.concatフック: VM文字列結合を補足
+table.concat = function(t, sep, i, j)
+  local r = __orig_concat(t, sep, i, j)
+  if type(r)=="string" and #r >= 6 then
+    local sc = lua_score(r)
+    if sc >= 20 then
+      str_log[#str_log+1] = { code=r, source="table.concat", score=sc }
+      -- table.concatで生成された高スコアコードを即座にトレース
+      if sc >= 50 and #stage_log == 0 then
+        local hash = simple_hash(r)
+        if not seen_codes[hash] then
+          seen_codes[hash] = true
+          local chunk = __orig_ls(r)
+          if chunk then
+            -- フックを仕込んで実行
+            rawset(_G,"loadstring",make_ls_hook(1))
+            rawset(_G,"load",make_ls_hook(1))
+            pcall(chunk)
+          end
+        end
       end
-    end, "", 500)
-  end
-end)
-
-local __run_ok, __run_err = pcall(function()
-  local chunk, err = __orig_ls(__obf_code)
-  if not chunk then
-    error("__PARSE_ERROR__:" .. tostring(err))
-  end
-  chunk()
-end)
-
-pcall(function()
-  if debug and debug.sethook then debug.sethook() end
-end)
-
--- ── 6. 結果出力 ──────────────────────────────────────────────
--- 戦略:
---   a) loadstringにキャプチャされたものの中で最後のもの (=最終段階)
---   b) なければ全キャプチャ中スコア最高のもの
---   c) なければエラー報告
-
--- loadstringキャプチャを後ろから探す
-local best = nil
-for i = #captures, 1, -1 do
-  if captures[i].source == "loadstring" and #captures[i].code > 10 then
-    best = captures[i]
-    break
-  end
-end
-
--- loadstringキャプチャがなければ全体からスコア最高を選ぶ
-if not best then
-  local best_score = -1
-  for _, cap in ipairs(captures) do
-    if cap.score > best_score then
-      best_score = cap.score
-      best = cap
     end
   end
+  return r
 end
 
-if best and #best.code > 5 then
-  io.write("__CAPTURED_START__")
-  io.write(best.code)
-  io.write("__CAPTURED_END__")
-  io.write("__META__layers=" .. tostring(#captures) ..
-           ",source=" .. tostring(best.source) ..
-           ",score=" .. tostring(math.floor(best.score or 0)) ..
-           ",limit=" .. tostring(__limit_hit))
-elseif not __run_ok then
-  local err_str = tostring(__run_err)
-  if err_str:find("__PARSE_ERROR__") then
-    io.write("__PARSE_ERROR__:" .. err_str)
-  else
-    io.write("__RUN_ERROR__:" .. err_str:sub(1, 400))
+-- トレース実行本体
+trace_execute = function(code_str, depth)
+  if depth > MAX_DEPTH then return end
+  local hash = simple_hash(code_str)
+  if seen_codes[hash] then return end
+  seen_codes[hash] = true
+
+  -- このdepth用のフックをセット
+  local ls_hook = make_ls_hook(depth)
+  rawset(_G, "loadstring", ls_hook)
+  rawset(_G, "load",       ls_hook)
+  pcall(function()
+    local mt = getmetatable(_G) or {}
+    mt.__index = function(t,k)
+      if k=="loadstring" or k=="load" then return ls_hook end
+      return rawget(t,k)
+    end
+    setmetatable(_G, mt)
+  end)
+
+  -- 命令数制限
+  local instr = 0
+  pcall(function()
+    if debug and debug.sethook then
+      debug.sethook(function()
+        instr = instr + 1
+        if instr > MAX_INSTR then error("__LIMIT__") end
+      end,"",500)
+    end
+  end)
+
+  local chunk, err = __orig_ls(code_str)
+  if chunk then
+    pcall(chunk)
   end
+
+  pcall(function()
+    if debug and debug.sethook then debug.sethook() end
+  end)
+end
+
+-- ── メイン実行 ───────────────────────────────────────────────
+-- まず depth=0 でトレース実行
+trace_execute(__obf_code, 0)
+
+-- ── 結果選択 ────────────────────────────────────────────────
+-- 優先順位:
+--   1. stage_log の最後のエントリ (最終loadstring段階)
+--   2. stage_log 中でスコア最高のもの
+--   3. str_log 中でスコア最高のもの
+
+local function pick_best(log_table)
+  -- 最後のloadstringキャプチャを優先
+  for i = #log_table, 1, -1 do
+    local e = log_table[i]
+    if e.source == "loadstring" and #e.code > 10 then
+      return e
+    end
+  end
+  -- なければスコア最高
+  local best, best_sc = nil, -1
+  for _, e in ipairs(log_table) do
+    if (e.score or 0) > best_sc then
+      best_sc = e.score
+      best = e
+    end
+  end
+  return best
+end
+
+local result = pick_best(stage_log)
+
+-- stage_logが空ならstr_logから探す
+if not result then
+  result = pick_best(str_log)
+end
+
+-- ── 出力 ────────────────────────────────────────────────────
+if result and #result.code > 5 then
+  io.write("__CAPTURED_START__")
+  io.write(result.code)
+  io.write("__CAPTURED_END__")
+  io.write(string.format("__META__stages=%d,source=%s,score=%d,depth=%d",
+    #stage_log,
+    tostring(result.source),
+    math.floor(result.score or 0),
+    result.depth or 0))
 else
   io.write("__NO_CAPTURE__")
 end
@@ -387,47 +416,41 @@ end
   return new Promise(resolve => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
-    exec(`${luaBin} ${tempFile}`, { timeout: 30000, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
+    exec(`${luaBin} ${tempFile}`, { timeout: 35000, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
       if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
-        const start    = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
-        const end_idx  = stdout.indexOf('__CAPTURED_END__');
-        const captured = stdout.substring(start, end_idx);
+        const s   = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
+        const e   = stdout.indexOf('__CAPTURED_END__');
+        const captured = stdout.substring(s, e);
 
-        // メタ情報パース
-        const metaStr  = stdout.substring(end_idx + '__CAPTURED_END__'.length);
-        const layerM   = metaStr.match(/layers=(\d+)/);
-        const sourceM  = metaStr.match(/source=([^,]+)/);
-        const scoreM   = metaStr.match(/score=(\d+)/);
-        const limitM   = metaStr.match(/limit=(true|false)/);
+        const meta    = stdout.substring(e + '__CAPTURED_END__'.length);
+        const stagesM = meta.match(/stages=(\d+)/);
+        const sourceM = meta.match(/source=([^,]+)/);
+        const scoreM  = meta.match(/score=(\d+)/);
+        const depthM  = meta.match(/depth=(\d+)/);
 
         if (captured && captured.length > 5) {
           return resolve({
             success: true,
             result:  captured,
-            layers:  layerM  ? parseInt(layerM[1])  : 1,
-            source:  sourceM ? sourceM[1]            : 'unknown',
-            score:   scoreM  ? parseInt(scoreM[1])   : 0,
-            limitHit: limitM ? limitM[1] === 'true'  : false,
+            stages:  stagesM ? parseInt(stagesM[1]) : 1,
+            source:  sourceM ? sourceM[1] : 'unknown',
+            score:   scoreM  ? parseInt(scoreM[1])  : 0,
+            depth:   depthM  ? parseInt(depthM[1])  : 0,
             method:  'dynamic',
           });
         }
       }
 
-      if (stdout.includes('__PARSE_ERROR__:')) {
-        const msg = stdout.split('__PARSE_ERROR__:')[1] || '';
-        return resolve({ success: false, error: 'パースエラー: ' + msg.substring(0, 300), method: 'dynamic' });
-      }
-      if (stdout.includes('__RUN_ERROR__:')) {
-        const msg = stdout.split('__RUN_ERROR__:')[1] || '';
-        return resolve({ success: false, error: '実行エラー: ' + msg.substring(0, 300), method: 'dynamic' });
+      if (stdout.includes('__NO_CAPTURE__')) {
+        return resolve({ success: false, error: '完全なVM型難読化のため動的解読不可（opcodeエミュレーションが必要）', method: 'dynamic' });
       }
       if (error && stderr) {
         return resolve({ success: false, error: 'プロセスエラー: ' + stderr.substring(0, 300), method: 'dynamic' });
       }
 
-      resolve({ success: false, error: 'コードが生成されませんでした（完全なVM型難読化）', method: 'dynamic' });
+      resolve({ success: false, error: 'コードが生成されませんでした', method: 'dynamic' });
     });
   });
 }
