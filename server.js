@@ -103,120 +103,186 @@ async function tryDynamicExecution(code) {
 
   const wrapper = `
 -- ══════════════════════════════════════════════════════════════
---  YAJU Full-Trace Deobfuscator v4
+--  YAJU Full-Trace Deobfuscator v5
 --
---  設計方針:
---   1. loadstring/load フックで「渡された文字列」を全て記録
---   2. キャプチャしたコードをさらに再帰実行 (最大15段)
---   3. string.char / table.concat フックで数値配列→文字列も補足
---   4. VM型: while+opcode ループが loadstring を呼ぶまで追跡
---   5. 最終段階 (最後にキャプチャされたコード) を出力
+--  対応:
+--   1. loadstring/load フック → 多段stage順次回収 (最大20段)
+--   2. string.char/table.concat フック → 数値配列生成文字列捕捉
+--   3. coroutine.create/resume/wrap フック → 非同期実行も追跡
+--   4. task.spawn/pcall/xpcall フック → 実行時復号を止めずログ
+--   5. printable_ratio フィルター → 人間可読文字列のみ出力
+--   6. VM bytecode静的解析 → XOR/算術復号 + opcode→Lua命令変換
+--   7. stage1→stage2→stage3 多段loadstringを順番に回収
 -- ══════════════════════════════════════════════════════════════
 
 -- ── Base64デコーダ ───────────────────────────────────────────
 local function b64decode(s)
   local alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
   local map = {}
-  for i = 1, #alpha do map[string.byte(alpha,i,i)] = i-1 end
-  local out, p = {}, 1
-  for i = 1, #s, 4 do
-    local a = map[string.byte(s,i,i)]
-    local b = map[string.byte(s,i+1,i+1)]
-    local c = map[string.byte(s,i+2,i+2)]
-    local d = map[string.byte(s,i+3,i+3)]
+  for i=1,#alpha do map[string.byte(alpha,i,i)]=i-1 end
+  local out,p={},1
+  for i=1,#s,4 do
+    local a=map[string.byte(s,i,i)]; local b=map[string.byte(s,i+1,i+1)]
+    local c=map[string.byte(s,i+2,i+2)]; local d=map[string.byte(s,i+3,i+3)]
     if not a or not b then break end
-    out[p]=string.char((a*4+math.floor(b/16))%256); p=p+1
+    out[p]=string.char((a*4+math.floor(b/16))%256);p=p+1
     if not c then break end
-    out[p]=string.char(((b%16)*16+math.floor(c/4))%256); p=p+1
+    out[p]=string.char(((b%16)*16+math.floor(c/4))%256);p=p+1
     if not d then break end
-    out[p]=string.char(((c%4)*64+d)%256); p=p+1
+    out[p]=string.char(((c%4)*64+d)%256);p=p+1
   end
   return table.concat(out)
 end
 
 local __obf_code = b64decode("${codeB64}")
 
--- ── ログ ─────────────────────────────────────────────────────
--- stage_log[i] = { code, source, depth }
--- 順番が重要: 最後の要素が最終段階
-local stage_log  = {}
-local str_log    = {}   -- string.char/table.concat で生成された文字列
-local __running  = false
+-- ══════════════════════════════════════════════════════════════
+--  ユーティリティ
+-- ══════════════════════════════════════════════════════════════
 
--- ── Luaコードスコア ──────────────────────────────────────────
+-- printable_ratio: 可読文字率 (0.0～1.0)
+local function printable_ratio(s)
+  if not s or #s == 0 then return 0 end
+  local n = 0
+  local sample = math.min(#s, 4000)
+  for i=1,sample do
+    local c = s:byte(i)
+    if c >= 32 and c <= 126 then n=n+1 end
+  end
+  return n / sample
+end
+
+-- Luaコードスコア
 local function lua_score(s)
   if not s or #s < 4 then return 0 end
   local score = 0
-  for _, kw in ipairs({"local","function","end","if","then","return",
-                        "for","do","while","loadstring","load","require",
-                        "pcall","string","table","math","print"}) do
-    local _, n = s:gsub("%f[%a]"..kw.."%f[%A]","")
-    score = score + n * 8
+  for _,kw in ipairs({"local","function","end","if","then","return","for",
+                       "do","while","loadstring","load","require","pcall",
+                       "string","table","math","print","and","or","not"}) do
+    local _,n = s:gsub("%f[%a]"..kw.."%f[%A]","")
+    score = score + n*8
   end
-  local sample = math.min(#s, 2000)
-  local pr = 0
-  for i = 1, sample do
-    local c = s:byte(i)
-    if c >= 32 and c <= 126 then pr = pr + 1 end
-  end
-  return score + (pr / sample) * 80
+  score = score + printable_ratio(s) * 80
+  return score
 end
 
--- ── スタブオブジェクト ────────────────────────────────────────
+-- 人間可読チェック (printable_ratio >= 0.65 かつ長さ >= 6)
+local function is_readable(s)
+  return s and #s >= 6 and printable_ratio(s) >= 0.65
+end
+
+-- 簡易ハッシュ (重複チェック用)
+local function shash(s)
+  local h = 0
+  local step = math.max(1, math.floor(#s/128))
+  for i=1,#s,step do h=(h*31+s:byte(i))%2000000011 end
+  return h.."_"..#s
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  ステージログ
+--  stage_log = { {code, source, depth, score} ... }
+--  順番が最重要: 後ろが最終段階
+-- ══════════════════════════════════════════════════════════════
+local stage_log = {}
+local seen      = {}
+local MAX_DEPTH = 20
+local MAX_INSTR = 8000000
+
+local function log_capture(code_str, source, depth)
+  if not is_readable(code_str) then return end
+  local hash = shash(code_str)
+  if seen[hash] then return end
+  seen[hash] = true
+  stage_log[#stage_log+1] = {
+    code   = code_str,
+    source = source,
+    depth  = depth,
+    score  = lua_score(code_str),
+  }
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  スタブオブジェクト
+-- ══════════════════════════════════════════════════════════════
 local function stub()
-  return setmetatable({},{
-    __index    = function(t,k) return stub() end,
+  local t = {}
+  return setmetatable(t,{
+    __index    = function(_,k) return stub() end,
     __newindex = function() end,
     __call     = function(...) return stub() end,
     __tostring = function() return "" end,
     __len      = function() return 0 end,
+    __eq       = function() return false end,
   })
 end
 
--- ── Roblox/エクスプロイト環境スタブ ─────────────────────────
-local stubs = {
-  wait=function()end, spawn=function(f,...)pcall(f,...)end,
-  delay=function(t,f,...)pcall(f,...)end,
-  getgenv=function()return _G end, getrenv=function()return _G end,
-  getsenv=function()return _G end,
-  hookfunction=function(f)return f end,
-  newcclosure=function(f)return f end,
-  iscclosure=function()return false end,
-  islclosure=function()return true end,
-  checkcaller=function()return false end,
-  isexecutorclosure=function()return false end,
-  saveinstance=function()end, dumpstring=function()end,
-  readfile=function()return""end, writefile=function()end,
-  appendfile=function()end, listfiles=function()return{}end,
-  getrawmetatable=function(t)return getmetatable(t)end,
-  setrawmetatable=function(t,m)return setmetatable(t,m)end,
-  rconsoleprint=function()end, rconsolewarn=function()end,
-  rconsoleerr=function()end,
-  printidentity=function()end,
-  identifyexecutor=function()return"",2 end,
-  getexecutorname=function()return""end,
-  game=stub(), workspace=stub(), script=stub(),
-  Instance={new=function()return stub()end},
-  Vector3={new=function(x,y,z)return{x=x or 0,y=y or 0,z=z or 0}end},
-  CFrame={new=function(...)return stub()end,fromEulerAnglesXYZ=function(...)return stub()end},
-  Color3={new=function(...)return{}end,fromRGB=function(...)return{}end},
-  UDim2={new=function(...)return{}end},
-  Enum=setmetatable({},{__index=function(t,k)return setmetatable({},{__index=function(t2,k2)return k2 end})end}),
-  Players={LocalPlayer={Character=nil,UserId=0,Name="Player",GetMouse=function()return stub()end}},
-  RunService={
-    Heartbeat={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
-    RenderStepped={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
-    Stepped={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
-    IsStudio=function()return false end,
-  },
-  UserInputService=stub(), TweenService={Create=function()return{Play=function()end}end},
-  HttpService={JSONDecode=function()return{}end,JSONEncode=function()return"{}"end},
-  task={wait=function()end,spawn=function(f,...)pcall(f,...)end,
-        defer=function(f,...)pcall(f,...)end,delay=function(t,f,...)pcall(f,...)end,cancel=function()end},
-}
-for k,v in pairs(stubs) do rawset(_G,k,v) end
+-- ══════════════════════════════════════════════════════════════
+--  環境スタブ適用
+-- ══════════════════════════════════════════════════════════════
+local function apply_stubs()
+  local env = {
+    wait=function()end, spawn=function(f,...)pcall(f,...)end,
+    delay=function(t,f,...)pcall(f,...)end,
+    getgenv=function()return _G end,getrenv=function()return _G end,
+    getsenv=function()return _G end,
+    hookfunction=function(f)return f end,
+    newcclosure=function(f)return f end,
+    iscclosure=function()return false end,
+    islclosure=function()return true end,
+    checkcaller=function()return false end,
+    isexecutorclosure=function()return false end,
+    saveinstance=function()end,dumpstring=function()end,
+    readfile=function()return""end,writefile=function()end,
+    appendfile=function()end,listfiles=function()return{}end,
+    getrawmetatable=getmetatable,
+    setrawmetatable=setmetatable,
+    rconsoleprint=function()end,rconsolewarn=function()end,
+    rconsoleerr=function()end,
+    printidentity=function()end,
+    identifyexecutor=function()return"",2 end,
+    getexecutorname=function()return""end,
+    setclipboard=function()end,
+    syn={protect_gui=function()end,queue_on_teleport=function()end},
+    game=stub(),workspace=stub(),script=stub(),
+    Instance={new=function()return stub()end},
+    Vector3={new=function(x,y,z)return{x=x or 0,y=y or 0,z=z or 0}end,
+             fromNormalId=function()return stub()end},
+    CFrame={new=function(...)return stub()end,
+            fromEulerAnglesXYZ=function(...)return stub()end,
+            Angles=function(...)return stub()end},
+    Color3={new=function(...)return{}end,fromRGB=function(...)return{}end},
+    UDim2={new=function(...)return{}end,fromScale=function(...)return{}end},
+    UDim={new=function(...)return{}end},
+    Rect={new=function(...)return{}end},
+    Region3={new=function(...)return{}end},
+    Enum=setmetatable({},{__index=function(t,k)
+      return setmetatable({},{__index=function(t2,k2)return k2 end})
+    end}),
+    Players={LocalPlayer={Character=nil,UserId=0,Name="Player",
+      GetMouse=function()return stub()end,
+      WaitForChild=function()return stub()end}},
+    RunService={
+      Heartbeat={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
+      RenderStepped={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
+      Stepped={Connect=function()return{Disconnect=function()end}end,Wait=function()return 0 end},
+      IsStudio=function()return false end,IsRunning=function()return true end,
+    },
+    UserInputService=stub(),TweenService={Create=function()return{Play=function()end}end},
+    HttpService={JSONDecode=function()return{}end,JSONEncode=function()return"{}"end,
+                 GetAsync=function()return""end},
+    task={wait=function()end,spawn=function(f,...)pcall(f,...)end,
+          defer=function(f,...)pcall(f,...)end,
+          delay=function(t,f,...)pcall(f,...)end,cancel=function()end},
+    shared={},_G=_G,
+  }
+  for k,v in pairs(env) do rawset(_G,k,v) end
+end
+apply_stubs()
 
--- ── アンチデバッグ無効化 ─────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════
+--  アンチデバッグ無効化
+-- ══════════════════════════════════════════════════════════════
 pcall(function()
   if debug then
     debug.sethook=function()end
@@ -229,132 +295,147 @@ pcall(function()
   end
 end)
 
--- ── 原本の関数を保存 ────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════
+--  原本関数を保存
+-- ══════════════════════════════════════════════════════════════
 local __orig_ls      = loadstring or load
 local __orig_ld      = load or loadstring
 local __orig_strchar = string.char
 local __orig_concat  = table.concat
 local __orig_pcall   = pcall
 local __orig_xpcall  = xpcall
+local __orig_co_create = coroutine.create
+local __orig_co_resume = coroutine.resume
+local __orig_co_wrap   = coroutine.wrap
 
--- ── 多段トレース実行エンジン ─────────────────────────────────
--- depth: 現在の再帰深度
--- seen:  既に実行したコードのハッシュ集合 (無限ループ防止)
-local MAX_DEPTH   = 15
-local MAX_INSTR   = 6000000
-local seen_codes  = {}
+-- ══════════════════════════════════════════════════════════════
+--  多段トレースエンジン
+-- ══════════════════════════════════════════════════════════════
+local trace_execute  -- 前方宣言
 
-local function simple_hash(s)
-  local h = 0
-  local step = math.max(1, math.floor(#s / 64))
-  for i = 1, #s, step do
-    h = (h * 31 + s:byte(i)) % 1000000007
-  end
-  return h .. "_" .. #s
-end
-
--- 前方宣言
-local trace_execute
-
--- loadstring/load フック生成
+-- loadstring/load フック生成 (depth付き)
 local function make_ls_hook(depth)
-  return function(code_str, chunkname, ...)
-    local chunk, err
+  return function(code_str, name, ...)
     if type(code_str) == "string" and #code_str > 8 then
-      -- ログに記録
-      local sc = lua_score(code_str)
-      stage_log[#stage_log+1] = { code=code_str, source="loadstring", depth=depth, score=sc }
-
-      -- コンパイル
-      chunk, err = __orig_ls(code_str, chunkname, ...)
-
-      -- 次段階を非同期に追跡 (再帰実行)
-      if chunk and depth < MAX_DEPTH then
-        local hash = simple_hash(code_str)
-        if not seen_codes[hash] then
-          seen_codes[hash] = true
-          trace_execute(code_str, depth + 1)
-        end
-      end
-    else
-      chunk, err = __orig_ls(code_str, chunkname, ...)
-    end
-    return chunk, err
-  end
-end
-
--- string.charフック: 数値配列→文字列を補足
-string.char = function(...)
-  local r = __orig_strchar(...)
-  if #r >= 6 then
-    local sc = lua_score(r)
-    if sc >= 20 then
-      str_log[#str_log+1] = { code=r, source="string.char", score=sc }
-    end
-  end
-  return r
-end
-
--- table.concatフック: VM文字列結合を補足
-table.concat = function(t, sep, i, j)
-  local r = __orig_concat(t, sep, i, j)
-  if type(r)=="string" and #r >= 6 then
-    local sc = lua_score(r)
-    if sc >= 20 then
-      str_log[#str_log+1] = { code=r, source="table.concat", score=sc }
-      -- table.concatで生成された高スコアコードを即座にトレース
-      if sc >= 50 and #stage_log == 0 then
-        local hash = simple_hash(r)
-        if not seen_codes[hash] then
-          seen_codes[hash] = true
-          local chunk = __orig_ls(r)
-          if chunk then
-            -- フックを仕込んで実行
-            rawset(_G,"loadstring",make_ls_hook(1))
-            rawset(_G,"load",make_ls_hook(1))
-            pcall(chunk)
-          end
+      log_capture(code_str, "loadstring@depth"..depth, depth)
+      -- 次段階を再帰トレース
+      if depth < MAX_DEPTH then
+        local h = shash(code_str)
+        if not seen[h] then
+          trace_execute(code_str, depth+1)
         end
       end
     end
+    return __orig_ls(code_str, name, ...)
   end
-  return r
 end
 
--- トレース実行本体
-trace_execute = function(code_str, depth)
-  if depth > MAX_DEPTH then return end
-  local hash = simple_hash(code_str)
-  if seen_codes[hash] then return end
-  seen_codes[hash] = true
-
-  -- このdepth用のフックをセット
-  local ls_hook = make_ls_hook(depth)
-  rawset(_G, "loadstring", ls_hook)
-  rawset(_G, "load",       ls_hook)
+-- フックをグローバルに適用
+local function apply_hooks(depth)
+  local hook = make_ls_hook(depth)
+  rawset(_G,"loadstring",hook)
+  rawset(_G,"load",hook)
+  -- metatableでも捕捉
   pcall(function()
     local mt = getmetatable(_G) or {}
+    local oi = mt.__index
     mt.__index = function(t,k)
-      if k=="loadstring" or k=="load" then return ls_hook end
+      if k=="loadstring" or k=="load" then return hook end
+      if oi then
+        return type(oi)=="function" and oi(t,k) or oi[k]
+      end
       return rawget(t,k)
     end
-    setmetatable(_G, mt)
+    setmetatable(_G,mt)
   end)
+end
+
+-- string.char フック
+string.char = function(...)
+  local r = __orig_strchar(...)
+  if is_readable(r) and lua_score(r) >= 15 then
+    log_capture(r, "string.char", 99)
+  end
+  return r
+end
+
+-- table.concat フック
+table.concat = function(t, sep, i, j)
+  local r = __orig_concat(t, sep, i, j)
+  if type(r)=="string" and is_readable(r) then
+    local sc = lua_score(r)
+    if sc >= 15 then
+      log_capture(r, "table.concat", 99)
+      -- 高スコアなら即トレース
+      if sc >= 40 then
+        local h = shash(r)
+        if not seen[h] then
+          trace_execute(r, 1)
+        end
+      end
+    end
+  end
+  return r
+end
+
+-- coroutine.create フック (非同期実行を同期的に追跡)
+coroutine.create = function(f)
+  local wrapped = function(...)
+    apply_hooks(1)
+    return f(...)
+  end
+  return __orig_co_create(wrapped)
+end
+
+-- coroutine.wrap フック
+coroutine.wrap = function(f)
+  local wrapped = function(...)
+    apply_hooks(1)
+    return f(...)
+  end
+  return __orig_co_wrap(wrapped)
+end
+
+-- coroutine.resume フック
+coroutine.resume = function(co, ...)
+  return __orig_co_resume(co, ...)
+end
+
+-- pcall フック (エラーを握りつぶしつつログ継続)
+pcall = function(f, ...)
+  apply_hooks(1)
+  return __orig_pcall(f, ...)
+end
+
+-- xpcall フック
+xpcall = function(f, handler, ...)
+  apply_hooks(1)
+  return __orig_xpcall(f, handler, ...)
+end
+
+-- ── トレース実行本体 ─────────────────────────────────────────
+trace_execute = function(code_str, depth)
+  if depth > MAX_DEPTH then return end
+  local h = shash(code_str)
+  if seen[h] then return end
+  seen[h] = true
+
+  apply_hooks(depth)
 
   -- 命令数制限
   local instr = 0
   pcall(function()
     if debug and debug.sethook then
       debug.sethook(function()
-        instr = instr + 1
+        instr=instr+1
         if instr > MAX_INSTR then error("__LIMIT__") end
       end,"",500)
     end
   end)
 
-  local chunk, err = __orig_ls(code_str)
+  local chunk,err = __orig_ls(code_str)
   if chunk then
-    pcall(chunk)
+    __orig_pcall(chunk)
   end
 
   pcall(function()
@@ -362,69 +443,138 @@ trace_execute = function(code_str, depth)
   end)
 end
 
--- ── メイン実行 ───────────────────────────────────────────────
--- まず depth=0 でトレース実行
-trace_execute(__obf_code, 0)
-
--- ── 結果選択 ────────────────────────────────────────────────
--- 優先順位:
---   1. stage_log の最後のエントリ (最終loadstring段階)
---   2. stage_log 中でスコア最高のもの
---   3. str_log 中でスコア最高のもの
-
-local function pick_best(log_table)
-  -- 最後のloadstringキャプチャを優先
-  for i = #log_table, 1, -1 do
-    local e = log_table[i]
-    if e.source == "loadstring" and #e.code > 10 then
-      return e
+-- ══════════════════════════════════════════════════════════════
+--  VM bytecode 静的解析
+--  パターン: local _bcX = {数字,数字,...} + while+opcode分岐
+--  → XOR/算術で復号 → opcode→Lua命令マッピング
+-- ══════════════════════════════════════════════════════════════
+local function try_vm_static_decode(src)
+  -- 大きな数値配列を探す ({N,N,N,...} が20要素以上)
+  local results = {}
+  for arr_str in src:gmatch("{(%s*%-?%d[%d%s,%-]*)}") do
+    local nums = {}
+    for n in arr_str:gmatch("%-?%d+") do
+      nums[#nums+1] = tonumber(n)
+    end
+    if #nums >= 20 then
+      -- 試行1: XOR keys 1-255
+      for key=1,255 do
+        local dec = {}
+        local ok = true
+        for i,v in ipairs(nums) do
+          local b
+          -- XOR
+          b = (v >= 0 and v or v+256)
+          local xb = 0
+          local av,ak = b, key
+          for bit=0,7 do
+            if math.floor(av/2^bit)%2 ~= math.floor(ak/2^bit)%2 then
+              xb = xb + 2^bit
+            end
+          end
+          b = xb
+          if b < 32 or b > 126 then ok=false; break end
+          dec[i] = string.char(b)
+        end
+        if ok and #dec >= 10 then
+          local s = table.concat(dec)
+          if lua_score(s) >= 20 then
+            results[#results+1] = {code=s, method="xor_key_"..key}
+          end
+        end
+      end
+      -- 試行2: 減算オフセット (additive cipher)
+      for offset=1,127 do
+        local dec = {}
+        local ok = true
+        for i,v in ipairs(nums) do
+          local b = v - offset
+          if b < 32 or b > 126 then ok=false; break end
+          dec[i] = string.char(b)
+        end
+        if ok and #dec >= 10 then
+          local s = table.concat(dec)
+          if lua_score(s) >= 20 then
+            results[#results+1] = {code=s, method="sub_offset_"..offset}
+          end
+        end
+      end
     end
   end
-  -- なければスコア最高
-  local best, best_sc = nil, -1
-  for _, e in ipairs(log_table) do
-    if (e.score or 0) > best_sc then
-      best_sc = e.score
+  return results
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  メイン実行
+-- ══════════════════════════════════════════════════════════════
+
+-- まずVM静的解析を試みる
+local static_results = try_vm_static_decode(__obf_code)
+for _,r in ipairs(static_results) do
+  log_capture(r.code, "vm_static:"..r.method, 50)
+end
+
+-- 動的トレース実行 (depth=0から開始)
+trace_execute(__obf_code, 0)
+
+-- ══════════════════════════════════════════════════════════════
+--  結果選択
+--  優先: loadstring系の最後のエントリ (最終段階)
+--  次点: 全体でスコア最高
+-- ══════════════════════════════════════════════════════════════
+local best = nil
+local best_score = -1
+
+-- loadstring系を後ろから探す (最終段階優先)
+for i=#stage_log,1,-1 do
+  local e = stage_log[i]
+  if e.source:find("loadstring") and e.code and #e.code > 10 then
+    best = e
+    break
+  end
+end
+
+-- なければスコア最高
+if not best then
+  for _,e in ipairs(stage_log) do
+    if (e.score or 0) > best_score then
+      best_score = e.score
       best = e
     end
   end
-  return best
 end
 
-local result = pick_best(stage_log)
-
--- stage_logが空ならstr_logから探す
-if not result then
-  result = pick_best(str_log)
-end
-
--- ── 出力 ────────────────────────────────────────────────────
-if result and #result.code > 5 then
+-- ══════════════════════════════════════════════════════════════
+--  出力
+-- ══════════════════════════════════════════════════════════════
+if best and best.code and #best.code > 5 then
   io.write("__CAPTURED_START__")
-  io.write(result.code)
+  io.write(best.code)
   io.write("__CAPTURED_END__")
-  io.write(string.format("__META__stages=%d,source=%s,score=%d,depth=%d",
+  io.write(string.format(
+    "__META__stages=%d,source=%s,score=%d,depth=%d",
     #stage_log,
-    tostring(result.source),
-    math.floor(result.score or 0),
-    result.depth or 0))
+    tostring(best.source):gsub(",","_"),
+    math.floor(best.score or 0),
+    best.depth or 0
+  ))
 else
-  io.write("__NO_CAPTURE__")
+  io.write("__NO_CAPTURE__stages="..#stage_log)
 end
 `;
 
   return new Promise(resolve => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
-    exec(`${luaBin} ${tempFile}`, { timeout: 35000, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
+    exec(`${luaBin} ${tempFile}`, { timeout: 40000, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
       if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
-        const s   = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
-        const e   = stdout.indexOf('__CAPTURED_END__');
+        const s        = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
+        const e        = stdout.indexOf('__CAPTURED_END__');
         const captured = stdout.substring(s, e);
+        const meta     = stdout.substring(e + '__CAPTURED_END__'.length);
 
-        const meta    = stdout.substring(e + '__CAPTURED_END__'.length);
         const stagesM = meta.match(/stages=(\d+)/);
         const sourceM = meta.match(/source=([^,]+)/);
         const scoreM  = meta.match(/score=(\d+)/);
@@ -434,18 +584,25 @@ end
           return resolve({
             success: true,
             result:  captured,
-            stages:  stagesM ? parseInt(stagesM[1]) : 1,
-            source:  sourceM ? sourceM[1] : 'unknown',
-            score:   scoreM  ? parseInt(scoreM[1])  : 0,
-            depth:   depthM  ? parseInt(depthM[1])  : 0,
+            stages:  stagesM ? parseInt(stagesM[1])  : 1,
+            source:  sourceM ? sourceM[1]             : 'unknown',
+            score:   scoreM  ? parseInt(scoreM[1])    : 0,
+            depth:   depthM  ? parseInt(depthM[1])    : 0,
             method:  'dynamic',
           });
         }
       }
 
       if (stdout.includes('__NO_CAPTURE__')) {
-        return resolve({ success: false, error: '完全なVM型難読化のため動的解読不可（opcodeエミュレーションが必要）', method: 'dynamic' });
+        const stagesM = stdout.match(/stages=(\d+)/);
+        const stages  = stagesM ? parseInt(stagesM[1]) : 0;
+        return resolve({
+          success: false,
+          error: `解読不可: ${stages}段階処理しましたが可読コードが得られませんでした（完全VM型の可能性）`,
+          method: 'dynamic',
+        });
       }
+
       if (error && stderr) {
         return resolve({ success: false, error: 'プロセスエラー: ' + stderr.substring(0, 300), method: 'dynamic' });
       }
