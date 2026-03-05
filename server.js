@@ -683,6 +683,229 @@ setInterval(() => {
   });
 }, 5 * 60 * 1000);
 
+// ════════════════════════════════════════════════════════
+//  フル難読化 API  POST /api/full-obfuscate
+//  bot.py から呼ぶ用: カスタムVM + Prometheus + Base64/XOR
+//
+//  固定設定:
+//   - カスタムVM: ON
+//   - Base64層数: 12
+//   - ダミーコード: 250
+//   - XOR難読化: ON
+// ════════════════════════════════════════════════════════
+app.post('/api/full-obfuscate', async (req, res) => {
+  const { code, seed } = req.body;
+  if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
+
+  let current = code;
+
+  // ① カスタムVM難読化
+  const vmRes = await obfuscateWithCustomVM(current, { seed });
+  if (vmRes.success && vmRes.result) {
+    current = vmRes.result;
+  } else {
+    return res.json({ success: false, error: 'VM難読化失敗: ' + (vmRes.error || '') });
+  }
+
+  // ② Base64 + XOR (Node.js側で実装)
+  const XOR_DEPTH = 36;
+  const B64_LAYERS = 12;
+  const JUNK_COUNT = 250;
+
+  // XOR暗号化
+  const masterSeed = seed || (Math.floor(Math.random() * 99999999) + 100000);
+  let rngState = masterSeed;
+  const rng = () => { rngState = (rngState * 1664525 + 1013904223) % 4294967296; return rngState; };
+
+  const ops = [];
+  for (let i = 0; i < XOR_DEPTH; i++) {
+    const r = rng();
+    ops.push({
+      type: Math.floor((r % 100) / 34),
+      keyBase: Math.floor((r / 256) % 255) + 1,
+      prime: [2,3,5,7,11,13,17,19,23,29,31][Math.floor((r % 1000) / 100)] || 3
+    });
+  }
+
+  let bytes = Buffer.from(current, 'utf8');
+  for (let pass = 0; pass < XOR_DEPTH; pass++) {
+    const { type: tp, keyBase: k, prime: p } = ops[pass];
+    for (let i = 0; i < bytes.length; i++) {
+      const dk = (k * (i + p)) % 256;
+      if (tp === 0) bytes[i] = bytes[i] ^ dk;
+      else if (tp === 1) bytes[i] = (bytes[i] + dk) % 256;
+      else bytes[i] = (bytes[i] - dk + 256) % 256;
+    }
+  }
+
+  // Base64を12層
+  let encoded = bytes.toString('base64');
+  for (let i = 1; i < B64_LAYERS; i++) {
+    encoded = Buffer.from(encoded).toString('base64');
+  }
+
+  // ジャンクコード・変数名生成ヘルパー
+  const usedVars = new Set();
+  const makeVar = () => {
+    const starts = ['I','l','O','Il','lI','OI','IO','lO','Ol'];
+    const chars  = ['I','l','O','_','1','0'];
+    let name;
+    do {
+      name = starts[Math.floor(Math.random() * starts.length)];
+      const len = 10 + Math.floor(Math.random() * 8);
+      for (let i = 0; i < len; i++) name += chars[Math.floor(Math.random() * chars.length)];
+    } while (usedVars.has(name));
+    usedVars.add(name);
+    return name;
+  };
+
+  const numExpr = (n) => {
+    const a = Math.floor(Math.random() * 40) + 2;
+    const b = Math.floor(n / a);
+    const c = n - a * b;
+    return `(${a}*${b}+${c})`;
+  };
+
+  const makeJunk = (count) => {
+    let out = '';
+    for (let i = 0; i < count; i++) {
+      const r = Math.random();
+      const v = makeVar();
+      if (r < 0.3) out += `local ${v}=${numExpr(Math.floor(Math.random()*9999)+1)}\n`;
+      else if (r < 0.6) out += `local ${v}=function()return ${numExpr(Math.floor(Math.random()*100))} end\n`;
+      else out += `local ${v}={${[1,2,3].map(()=>numExpr(Math.floor(Math.random()*100)+1)).join(',')}}\n`;
+    }
+    return out;
+  };
+
+  // Luaコード組み立て
+  const vLib  = makeVar(), vStr = makeVar(), vTbl = makeVar();
+  const vMap  = makeVar(), vIdx = makeVar(), vS   = makeVar();
+  const vRr   = makeVar(), vPp  = makeVar(), vNn  = makeVar();
+  const vAa   = makeVar(), vBb  = makeVar(), vCc  = makeVar(), vDd = makeVar();
+  const vAlpha= makeVar(), vParts= makeVar();
+  const vLd   = makeVar();
+  const vXorFn= makeVar(), vXA  = makeVar(), vXB  = makeVar();
+  const vXSeed= makeVar(), vXNxt= makeVar(), vXOps= makeVar();
+  const vXPrim= makeVar(), vXI  = makeVar(), vXR  = makeVar();
+  const vXTp  = makeVar(), vXKb = makeVar(), vXPr = makeVar();
+  const vXPass= makeVar(), vXOp = makeVar(), vXDk = makeVar();
+  const vXB2  = makeVar(), vXOut= makeVar(), vXVar= makeVar();
+  const vVM2  = makeVar(), vVMSt= makeVar();
+
+  // Base64アルファベットをチャンク分割して隠す
+  const fullAlpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  const aKey = Math.floor(Math.random() * 40) + 5;
+  const chunks = [];
+  for (let i = 0; i < fullAlpha.length; i += 11) {
+    const chunk = fullAlpha.substring(i, i + 11);
+    const enc = chunk.split('').map(c => c.charCodeAt(0) + aKey).join(',');
+    chunks.push(`(function()local _t={${enc}};local _r={};for _i=1,#_t do _r[_i]=string.char(_t[_i]-${aKey})end;return table.concat(_r)end)()`);
+  }
+
+  // XORデコーダ (Lua5.1互換)
+  const sA = Math.floor(Math.random() * 800) + 100;
+  const sB = Math.floor(masterSeed / sA);
+  const sC = masterSeed - sA * sB;
+  const mulA = Math.floor(Math.random() * 900) + 100;
+  const mulB = Math.floor(1664525 / mulA);
+  const mulC = 1664525 - mulA * mulB;
+  const addA = Math.floor(Math.random() * 900) + 100;
+  const addB = Math.floor(1013904223 / addA);
+  const addC = 1013904223 - addA * addB;
+
+  const xorDecoder = `
+local function ${vXorFn}(${vXA},${vXB})
+  local _=0
+  for _i=0,7 do
+    local _a=math.floor(${vXA}/2^_i)%2
+    local _b=math.floor(${vXB}/2^_i)%2
+    if _a~=_b then _=_+2^_i end
+  end
+  return _
+end
+local function ${vXVar}(${vS})
+  local ${vXB2}={}
+  for ${vXI}=1,#${vS} do ${vXB2}[${vXI}]=string.byte(${vS},${vXI}) end
+  local ${vXSeed}=${sA}*${sB}+${sC}
+  local function ${vXNxt}() ${vXSeed}=(${vXSeed}*(${mulA}*${mulB}+${mulC})+${addA}*${addB}+${addC})%(2^32);return ${vXSeed} end
+  local ${vXOps}={}
+  local ${vXPrim}={2,3,5,7,11,13,17,19,23,29,31}
+  for ${vXI}=1,${XOR_DEPTH} do
+    local ${vXR}=${vXNxt}()
+    local ${vXTp}=math.floor((${vXR}%100)/34)
+    local ${vXKb}=math.floor((${vXR}/256)%255)+1
+    local ${vXPr}=${vXPrim}[math.floor((${vXR}%1000)/100)+1] or 3
+    table.insert(${vXOps},{${vXTp},${vXKb},${vXPr}})
+  end
+  for ${vXPass}=${XOR_DEPTH},1,-1 do
+    local ${vXOp}=${vXOps}[${vXPass}]
+    local ${vXTp},${vXKb},${vXPr}=${vXOp}[1],${vXOp}[2],${vXOp}[3]
+    for ${vXI}=1,#${vXB2} do
+      local ${vXDk}=(${vXKb}*(${vXI}+${vXPr}))%256
+      if ${vXTp}==0 then ${vXB2}[${vXI}]=${vXorFn}(${vXB2}[${vXI}],${vXDk})
+      elseif ${vXTp}==1 then ${vXB2}[${vXI}]=(${vXB2}[${vXI}]-${vXDk}+256)%256
+      elseif ${vXTp}==2 then ${vXB2}[${vXI}]=(${vXB2}[${vXI}]+${vXDk})%256 end
+    end
+  end
+  local ${vXOut}={}
+  for ${vXI}=1,#${vXB2} do ${vXOut}[${vXI}]=string.char(${vXB2}[${vXI}]) end
+  return table.concat(${vXOut})
+end
+`;
+
+  // Base64デコーダ
+  const b64Decoder = `
+local ${vParts}={${chunks.join(',')}}
+local ${vAlpha}=table.concat(${vParts})
+local ${vMap}={}
+for ${vIdx}=1,#${vAlpha} do ${vMap}[string.byte(${vAlpha},${vIdx},${vIdx})]=${vIdx}-1 end
+local function ${vLib}(${vS})
+  local ${vRr},${vPp},${vNn}={},1,#${vS}
+  for ${vIdx}=1,${vNn},4 do
+    local ${vAa},${vBb},${vCc},${vDd}=${vMap}[string.byte(${vS},${vIdx},${vIdx})],${vMap}[string.byte(${vS},${vIdx}+1,${vIdx}+1)],${vMap}[string.byte(${vS},${vIdx}+2,${vIdx}+2)],${vMap}[string.byte(${vS},${vIdx}+3,${vIdx}+3)]
+    if not ${vAa} or not ${vBb} then break end
+    ${vRr}[${vPp}]=string.char((${vAa}*4+math.floor(${vBb}/16))%256) ${vPp}=${vPp}+1
+    if not ${vCc} then break end
+    ${vRr}[${vPp}]=string.char(((${vBb}%16)*16+math.floor(${vCc}/4))%256) ${vPp}=${vPp}+1
+    if not ${vDd} then break end
+    ${vRr}[${vPp}]=string.char(((${vCc}%4)*64+${vDd})%256) ${vPp}=${vPp}+1
+  end
+  return table.concat(${vRr})
+end
+`;
+
+  // loadstring参照を難読化
+  const lsKey = Math.floor(Math.random() * 40) + 5;
+  const lsEnc = 'loadstring'.split('').map(c => c.charCodeAt(0) + lsKey).join(',');
+  const ldRef = `local ${vLd}=(function()local _t={${lsEnc}};local _r={};for _i=1,#_t do _r[_i]=string.char(_t[_i]-${lsKey})end;return rawget(_G,table.concat(_r)) or loadstring end)()`;
+
+  // 制御フロー平坦化
+  const steps = [];
+  for (let i = 0; i < B64_LAYERS; i++) steps.push(`${vStr}=${vLib}(${vStr})`);
+  steps.push(`${vStr}=${vXVar}(${vStr})`);
+  steps.push(`local _f,_e=${vLd}(${vStr});if _f then _f() else error(_e) end return`);
+
+  let vmDisp = '{';
+  for (let i = 0; i < steps.length; i++) {
+    vmDisp += `[${i}]=function()${steps[i]} return ${i === steps.length - 1 ? -1 : i + 1}end,`;
+  }
+  vmDisp += '}';
+
+  const finalLua = `(function()
+${makeJunk(Math.floor(JUNK_COUNT / 5))}
+${b64Decoder}
+${xorDecoder}
+${ldRef}
+local ${vStr}="${encoded}"
+local ${vVMSt}=0
+local ${vVM2}=${vmDisp}
+while ${vVMSt}~=-1 do ${vVMSt}=${vVM2}[${vVMSt}]()end
+end)()`;
+
+  res.json({ success: true, result: finalLua, seed: masterSeed, method: 'full' });
+});
+
 app.listen(PORT, () => {
   console.log(`🔥 Lua Obfuscator/Deobfuscator Server running on port ${PORT}`);
   console.log(`   Lua:        ${checkLuaAvailable() || 'NOT FOUND'}`);
