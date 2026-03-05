@@ -12,24 +12,18 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// temp ディレクトリ
 const tempDir = path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
 
-// ════════════════════════════════════════════════════════
-//  Lua / Prometheus 確認
-// ════════════════════════════════════════════════════════
 function checkLuaAvailable() {
   try { execSync('lua -v 2>&1', { timeout: 3000 }); return 'lua'; } catch {}
   try { execSync('luajit -v 2>&1', { timeout: 3000 }); return 'luajit'; } catch {}
   return null;
 }
 
-// Prometheus は Lua5.1 専用なので専用バイナリを探す
 function checkLua51Available() {
   try { execSync('lua5.1 -v 2>&1', { timeout: 3000 }); return 'lua5.1'; } catch {}
   try { execSync('luajit -v 2>&1', { timeout: 3000 }); return 'luajit'; } catch {}
-  // lua5.4 でも一応試す（動かない場合もある）
   try { execSync('lua -v 2>&1', { timeout: 3000 }); return 'lua'; } catch {}
   return null;
 }
@@ -39,9 +33,6 @@ function checkPrometheusAvailable() {
       || fs.existsSync(path.join(__dirname, 'cli.lua'));
 }
 
-// ════════════════════════════════════════════════════════
-//  STATUS  GET /api/status
-// ════════════════════════════════════════════════════════
 app.get('/api/status', (req, res) => {
   res.json({
     status: 'ok',
@@ -53,63 +44,55 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// ════════════════════════════════════════════════════════
-//  解読 API  POST /api/deobfuscate
-// ════════════════════════════════════════════════════════
 app.post('/api/deobfuscate', async (req, res) => {
   const { code, method } = req.body;
   if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
 
   let result;
   switch (method) {
-    case 'xor':             result = deobfuscateXOR(code);           break;
-    case 'split_strings':   result = deobfuscateSplitStrings(code);  break;
-    case 'encrypt_strings': result = deobfuscateEncryptStrings(code); break;
-    case 'constant_array':   result = deobfuscateConstantArray(code);  break;
-    case 'eval_expressions': result = evaluateExpressions(code);      break;
-    case 'vmify':            result = deobfuscateVmify(code);         break;
-    case 'dynamic':         result = await tryDynamicExecution(code); break;
+    case 'xor':             result = deobfuscateXOR(code);            break;
+    case 'split_strings':   result = deobfuscateSplitStrings(code);   break;
+    case 'encrypt_strings': result = deobfuscateEncryptStrings(code);  break;
+    case 'constant_array':  result = deobfuscateConstantArray(code);   break;
+    case 'eval_expressions':result = evaluateExpressions(code);        break;
+    case 'vmify':           result = deobfuscateVmify(code);           break;
+    case 'dynamic':         result = await tryDynamicExecution(code);  break;
     case 'auto':
-    default:                result = await autoDeobfuscate(code);    break;
+    default:                result = await autoDeobfuscate(code);      break;
   }
 
   res.json(result);
 });
 
-// 後方互換 (旧エンドポイント)
 app.post('/deobfuscate', async (req, res) => {
   const { code } = req.body;
   if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
   res.json(deobfuscateXOR(code));
 });
 
-// ════════════════════════════════════════════════════════
-//  難読化 API  POST /api/obfuscate  (Prometheus)
-// ════════════════════════════════════════════════════════
 app.post('/api/obfuscate', async (req, res) => {
   const { code, preset, steps } = req.body;
   if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
   res.json(await obfuscateWithPrometheus(code, { preset, steps }));
 });
 
-// ════════════════════════════════════════════════════════
-//  VM難読化 API  POST /api/vm-obfuscate
-// ════════════════════════════════════════════════════════
 app.post('/api/vm-obfuscate', async (req, res) => {
   const { code, seed } = req.body;
   if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
   res.json(await obfuscateWithCustomVM(code, { seed }));
 });
 
-
 // ════════════════════════════════════════════════════════
-//  動的実行  —  Renderサーバー上のLuaを最大限活用
+//  動的実行 (全面強化版)
 //
-//  方針:
-//   1. まず動的実行を試みる（これがメイン）
-//   2. 動的実行が失敗した場合のみ静的解析にフォールバック
-//   3. 多段難読化に対応（動的実行の結果を再帰的に動的実行）
-//   4. アンチダンプ・アンチデバッグを無効化してから実行
+//  強化点:
+//   1. Roblox依存関数を全てスタブ化 (task.wait, coroutine等)
+//   2. string.charフックで数値配列からの文字列生成を捕捉
+//   3. loadstring/loadを多重フック (rawset + metatable)
+//   4. アンチデバッグを徹底的に無効化
+//   5. VM opcodeループ対策: pcallでタイムアウト付き実行
+//   6. 全キャプチャから最長・最高スコアのものを選択
+//   7. 多段実行: 最大5ラウンド
 // ════════════════════════════════════════════════════════
 async function tryDynamicExecution(code) {
   const luaBin = checkLuaAvailable();
@@ -117,42 +100,122 @@ async function tryDynamicExecution(code) {
 
   const tempFile = path.join(tempDir, `obf_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
 
-  // ]] が含まれる場合のエスケープ
-  const safeCode = code.replace(/\]\]/g, '] ]');
+  // ]] を含む場合のエスケープ
+  const safeCode = code
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '');
 
   const wrapper = `
 -- ══════════════════════════════════════════
---  YAJU Deobfuscator - Dynamic Execution Wrapper
+--  YAJU VM Deobfuscator - Enhanced Wrapper
 -- ══════════════════════════════════════════
 
--- 全キャプチャを格納するテーブル（多段対応）
 local __captures = {}
 local __capture_count = 0
+local __strings_captured = {}
 local __original_loadstring = loadstring or load
 local __original_load = load or loadstring
 
--- アンチダンプ・アンチデバッグを無効化
+-- ── 1. Roblox/エクスプロイト環境スタブ ──────────────────
+-- task系
+local task = task or {}
+task.wait      = function(n) end
+task.spawn     = function(f, ...) pcall(f, ...) end
+task.defer     = function(f, ...) pcall(f, ...) end
+task.delay     = function(t, f, ...) pcall(f, ...) end
+task.cancel    = function() end
+_G.task = task
+
+-- coroutine拡張スタブ
+local __orig_coyield = coroutine.yield
+coroutine.yield = function(...) return ... end
+
+-- wait (古い書き方)
+_G.wait = function(n) end
+
+-- Roblox Instance系スタブ
+_G.game         = _G.game or setmetatable({}, {__index = function(t,k) return function(...) end end})
+_G.workspace    = _G.workspace or {}
+_G.script       = _G.script or {}
+_G.Instance     = { new = function() return setmetatable({},{__index=function(t,k)return function(...)end end, __newindex=function()end}) end }
+_G.Vector3      = { new = function(x,y,z) return {x=x or 0,y=y or 0,z=z or 0} end }
+_G.CFrame       = { new = function(...) return {} end }
+_G.Color3       = { new = function(...) return {} end, fromRGB = function(...) return {} end }
+_G.UDim2        = { new = function(...) return {} end }
+_G.Enum         = setmetatable({}, {__index=function(t,k) return setmetatable({},{__index=function(t2,k2) return k2 end}) end})
+_G.Humanoid     = {}
+_G.RunService   = { Heartbeat = { Connect = function() return {Disconnect=function()end} end }, RenderStepped = { Connect = function() return {Disconnect=function()end} end } }
+_G.Players      = { LocalPlayer = { Character = nil, UserId = 0, Name = "Player" } }
+_G.HttpService  = { JSONDecode = function(s) return {} end, JSONEncode = function(t) return "{}" end }
+_G.UserInputService = setmetatable({}, {__index=function() return function() end end})
+_G.TweenService = { Create = function() return {Play=function()end} end }
+
+-- エクスプロイト系スタブ
+_G.getgenv      = function() return _G end
+_G.getrenv      = function() return _G end
+_G.getsenv      = function() return _G end
+_G.getfenv      = getfenv or function() return _G end
+_G.setfenv      = setfenv or function(f,t) return f end
+_G.getrawmetatable = function(t) return getmetatable(t) end
+_G.setrawmetatable = function(t,m) return setmetatable(t,m) end
+_G.hookfunction = function(f,h) return f end
+_G.newcclosure  = function(f) return f end
+_G.iscclosure   = function(f) return false end
+_G.islclosure   = function(f) return true end
+_G.checkcaller  = function() return false end
+_G.isexecutorclosure = function() return false end
+_G.saveinstance  = function() end
+_G.dumpstring    = function() end
+_G.readfile      = function() return "" end
+_G.writefile     = function() end
+_G.appendfile    = function() end
+_G.listfiles     = function() return {} end
+_G.loadfile      = loadfile
+_G.dofile        = dofile
+_G.syn           = { protect_gui = function() end, queue_on_teleport = function() end }
+_G.rconsoleprint = function() end
+_G.rconsolewarn  = function() end
+_G.rconsoleerr   = function() end
+
+-- ── 2. アンチデバッグ無効化 ──────────────────────────────
 pcall(function()
   if debug then
-    debug.sethook = function() end
-    debug.getinfo = nil
-    debug.getlocal = nil
-    debug.setlocal = nil
-    debug.getupvalue = nil
-    debug.setupvalue = nil
-  end
-end)
-pcall(function()
-  if getfenv then
-    local env = getfenv()
-    env.saveinstance = nil
-    env.dumpstring = nil
-    env.save_instance = nil
+    debug.sethook    = function() end
+    debug.getinfo    = function() return {} end
+    debug.getlocal   = function() return nil end
+    debug.setlocal   = function() end
+    debug.getupvalue = function() return nil end
+    debug.setupvalue = function() end
+    debug.traceback  = function() return "" end
+    debug.getmetatable = getmetatable
+    debug.setmetatable = setmetatable
   end
 end)
 
--- loadstring / load を完全フック
-local function __hook(code_str, ...)
+-- ── 3. string.char フック (数値配列→文字列を捕捉) ──────────
+local __orig_strchar = string.char
+string.char = function(...)
+  local result = __orig_strchar(...)
+  if #result >= 4 then
+    __strings_captured[#__strings_captured + 1] = result
+  end
+  return result
+end
+
+-- ── 4. table.concat フック (VM文字列結合を捕捉) ─────────────
+local __orig_concat = table.concat
+table.concat = function(t, sep, i, j)
+  local result = __orig_concat(t, sep, i, j)
+  if type(result) == "string" and #result >= 10 then
+    __strings_captured[#__strings_captured + 1] = result
+  end
+  return result
+end
+
+-- ── 5. loadstring/load 多重フック ────────────────────────────
+local function __hook_load(code_str, ...)
   if type(code_str) == "string" and #code_str > 20 then
     __capture_count = __capture_count + 1
     __captures[__capture_count] = code_str
@@ -160,38 +223,116 @@ local function __hook(code_str, ...)
   return __original_loadstring(code_str, ...)
 end
 
-_G.loadstring = __hook
-_G.load       = __hook
-if rawset then
-  pcall(function() rawset(_G, "loadstring", __hook) end)
-  pcall(function() rawset(_G, "load", __hook) end)
-end
+-- _G への直接書き込み + rawset でフック
+_G.loadstring = __hook_load
+_G.load       = __hook_load
+pcall(function() rawset(_G, "loadstring", __hook_load) end)
+pcall(function() rawset(_G, "load",       __hook_load) end)
 
--- 難読化コードを実行
-local __obf_code = [[
-${safeCode}
-]]
+-- メタテーブルでも捕捉 (難読化コードが _G.loadstring を参照する場合)
+local __orig_G_mt = getmetatable(_G)
+pcall(function()
+  setmetatable(_G, {
+    __index = function(t, k)
+      if k == "loadstring" or k == "load" then return __hook_load end
+      if __orig_G_mt and __orig_G_mt.__index then
+        if type(__orig_G_mt.__index) == "function" then
+          return __orig_G_mt.__index(t, k)
+        end
+        return __orig_G_mt.__index[k]
+      end
+      return rawget(t, k)
+    end
+  })
+end)
+
+-- ── 6. 難読化コードを実行 ────────────────────────────────────
+local __obf_code = "${safeCode}"
 
 local __ok, __err = pcall(function()
   local chunk, err = __original_loadstring(__obf_code)
-  if not chunk then error("parse error: " .. tostring(err)) end
-  chunk()
+  if not chunk then
+    -- パースエラーの場合はそのまま報告
+    error("parse_error: " .. tostring(err))
+  end
+  -- タイムアウト対策: debug.sethookで命令数制限 (VM系の無限ループ防止)
+  local __instr_count = 0
+  local __MAX_INSTR = 5000000
+  pcall(function()
+    if debug and debug.sethook then
+      debug.sethook(function()
+        __instr_count = __instr_count + 1
+        if __instr_count > __MAX_INSTR then
+          error("instruction_limit_exceeded")
+        end
+      end, "", 1000)
+    end
+  end)
+  local run_ok, run_err = pcall(chunk)
+  pcall(function() if debug and debug.sethook then debug.sethook() end end)
+  if not run_ok and not tostring(run_err):find("instruction_limit_exceeded") then
+    -- 命令数超過以外のエラーは報告
+    if not tostring(run_err):find("attempt to") and #__captures == 0 then
+      error(run_err)
+    end
+  end
 end)
 
--- キャプチャ結果を出力（最後にキャプチャされたものが最も解読されたもの）
-if __capture_count > 0 then
-  -- 最も長い（＝最も展開された）コードを選択
-  local best = __captures[1]
-  for i = 2, __capture_count do
-    if #__captures[i] > #best then best = __captures[i] end
+-- ── 7. 結果選択 ──────────────────────────────────────────────
+-- キャプチャされたコードの中からLuaスコアが最高のものを選ぶ
+local function score_lua(s)
+  if not s or #s < 5 then return -1 end
+  local score = 0
+  local keywords = {"local","function","end","if","then","else","return",
+                    "for","do","while","print","table","string","math",
+                    "loadstring","load","require","pcall","xpcall"}
+  for _, kw in ipairs(keywords) do
+    local _, count = s:gsub("%f[%a]" .. kw .. "%f[%A]", "")
+    score = score + count * 10
   end
+  -- 可読文字率
+  local printable = 0
+  local sample = math.min(#s, 3000)
+  for i = 1, sample do
+    local c = s:byte(i)
+    if c >= 32 and c <= 126 then printable = printable + 1 end
+  end
+  score = score + (printable / sample) * 100
+  return score
+end
+
+-- loadstringでキャプチャしたものを最優先
+local best_code = nil
+local best_score = -1
+
+for i = 1, __capture_count do
+  local s = score_lua(__captures[i])
+  if s > best_score then
+    best_score = s
+    best_code = __captures[i]
+  end
+end
+
+-- string.char/table.concatキャプチャから補完
+if best_score < 50 then
+  for _, s in ipairs(__strings_captured) do
+    local sc = score_lua(s)
+    if sc > best_score then
+      best_score = sc
+      best_code = s
+    end
+  end
+end
+
+if best_code and #best_code > 5 then
   io.write("__CAPTURED_START__")
-  io.write(best)
+  io.write(best_code)
   io.write("__CAPTURED_END__")
-  -- 多段情報も出力
   if __capture_count > 1 then
     io.write("__LAYERS__:" .. tostring(__capture_count))
   end
+elseif not __ok and tostring(__err):find("parse_error") then
+  io.write("__PARSE_ERROR__:" .. tostring(__err))
 else
   io.write("__NO_CAPTURE__")
   if not __ok then
@@ -203,24 +344,26 @@ end
   return new Promise(resolve => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
-    exec(`${luaBin} ${tempFile}`, { timeout: 20000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+    exec(`${luaBin} ${tempFile}`, { timeout: 25000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
-      // キャプチャ成功
       if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
         const start    = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
-        const end      = stdout.indexOf('__CAPTURED_END__');
-        const captured = stdout.substring(start, end).trim();
+        const end_idx  = stdout.indexOf('__CAPTURED_END__');
+        const captured = stdout.substring(start, end_idx).trim();
 
         if (captured && captured.length > 5) {
-          // 多段レイヤー数を取得
           const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
           const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
           return resolve({ success: true, result: captured, layers, method: 'dynamic' });
         }
       }
 
-      // エラー情報
+      if (stdout.includes('__PARSE_ERROR__:')) {
+        const errMsg = stdout.split('__PARSE_ERROR__:')[1] || '';
+        return resolve({ success: false, error: 'パースエラー: ' + errMsg.substring(0, 300), method: 'dynamic' });
+      }
+
       if (stdout.includes('__ERROR__:')) {
         const errMsg = stdout.split('__ERROR__:')[1] || '';
         return resolve({ success: false, error: 'Luaエラー: ' + errMsg.substring(0, 300), method: 'dynamic' });
@@ -230,20 +373,15 @@ end
         return resolve({ success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic' });
       }
 
-      resolve({ success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic' });
+      resolve({ success: false, error: 'loadstring()が呼ばれませんでした（完全VM型難読化の可能性）', method: 'dynamic' });
     });
   });
 }
 
 // ════════════════════════════════════════════════════════
-//  静的解読メソッド群  (全面改訂版)
+//  静的解読メソッド群
 // ════════════════════════════════════════════════════════
 
-// ────────────────────────────────────────────────────────
-//  共通ユーティリティ
-// ────────────────────────────────────────────────────────
-
-/** Luaコードらしさのスコア */
 function scoreLuaCode(code) {
   const keywords = ['local','function','end','if','then','else','return','for','do','while','and','or','not','nil','true','false','print','table','string','math'];
   let score = 0;
@@ -306,9 +444,6 @@ function evalSimpleExpr(expr) {
   } catch { return null; }
 }
 
-// ────────────────────────────────────────────────────────
-//  XOR 解読
-// ────────────────────────────────────────────────────────
 function xorDecryptByte(byte, key) {
   let result = 0;
   for (let i = 0; i < 8; i++) {
@@ -343,9 +478,6 @@ function deobfuscateXOR(code) {
   return { success: true, result: bestResult, key: bestKey, score: bestScore, method: 'xor' };
 }
 
-// ────────────────────────────────────────────────────────
-//  SplitStrings / EncryptStrings / ConstantArray / Eval
-// ────────────────────────────────────────────────────────
 function deobfuscateSplitStrings(code) {
   let modified = code, found = false, iterations = 0;
   const re1 = /"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g;
@@ -451,20 +583,13 @@ function deobfuscateVmify(code) {
 }
 
 // ════════════════════════════════════════════════════════
-//  AUTO  —  動的実行メイン、静的解析はフォールバック
-//
-//  フロー:
-//   ① まず動的実行を試みる（Renderサーバーのluaを使う）
-//   ② 成功した場合、結果をさらに動的実行（多段難読化対応）
-//   ③ 動的実行が失敗した場合のみ静的解析を試みる
-//   ④ 静的解析で変化があれば、もう一度動的実行を試みる
+//  AUTO
 // ════════════════════════════════════════════════════════
 async function autoDeobfuscate(code) {
   const results = [];
   let current = code;
   const luaBin = checkLuaAvailable();
 
-  // ① メイン: 動的実行
   if (luaBin) {
     const dynRes = await tryDynamicExecution(current);
     results.push({ step: '動的実行 (1回目)', ...dynRes });
@@ -472,9 +597,7 @@ async function autoDeobfuscate(code) {
     if (dynRes.success && dynRes.result) {
       current = dynRes.result;
 
-      // ② 多段難読化対応: 結果をさらに動的実行（最大3回）
-      for (let round = 2; round <= 4; round++) {
-        // 結果がまだ難読化されていそうか確認（loadstringやBase64の特徴があるか）
+      for (let round = 2; round <= 5; round++) {
         const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+/]{60,}={0,2}/.test(current);
         if (!stillObfuscated) break;
 
@@ -483,11 +606,10 @@ async function autoDeobfuscate(code) {
         if (dynRes2.success && dynRes2.result && dynRes2.result !== current) {
           current = dynRes2.result;
         } else {
-          break; // これ以上変化しないので停止
+          break;
         }
       }
     } else {
-      // ③ 動的実行が失敗 → 静的解析で前処理してから再挑戦
       results.push({ step: '静的解析フォールバック開始', success: true, result: current, method: 'info' });
 
       const staticSteps = [
@@ -508,7 +630,6 @@ async function autoDeobfuscate(code) {
         }
       }
 
-      // ④ 静的解析で変化があれば動的実行を再試行
       if (staticChanged) {
         const dynRes3 = await tryDynamicExecution(current);
         results.push({ step: '動的実行 (静的解析後)', ...dynRes3 });
@@ -516,7 +637,6 @@ async function autoDeobfuscate(code) {
       }
     }
   } else {
-    // Luaなし → 静的解析のみ
     results.push({ step: '動的実行', success: false, error: 'Luaがインストールされていません', method: 'dynamic' });
     const staticSteps = [
       { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
@@ -541,7 +661,6 @@ async function autoDeobfuscate(code) {
 // ════════════════════════════════════════════════════════
 function obfuscateWithPrometheus(code, options = {}) {
   return new Promise(resolve => {
-    // PrometheusはLua5.1専用 → lua5.1 → luajit → lua の順で探す
     const luaBin = checkLua51Available();
     if (!luaBin) { resolve({ success: false, error: 'lua5.1またはLuaJITがインストールされていません' }); return; }
 
@@ -559,34 +678,16 @@ function obfuscateWithPrometheus(code, options = {}) {
     fs.writeFileSync(tmpIn, code);
 
     const preset = options.preset || 'Medium';
-    // stepsは現状Prometheusのargとして渡すと問題が起きるため使わない
-    // preset のみで制御する
     const cmd = `${luaBin} ${cliPath} --preset ${preset} ${tmpIn} --out ${tmpOut}`;
-
-    console.log('[Prometheus] cmd:', cmd);
-    console.log('[Prometheus] input preview:', JSON.stringify(code.substring(0, 120)));
 
     exec(cmd, { timeout: 30000, cwd: path.dirname(cliPath) }, (err, stdout, stderr) => {
       try { fs.unlinkSync(tmpIn); } catch {}
       const errText = (stderr || '').trim();
-      const outText = (stdout || '').trim();
-      console.log('[Prometheus] stdout:', outText.substring(0, 200));
-      console.log('[Prometheus] stderr:', errText.substring(0, 200));
       try {
-        if (err) {
-          // エラー内容をそのままフロントに返す
-          resolve({ success: false, error: 'Lua: ' + errText });
-          return;
-        }
-        if (!fs.existsSync(tmpOut)) {
-          resolve({ success: false, error: 'Prometheusが出力ファイルを生成しませんでした。stderr: ' + errText });
-          return;
-        }
+        if (err) { resolve({ success: false, error: 'Lua: ' + errText }); return; }
+        if (!fs.existsSync(tmpOut)) { resolve({ success: false, error: 'Prometheusが出力ファイルを生成しませんでした。stderr: ' + errText }); return; }
         const result = fs.readFileSync(tmpOut, 'utf8');
-        if (!result || result.trim().length === 0) {
-          resolve({ success: false, error: 'Prometheusの出力が空でした' });
-          return;
-        }
+        if (!result || result.trim().length === 0) { resolve({ success: false, error: 'Prometheusの出力が空でした' }); return; }
         resolve({ success: true, result, preset });
       } finally {
         try { fs.unlinkSync(tmpOut); } catch {}
@@ -596,34 +697,15 @@ function obfuscateWithPrometheus(code, options = {}) {
 }
 
 // ════════════════════════════════════════════════════════
-//  古い一時ファイルのクリーンアップ
-// ════════════════════════════════════════════════════════
-
-// ════════════════════════════════════════════════════════
 //  カスタムVM難読化
-//  Renderサーバー上のLuaで実行される独自VMを生成する
-//
-//  フロー:
-//   1. 入力Luaコードをサーバーに送る
-//   2. vm_obfuscator.luaがコードをVM命令列に変換
-//      - luacが使える場合: バイトコード → XOR暗号化 → VMランタイム
-//      - luacがない場合: ソース → 加算暗号化 → VMランタイム
-//   3. 生成されたVMコード（独自インタープリタ付き）を返す
 // ════════════════════════════════════════════════════════
 function obfuscateWithCustomVM(code, options = {}) {
   return new Promise(resolve => {
     const luaBin = checkLuaAvailable();
-    if (!luaBin) {
-      resolve({ success: false, error: 'Luaがインストールされていません' });
-      return;
-    }
+    if (!luaBin) { resolve({ success: false, error: 'Luaがインストールされていません' }); return; }
 
-    // vm_obfuscator.lua の場所を確認
     const vmScript = path.join(__dirname, 'vm_obfuscator.lua');
-    if (!fs.existsSync(vmScript)) {
-      resolve({ success: false, error: 'vm_obfuscator.luaが見つかりません' });
-      return;
-    }
+    if (!fs.existsSync(vmScript)) { resolve({ success: false, error: 'vm_obfuscator.luaが見つかりません' }); return; }
 
     const seed = options.seed || (Math.floor(Math.random() * 900000) + 100000);
     const tmpIn  = path.join(tempDir, `vm_in_${crypto.randomBytes(8).toString('hex')}.lua`);
@@ -631,37 +713,20 @@ function obfuscateWithCustomVM(code, options = {}) {
     fs.writeFileSync(tmpIn, code, 'utf8');
 
     const cmd = `${luaBin} ${vmScript} ${tmpIn} --out ${tmpOut} --seed ${seed}`;
-    console.log('[VM] cmd:', cmd);
 
     exec(cmd, { timeout: 30000, cwd: __dirname }, (err, stdout, stderr) => {
       try { fs.unlinkSync(tmpIn); } catch {}
 
       const outText = (stdout || '').trim();
       const errText = (stderr || '').trim();
-      console.log('[VM] stdout:', outText.substring(0, 200));
-      if (errText) console.log('[VM] stderr:', errText.substring(0, 200));
 
-      if (err) {
-        resolve({ success: false, error: 'VM難読化エラー: ' + (errText || err.message) });
-        return;
-      }
-
-      // vm_obfuscator.lua は成功時 "OK:<outfile>" を stdout に出力する
-      if (!outText.startsWith('OK:') && !fs.existsSync(tmpOut)) {
-        resolve({ success: false, error: 'VM難読化失敗: ' + (errText || outText || '出力なし') });
-        return;
-      }
+      if (err) { resolve({ success: false, error: 'VM難読化エラー: ' + (errText || err.message) }); return; }
+      if (!outText.startsWith('OK:') && !fs.existsSync(tmpOut)) { resolve({ success: false, error: 'VM難読化失敗: ' + (errText || outText || '出力なし') }); return; }
 
       try {
-        if (!fs.existsSync(tmpOut)) {
-          resolve({ success: false, error: '出力ファイルが見つかりません' });
-          return;
-        }
+        if (!fs.existsSync(tmpOut)) { resolve({ success: false, error: '出力ファイルが見つかりません' }); return; }
         const result = fs.readFileSync(tmpOut, 'utf8');
-        if (!result || result.trim().length === 0) {
-          resolve({ success: false, error: 'VM難読化の出力が空でした' });
-          return;
-        }
+        if (!result || result.trim().length === 0) { resolve({ success: false, error: 'VM難読化の出力が空でした' }); return; }
         resolve({ success: true, result, seed, method: 'custom_vm' });
       } finally {
         try { fs.unlinkSync(tmpOut); } catch {}
@@ -670,28 +735,8 @@ function obfuscateWithCustomVM(code, options = {}) {
   });
 }
 
-setInterval(() => {
-  const now = Date.now();
-  fs.readdir(tempDir, (err, files) => {
-    if (err) return;
-    files.forEach(file => {
-      const fp = path.join(tempDir, file);
-      fs.stat(fp, (err, stats) => {
-        if (!err && now - stats.mtimeMs > 10 * 60 * 1000) fs.unlink(fp, () => {});
-      });
-    });
-  });
-}, 5 * 60 * 1000);
-
 // ════════════════════════════════════════════════════════
 //  フル難読化 API  POST /api/full-obfuscate
-//  bot.py から呼ぶ用: カスタムVM + Prometheus + Base64/XOR
-//
-//  固定設定:
-//   - カスタムVM: ON
-//   - Base64層数: 12
-//   - ダミーコード: 250
-//   - XOR難読化: ON
 // ════════════════════════════════════════════════════════
 app.post('/api/full-obfuscate', async (req, res) => {
   const { code, seed } = req.body;
@@ -699,7 +744,6 @@ app.post('/api/full-obfuscate', async (req, res) => {
 
   let current = code;
 
-  // ① カスタムVM難読化
   const vmRes = await obfuscateWithCustomVM(current, { seed });
   if (vmRes.success && vmRes.result) {
     current = vmRes.result;
@@ -707,12 +751,10 @@ app.post('/api/full-obfuscate', async (req, res) => {
     return res.json({ success: false, error: 'VM難読化失敗: ' + (vmRes.error || '') });
   }
 
-  // ② Base64 + XOR (Node.js側で実装)
   const XOR_DEPTH = 36;
   const B64_LAYERS = 10;
   const JUNK_COUNT = 250;
 
-  // XOR暗号化
   const masterSeed = seed || (Math.floor(Math.random() * 99999999) + 100000);
   let rngState = masterSeed;
   const rng = () => { rngState = (rngState * 1664525 + 1013904223) % 4294967296; return rngState; };
@@ -738,13 +780,11 @@ app.post('/api/full-obfuscate', async (req, res) => {
     }
   }
 
-  // Base64を12層
   let encoded = bytes.toString('base64');
   for (let i = 1; i < B64_LAYERS; i++) {
     encoded = Buffer.from(encoded).toString('base64');
   }
 
-  // ジャンクコード・変数名生成ヘルパー
   const usedVars = new Set();
   const makeVar = () => {
     const starts = ['I','l','O','Il','lI','OI','IO','lO','Ol'];
@@ -778,7 +818,6 @@ app.post('/api/full-obfuscate', async (req, res) => {
     return out;
   };
 
-  // Luaコード組み立て
   const vLib  = makeVar(), vStr = makeVar(), vTbl = makeVar();
   const vMap  = makeVar(), vIdx = makeVar(), vS   = makeVar();
   const vRr   = makeVar(), vPp  = makeVar(), vNn  = makeVar();
@@ -793,7 +832,6 @@ app.post('/api/full-obfuscate', async (req, res) => {
   const vXB2  = makeVar(), vXOut= makeVar(), vXVar= makeVar();
   const vVM2  = makeVar(), vVMSt= makeVar();
 
-  // Base64アルファベットをチャンク分割して隠す
   const fullAlpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
   const aKey = Math.floor(Math.random() * 40) + 5;
   const chunks = [];
@@ -803,7 +841,6 @@ app.post('/api/full-obfuscate', async (req, res) => {
     chunks.push(`(function()local _t={${enc}};local _r={};for _i=1,#_t do _r[_i]=string.char(_t[_i]-${aKey})end;return table.concat(_r)end)()`);
   }
 
-  // XORデコーダ (Lua5.1互換)
   const sA = Math.floor(Math.random() * 800) + 100;
   const sB = Math.floor(masterSeed / sA);
   const sC = masterSeed - sA * sB;
@@ -854,7 +891,6 @@ local function ${vXVar}(${vS})
 end
 `;
 
-  // Base64デコーダ
   const b64Decoder = `
 local ${vParts}={${chunks.join(',')}}
 local ${vAlpha}=table.concat(${vParts})
@@ -875,12 +911,10 @@ local function ${vLib}(${vS})
 end
 `;
 
-  // loadstring参照を難読化
   const lsKey = Math.floor(Math.random() * 40) + 5;
   const lsEnc = 'loadstring'.split('').map(c => c.charCodeAt(0) + lsKey).join(',');
   const ldRef = `local ${vLd}=(function()local _t={${lsEnc}};local _r={};for _i=1,#_t do _r[_i]=string.char(_t[_i]-${lsKey})end;return rawget(_G,table.concat(_r)) or loadstring end)()`;
 
-  // 制御フロー平坦化
   const steps = [];
   for (let i = 0; i < B64_LAYERS; i++) steps.push(`${vStr}=${vLib}(${vStr})`);
   steps.push(`${vStr}=${vXVar}(${vStr})`);
@@ -905,6 +939,20 @@ end)()`;
 
   res.json({ success: true, result: finalLua, seed: masterSeed, method: 'full' });
 });
+
+// 古い一時ファイルのクリーンアップ
+setInterval(() => {
+  const now = Date.now();
+  fs.readdir(tempDir, (err, files) => {
+    if (err) return;
+    files.forEach(file => {
+      const fp = path.join(tempDir, file);
+      fs.stat(fp, (err, stats) => {
+        if (!err && now - stats.mtimeMs > 10 * 60 * 1000) fs.unlink(fp, () => {});
+      });
+    });
+  });
+}, 5 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`🔥 Lua Obfuscator/Deobfuscator Server running on port ${PORT}`);
