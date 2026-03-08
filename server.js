@@ -443,9 +443,7 @@ class CapturePool {
 //  共通ユーティリティ  (v2から引継ぎ + 拡張)
 // ────────────────────────────────────────────────────────────────────────
 function scoreLuaCode(code) {
-  if (!code || typeof code !== 'string') return 0;
-  const keywords = ['local','function','end','if','then','else','return','for','do',
-    'while','and','or','not','nil','true','false','print','table','string','math'];
+  const keywords = ['local','function','end','if','then','else','return','for','do','while','and','or','not','nil','true','false','print','table','string','math'];
   let score = 0;
   keywords.forEach(kw => {
     const m = code.match(new RegExp('\\b' + kw + '\\b', 'g'));
@@ -634,8 +632,13 @@ function evalLuaNumExpr(expr) {
   } catch { return null; }
 }
 function evalSimpleExpr(expr) {
-  const r=evalLuaNumExpr(expr); if(r===null)return null;
-  return Number.isInteger(r)?r:Math.floor(r);
+  try {
+    const clean = expr.trim();
+    if (!/^[\d\s+\-*/%().]+$/.test(clean)) return null;
+    const result = Function('"use strict"; return (' + clean + ')')();
+    if (typeof result === 'number' && isFinite(result)) return Math.floor(result);
+    return null;
+  } catch { return null; }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -744,53 +747,46 @@ function evalExprWithEnv(expr,env){
 //  #2  evaluateExpressions  — Lua定数式を正規表現で検出して評価
 // ────────────────────────────────────────────────────────────────────────
 function evaluateExpressions(code) {
-  let modified=code, found=false;
-  let prev, iters=0;
+  let modified = code, found = false;
+  let prev, iters = 0;
   do {
-    prev=modified;
-    // 括弧内の純粋数値式（文字列外）
-    modified=modified.replace(/\(([^()'"\n]{1,120})\)/g,(match,inner)=>{
-      if(/["']/.test(inner)) return match;
-      const v=evalLuaNumExpr(inner);
-      if(v===null||!Number.isInteger(v)) return match;
-      if(String(v)===inner.trim()) return match;
-      found=true; return String(v);
+    prev = modified;
+    modified = modified.replace(/\(\s*([\d.]+)\s*([\+\-\*\/\%])\s*([\d.]+)\s*\)/g, (_, a, op, b) => {
+      const result = evalSimpleExpr(`${a}${op}${b}`);
+      if (result === null) return _;
+      found = true; return String(result);
     });
-    // 代入右辺の裸の数値算術
-    modified=modified.replace(/(=\s*)([0-9][0-9\s\+\-\*\/\%\^\(\)\.]*[0-9])/g,(match,eq,expr)=>{
-      if(/[a-zA-Z]/.test(expr)) return match;
-      const v=evalLuaNumExpr(expr);
-      if(v===null||!Number.isInteger(v)) return match;
-      if(String(v)===expr.trim()) return match;
-      found=true; return eq+String(v);
-    });
-    // 配列インデックス内の式
-    modified=modified.replace(/\[\s*([0-9][0-9\s\+\-\*\/\%\^\(\)\.]*)\s*\]/g,(match,expr)=>{
-      const v=evalLuaNumExpr(expr); if(v===null||!Number.isInteger(v)) return match;
-      if(String(v)===expr.trim()) return match;
-      found=true; return `[${v}]`;
-    });
-  } while(modified!==prev&&++iters<30);
-  if(!found) return { success:false, error:'評価できる定数式がありませんでした', method:'eval_expressions' };
-  return { success:true, result:modified, method:'eval_expressions' };
+  } while (modified !== prev && ++iters < 20);
+  modified = modified.replace(/\[\s*([\d\s+\-*\/%().]+)\s*\]/g, (match, expr) => {
+    const result = evalSimpleExpr(expr);
+    if (result === null) return match;
+    found = true; return `[${result}]`;
+  });
+  let concatIter = 0;
+  while (/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g.test(modified) && concatIter++ < 40) {
+    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g, (_, a, b) => { found = true; return `"${a}${b}"`; });
+  }
+  if (!found) return { success: false, error: '評価できる式がありませんでした', method: 'eval_expressions' };
+  return { success: true, result: modified, method: 'eval_expressions' };
 }
 
 // ────────────────────────────────────────────────────────────────────────
 //  #3  splitStrings  — 連続文字列連結を1つにまとめる
 // ────────────────────────────────────────────────────────────────────────
 function deobfuscateSplitStrings(code) {
-  let modified=code, found=false;
-  let prev, iters=0;
-  do {
-    prev=modified;
-    // 任意の組み合わせ
-    modified=modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.]*)*)"/g,(_,a,b)=>{ found=true; return `"${a}${b}"`; });
-    modified=modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.]*)*)'/g,(_,a,b)=>{ found=true; return `'${a}${b}'`; });
-    modified=modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*'((?:[^'\\]|\\.]*)*)'/g,(_,a,b)=>{ found=true; return `"${a}${b}"`; });
-    modified=modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*"((?:[^"\\]|\\.]*)*)"/g,(_,a,b)=>{ found=true; return `"${a}${b}"`; });
-  } while(modified!==prev&&++iters<80);
-  if(!found) return { success:false, error:'SplitStringsパターンが見つかりません', method:'split_strings' };
-  return { success:true, result:modified, method:'split_strings' };
+  let modified = code, found = false, iterations = 0;
+  const re1 = /"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g;
+  const re2 = /'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.)*)'/g;
+  while (re1.test(modified) && iterations < 60) {
+    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g, (_, a, b) => `"${a}${b}"`);
+    found = true; iterations++; re1.lastIndex = 0;
+  }
+  while (re2.test(modified) && iterations < 120) {
+    modified = modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.)*)'/g, (_, a, b) => `'${a}${b}'`);
+    found = true; iterations++; re2.lastIndex = 0;
+  }
+  if (!found) return { success: false, error: 'SplitStringsパターンが見つかりません', method: 'split_strings' };
+  return { success: true, result: modified, method: 'split_strings' };
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1139,14 +1135,17 @@ function vmDetector(code) {
 }
 
 function deobfuscateVmify(code) {
-  const r = vmDetector(code);
-  if (!r.isVm && r.hints.length === 0)
-    return { success: false, error: 'VMパターンが検出されませんでした', method: 'vmify' };
-  const vmType = r.isWereDev ? 'WereDev' : r.isMoonSec ? 'MoonSec' : r.isLuraph ? 'Luraph' : 'Generic';
-  return { success: true, result: code, hints: r.hints, strings: r.strings,
-    isWereDev: r.isWereDev, isMoonSec: r.isMoonSec, isLuraph: r.isLuraph,
-    vmType, weredevScore: r.weredevScore,
-    warning: `${vmType} VM検出 — 動的実行+フック解析を推奨`, method: 'vmify' };
+  const hints = [];
+  if (/return\s*\(function\s*\([^)]*\)/s.test(code)) hints.push('VMラッパー検出');
+  if (/\bInstructions\b|\bProto\b|\bupValues\b/i.test(code)) hints.push('Luaバイトコード構造を検出');
+  const strings = [];
+  const strPattern = /"([^"\\]{4,}(?:\\.[^"\\]*)*)"/g;
+  let m;
+  while ((m = strPattern.exec(code)) !== null) { if (m[1].length > 4) strings.push(m[1]); }
+  if (strings.length > 0) hints.push(`${strings.length}件の文字列リテラルを抽出`);
+  if (/\{(\s*\d+\s*,){8,}/.test(code)) hints.push('大規模バイトコードテーブルを検出');
+  if (hints.length === 0) return { success: false, error: 'Vmifyパターンが検出されませんでした', method: 'vmify' };
+  return { success: true, result: code, hints, strings: strings.slice(0, 50), warning: 'Vmify完全解読には動的実行を推奨', method: 'vmify' };
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1837,23 +1836,26 @@ function base64Detector(code, pool) {
 //  EncryptStrings  (後方互換 + charDecoder統合)
 // ────────────────────────────────────────────────────────────────────────
 function deobfuscateEncryptStrings(code) {
-  const env=new SymbolicEnv();
-  let res=charDecoder(code,env);
-  if(res.success) return res;
-  // フォールバック: 数値エスケープ展開
-  let modified=code, found=false;
-  modified=modified.replace(/"((?:\\[0-9]{1,3}|\\x[0-9a-fA-F]{2}|[^"\\])+)"/g,(match,inner)=>{
-    if(!/\\[0-9]|\\x/i.test(inner)) return match;
+  let modified = code, found = false;
+  modified = modified.replace(/string\.char\(([\d,\s]+)\)/g, (_, nums) => {
+    const chars = nums.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n) && n >= 0 && n <= 65535);
+    if (chars.length === 0) return _;
+    found = true;
+    return `"${chars.map(c => { const ch = String.fromCharCode(c); return ch === '"' ? '\\"' : ch === '\\' ? '\\\\' : ch; }).join('')}"`;
+  });
+  modified = modified.replace(/"((?:\\[0-9]{1,3}|\\x[0-9a-fA-F]{2}|[^"\\])+)"/g, (match, inner) => {
+    if (!/\\[0-9]|\\x/i.test(inner)) return match;
     try {
-      const decoded=resolveLuaStringEscapes(inner);
-      if([...decoded].every(c=>c.charCodeAt(0)>=32&&c.charCodeAt(0)<=126)){
-        found=true; return `"${decoded.replace(/"/g,'\\"').replace(/\\/g,'\\\\')}"`;
+      const decoded = resolveLuaStringEscapes(inner);
+      if ([...decoded].every(c => c.charCodeAt(0) >= 32 && c.charCodeAt(0) <= 126)) {
+        found = true;
+        return `"${decoded.replace(/"/g, '\\"').replace(/\\/g, '\\\\')}"`;
       }
     } catch {}
     return match;
   });
-  if(!found) return { success:false, error:'EncryptStringsパターンが見つかりません', method:'encrypt_strings' };
-  return { success:true, result:modified, method:'encrypt_strings' };
+  if (!found) return { success: false, error: 'EncryptStringsパターンが見つかりません', method: 'encrypt_strings' };
+  return { success: true, result: modified, method: 'encrypt_strings' };
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2273,231 +2275,81 @@ end
 // ────────────────────────────────────────────────────────────────────────
 //  autoDeobfuscate v5  (#1-#20, #56/#57 最終処理)
 // ────────────────────────────────────────────────────────────────────────
-async function autoDeobfuscate(code, _depth, _visitedCodes) {
-  const depth   = _depth || 0;
+async function autoDeobfuscate(code) {
   const results = [];
-  const origCode = code;
-  let current   = code;
-  const luaBin  = checkLuaAvailable();
-  const pool    = new CapturePool();
-  pool.add(current, 'input');
+  let current = code;
+  const luaBin = checkLuaAvailable();
 
-  // [1] 訪問済みコードセット（再帰呼び出し間で共有）
-  const visitedCodes = _visitedCodes || new Set();
-
-  // [3] 最大再帰深度を 3 に制限（無限展開防止）
-  const MAX_DEPTH = 3;
-  if (depth > MAX_DEPTH) {
-    return {
-      success: false, steps: results, finalCode: current,
-      finalScore: scoreLuaCode(current), poolSize: pool.entries.length,
-      savedResultPath: null, depth,
-    };
-  }
-
-  // [1] 入力コードが既訪問なら即停止
-  if (visitedCodes.has(current)) {
-    results.push({ step: 'VisitedSkip', success: false, method: 'visited_skip',
-      hints: ['このコードは既に処理済みのためスキップ'] });
-    return {
-      success: false, steps: results, finalCode: current,
-      finalScore: scoreLuaCode(current), poolSize: pool.entries.length,
-      savedResultPath: null, depth,
-    };
-  }
-  visitedCodes.add(current);
-
-  // ══ stripComments ════════════════════════════════════════════════════
-  {
-    const stripped = stripComments(current);
-    if (stripped !== current) {
-      results.push({ step: 'StripComments', success: true, method: 'strip_comments',
-        hints: ['巨大コメント難読化を除去'] });
-      current = stripped;
-      pool.add(current, 'strip_comments');
-    }
-  }
-
-  // ══ loaderPatternDetected チェック ═══════════════════════════════════
-  const isLoaderPattern = loaderPatternDetected(current);
-  results.push({
-    step: 'LoaderPatternCheck', success: true, method: 'loader_pattern',
-    loaderPattern: isLoaderPattern,
-    hints: isLoaderPattern ? ['loaderパターン検出'] : [],
-  });
-
-  let dynDecodedResult = null, dynVmAnalysis = null, wereDevDetected = false;
-
-  // ══ staticPipeline (pipeline → dynamicDecode の順) ═══════════════════
-  //  junk_clean → char_decoder → constant_array → eval_expressions
-  //  → xor_decoder → str_transform → dead_branch
-  // ══════════════════════════════════════════════════════════════════════
-  const staticPipeline = [
-    ['JunkClean',         junkAssignmentCleaner],
-    ['CharDecoder',       (c) => staticCharDecoder(c)],
-    ['ConstantArray',     constantArrayResolver],
-    ['EvalExpressions',   evaluateExpressions],
-    ['XorDecoder',        xorDecoder],
-    ['StringTransform',   stringTransformDecoder],
-    ['DeadBranch',        deadBranchRemover],
-  ];
-
-  const MAX_PASSES = 5;
-  let passChanged = true;
-  for (let pass = 0; pass < MAX_PASSES && passChanged; pass++) {
-    passChanged = false;
-    for (const [name, fn] of staticPipeline) {
-      const res = fn(current);
-      if (res.success && res.result && res.result !== current) {
-        // [7] results 内の過去ステップ result との重複チェック
-        const alreadySeen = results.some(r => r.result && r.result === res.result);
-        if (alreadySeen) continue;
-        results.push({ step: `${name} (pass${pass+1})`, ...res });
-        current = res.result;
-        pool.add(current, name.toLowerCase());
-        passChanged = true;
-      }
-    }
-  }
-
-  // AdvancedStatic (SymExec + ConstantFolding)
-  {
-    const advRes = advancedStaticDeobfuscate(current);
-    if (advRes.success && advRes.result !== current) {
-      results.push({ step: 'AdvancedStatic', ...advRes });
-      current = advRes.result;
-      pool.add(current, 'advanced_static');
-    }
-  }
-
-  // ══ dynamicDecode (pipeline後に実行) ════════════════════════════════
+  // ① メイン: 動的実行
   if (luaBin) {
-    const dynRes = await dynamicDecode(current);
-    results.push({
-      step: `dynamicDecode${depth > 0 ? ` (再帰${depth})` : ''}`,
-      success: dynRes.success, result: dynRes.result,
-      method: dynRes.method, error: dynRes.error,
-      decodedCount: dynRes.decodedCount,
-      WereDevVMDetected: dynRes.WereDevVMDetected,
-    });
+    const dynRes = await tryDynamicExecution(current);
+    results.push({ step: '動的実行 (1回目)', ...dynRes });
 
     if (dynRes.success && dynRes.result) {
-      // [2] dynRes.result が current と同じなら次ラウンドを実行しない
-      if (dynRes.result === current) {
-        results.push({ step: 'DynamicNoChange', success: false, method: 'dynamic_no_change',
-          hints: ['動的実行結果が入力と同一のためスキップ'] });
-      } else {
-        dynDecodedResult = dynRes.result;
-        dynVmAnalysis    = dynRes.vmAnalysis || null;
-        wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
-        current          = dynRes.result;
-        pool.add(current, 'dynamic_decode');
+      current = dynRes.result;
 
-        if (dynRes.allDecoded) {
-          for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
-        }
+      // ② 多段難読化対応: 結果をさらに動的実行（最大3回）
+      for (let round = 2; round <= 4; round++) {
+        // 結果がまだ難読化されていそうか確認（loadstringやBase64の特徴があるか）
+        const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+/]{60,}={0,2}/.test(current);
+        if (!stillObfuscated) break;
 
-        // [3][6] 多段loader再帰: 深度 MAX_DEPTH 以内 かつ 未訪問コードのみ
-        if (depth < MAX_DEPTH) {
-          // [5] stillObfuscated 判定: loadstring|load( のみ対象
-          const stillObfuscated = /loadstring|load\s*\(/.test(current);
-          // [6] 既訪問コードは再帰しない
-          if (stillObfuscated && !visitedCodes.has(current)) {
-            const recurse = await autoDeobfuscate(current, depth + 1, visitedCodes);
-            if (recurse.finalCode && recurse.finalCode !== current) {
-              current = recurse.finalCode;
-              pool.add(current, `recursive_loader_${depth + 1}`);
-              results.push({
-                step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
-                hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
-              });
-            }
-          }
+        const dynRes2 = await tryDynamicExecution(current);
+        results.push({ step: `動的実行 (${round}回目)`, ...dynRes2 });
+        if (dynRes2.success && dynRes2.result && dynRes2.result !== current) {
+          current = dynRes2.result;
+        } else {
+          break; // これ以上変化しないので停止
         }
+      }
+    } else {
+      // ③ 動的実行が失敗 → 静的解析で前処理してから再挑戦
+      results.push({ step: '静的解析フォールバック開始', success: true, result: current, method: 'info' });
+
+      const staticSteps = [
+        { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
+        { name: 'EncryptStrings',  fn: deobfuscateEncryptStrings },
+        { name: 'EvalExpressions', fn: evaluateExpressions },
+        { name: 'ConstantArray',   fn: deobfuscateConstantArray },
+        { name: 'XOR',             fn: deobfuscateXOR },
+      ];
+
+      let staticChanged = false;
+      for (const step of staticSteps) {
+        const res = step.fn(current);
+        results.push({ step: step.name, ...res });
+        if (res.success && res.result && res.result !== current) {
+          current = res.result;
+          staticChanged = true;
+        }
+      }
+
+      // ④ 静的解析で変化があれば動的実行を再試行
+      if (staticChanged) {
+        const dynRes3 = await tryDynamicExecution(current);
+        results.push({ step: '動的実行 (静的解析後)', ...dynRes3 });
+        if (dynRes3.success && dynRes3.result) current = dynRes3.result;
       }
     }
   } else {
-    results.push({ step: 'dynamicDecode', success: false,
-      error: 'Luaがインストールされていません', method: 'dynamic_decode' });
-  }
-
-  // ══ #19: VM検出は dynamicDecode の後にのみ ═══════════════════════════
-  if (!(isLoaderPattern && scoreLuaCode(current) < 20)) {
-    const vmTarget = dynDecodedResult || current;
-    const vmRes    = deobfuscateVmify(vmTarget);
-
-    if (vmRes.success) {
-      results.push({ step: 'VmDetect', ...vmRes });
-      const vmEx = vmBytecodeExtractor(vmTarget);
-      if (vmEx.success) results.push({ step: 'VmBytecodeExtract', ...vmEx });
-
-      const vmAnalysis = dynVmAnalysis ||
-        results.map(r => r.vmAnalysis).find(a => a && a.vmTrace && a.vmTrace.length > 0);
-
-      if (vmAnalysis && vmAnalysis.vmTrace && vmAnalysis.vmTrace.length > 0) {
-        const { vmTrace, bytecodeDump } = vmAnalysis;
-        const traceResult = vmTraceAnalyzer(vmTrace);            // #37-#39
-        results.push({ step: 'VmTraceAnalyzer', ...traceResult });
-
-        // #54: vmDecompiler を実行して VMコードを Lua に戻す
-        const decompResult = vmDecompiler(vmTrace, bytecodeDump, traceResult.opcodeMap);  // #40-#53
-        results.push({ step: 'VmDecompiler', ...decompResult });
-        if (decompResult.success && decompResult.pseudoCode) {
-          current = decompResult.pseudoCode;
-          pool.add(current, 'vm_decompiled');
-        }
-      }
-    }
-  } else {
-    results.push({ step: 'VmDetect (skipped)', success: false,
-      method: 'vm_detect_skipped', error: 'loaderPattern && score<20: VM解析スキップ' });
-  }
-
-  // base64検出
-  {
-    const b64res = base64Detector(current, pool);
-    if (b64res.success) results.push({ step: 'Base64Detect', ...b64res });
-  }
-
-  // ══ #55: beautifyLua で整形 ══════════════════════════════════════════
-  const beautified = beautifyLua(current);
-  if (beautified !== current) {
-    current = beautified;
-    results.push({ step: 'BeautifyLua', success: true, method: 'beautify' });
-  }
-
-  // ══ #56: スコア再計算 — 元コードより低ければ元コードを保持 ═══════════
-  // #17
-  const origScore = scoreLuaCode(origCode);
-  const finalScore = scoreLuaCode(current);
-  if (finalScore < origScore && current !== origCode) {
-    const poolBest = pool.getBest();
-    if (poolBest && scoreLuaCode(poolBest) >= origScore) {
-      current = poolBest;
-      results.push({ step: 'ScoreFallback', success: true, method: 'score_fallback',
-        hints: [`スコア改善: CapturePool最善候補を使用 (${finalScore.toFixed(0)} < ${origScore.toFixed(0)})`] });
+    // Luaなし → 静的解析のみ
+    results.push({ step: '動的実行', success: false, error: 'Luaがインストールされていません', method: 'dynamic' });
+    const staticSteps = [
+      { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
+      { name: 'EncryptStrings',  fn: deobfuscateEncryptStrings },
+      { name: 'EvalExpressions', fn: evaluateExpressions },
+      { name: 'ConstantArray',   fn: deobfuscateConstantArray },
+      { name: 'XOR',             fn: deobfuscateXOR },
+      { name: 'Vmify',           fn: deobfuscateVmify },
+    ];
+    for (const step of staticSteps) {
+      const res = step.fn(current);
+      results.push({ step: step.name, ...res });
+      if (res.success && res.result && res.result !== current) current = res.result;
     }
   }
-  const bestFinal = pool.getBest() || current;
-  const bestScore = Math.max(scoreLuaCode(current), scoreLuaCode(bestFinal));
-  if (scoreLuaCode(bestFinal) > scoreLuaCode(current)) current = bestFinal;
 
-  // ══ #57: result.lua として保存 ═══════════════════════════════════════
-  let savedResultPath = null;
-  try {
-    savedResultPath = path.join(tempDir, `result_${Date.now()}.lua`);
-    fs.writeFileSync(savedResultPath, current, 'utf8');
-  } catch {}
-
-  return {
-    success: results.some(r => r.success && r.result),
-    steps: results,
-    finalCode: current,
-    finalScore: scoreLuaCode(current),
-    poolSize: pool.entries.length,
-    savedResultPath,
-    depth,
-  };
+  return { success: results.some(r => r.success), steps: results, finalCode: current };
 }
 
 
