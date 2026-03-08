@@ -2242,7 +2242,13 @@ end
         const captured = stdout.substring(start, end).trim();
 
         if (captured && captured.length > 5) {
-          // 多段レイヤー数を取得
+          // [4] captured が元コードとほぼ同じ（長さ差5%以内）なら新レイヤーと判断しない
+          const originalLen = code.length;
+          const capturedLen = captured.length;
+          const diffRatio = Math.abs(capturedLen - originalLen) / Math.max(originalLen, 1);
+          if (diffRatio <= 0.05 && captured === code.trim()) {
+            return resolve({ success: false, error: 'captured が元コードと同一のため停止', method: 'dynamic' });
+          }
           const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
           const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
           return resolve({ success: true, result: captured, layers, method: 'dynamic' });
@@ -2267,16 +2273,41 @@ end
 // ────────────────────────────────────────────────────────────────────────
 //  autoDeobfuscate v5  (#1-#20, #56/#57 最終処理)
 // ────────────────────────────────────────────────────────────────────────
-async function autoDeobfuscate(code, _depth) {
+async function autoDeobfuscate(code, _depth, _visitedCodes) {
   const depth   = _depth || 0;
   const results = [];
-  const origCode = code;  // #17: 元コード保持用
+  const origCode = code;
   let current   = code;
   const luaBin  = checkLuaAvailable();
   const pool    = new CapturePool();
   pool.add(current, 'input');
 
-  // ══ #1: stripComments ════════════════════════════════════════════════
+  // [1] 訪問済みコードセット（再帰呼び出し間で共有）
+  const visitedCodes = _visitedCodes || new Set();
+
+  // [3] 最大再帰深度を 3 に制限（無限展開防止）
+  const MAX_DEPTH = 3;
+  if (depth > MAX_DEPTH) {
+    return {
+      success: false, steps: results, finalCode: current,
+      finalScore: scoreLuaCode(current), poolSize: pool.entries.length,
+      savedResultPath: null, depth,
+    };
+  }
+
+  // [1] 入力コードが既訪問なら即停止
+  if (visitedCodes.has(current)) {
+    results.push({ step: 'VisitedSkip', success: false, method: 'visited_skip',
+      hints: ['このコードは既に処理済みのためスキップ'] });
+    return {
+      success: false, steps: results, finalCode: current,
+      finalScore: scoreLuaCode(current), poolSize: pool.entries.length,
+      savedResultPath: null, depth,
+    };
+  }
+  visitedCodes.add(current);
+
+  // ══ stripComments ════════════════════════════════════════════════════
   {
     const stripped = stripComments(current);
     if (stripped !== current) {
@@ -2297,13 +2328,13 @@ async function autoDeobfuscate(code, _depth) {
 
   let dynDecodedResult = null, dynVmAnalysis = null, wereDevDetected = false;
 
-  // ══ #12: pipeline 先行 (pipeline → dynamicDecode の順) ═══════════════
+  // ══ staticPipeline (pipeline → dynamicDecode の順) ═══════════════════
   //  junk_clean → char_decoder → constant_array → eval_expressions
   //  → xor_decoder → str_transform → dead_branch
   // ══════════════════════════════════════════════════════════════════════
   const staticPipeline = [
     ['JunkClean',         junkAssignmentCleaner],
-    ['CharDecoder',       (c) => staticCharDecoder(c)],   // #13/#14 強化版
+    ['CharDecoder',       (c) => staticCharDecoder(c)],
     ['ConstantArray',     constantArrayResolver],
     ['EvalExpressions',   evaluateExpressions],
     ['XorDecoder',        xorDecoder],
@@ -2311,7 +2342,6 @@ async function autoDeobfuscate(code, _depth) {
     ['DeadBranch',        deadBranchRemover],
   ];
 
-  // maxPasses = 5
   const MAX_PASSES = 5;
   let passChanged = true;
   for (let pass = 0; pass < MAX_PASSES && passChanged; pass++) {
@@ -2319,6 +2349,9 @@ async function autoDeobfuscate(code, _depth) {
     for (const [name, fn] of staticPipeline) {
       const res = fn(current);
       if (res.success && res.result && res.result !== current) {
+        // [7] results 内の過去ステップ result との重複チェック
+        const alreadySeen = results.some(r => r.result && r.result === res.result);
+        if (alreadySeen) continue;
         results.push({ step: `${name} (pass${pass+1})`, ...res });
         current = res.result;
         pool.add(current, name.toLowerCase());
@@ -2349,28 +2382,36 @@ async function autoDeobfuscate(code, _depth) {
     });
 
     if (dynRes.success && dynRes.result) {
-      dynDecodedResult = dynRes.result;
-      dynVmAnalysis    = dynRes.vmAnalysis || null;
-      wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
-      current          = dynRes.result;
-      pool.add(current, 'dynamic_decode');
+      // [2] dynRes.result が current と同じなら次ラウンドを実行しない
+      if (dynRes.result === current) {
+        results.push({ step: 'DynamicNoChange', success: false, method: 'dynamic_no_change',
+          hints: ['動的実行結果が入力と同一のためスキップ'] });
+      } else {
+        dynDecodedResult = dynRes.result;
+        dynVmAnalysis    = dynRes.vmAnalysis || null;
+        wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
+        current          = dynRes.result;
+        pool.add(current, 'dynamic_decode');
 
-      if (dynRes.allDecoded) {
-        for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
-      }
+        if (dynRes.allDecoded) {
+          for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
+        }
 
-      // 多段loader再帰 (depth < 5)
-      if (depth < 5) {
-        const recurseCheck = /loadstring|load\s*\(|table\.concat\s*\(/.test(current);
-        if (recurseCheck) {
-          const recurse = await autoDeobfuscate(current, depth + 1);
-          if (recurse.finalCode && recurse.finalCode !== current) {
-            current = recurse.finalCode;
-            pool.add(current, `recursive_loader_${depth + 1}`);
-            results.push({
-              step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
-              hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
-            });
+        // [3][6] 多段loader再帰: 深度 MAX_DEPTH 以内 かつ 未訪問コードのみ
+        if (depth < MAX_DEPTH) {
+          // [5] stillObfuscated 判定: loadstring|load( のみ対象
+          const stillObfuscated = /loadstring|load\s*\(/.test(current);
+          // [6] 既訪問コードは再帰しない
+          if (stillObfuscated && !visitedCodes.has(current)) {
+            const recurse = await autoDeobfuscate(current, depth + 1, visitedCodes);
+            if (recurse.finalCode && recurse.finalCode !== current) {
+              current = recurse.finalCode;
+              pool.add(current, `recursive_loader_${depth + 1}`);
+              results.push({
+                step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
+                hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
+              });
+            }
           }
         }
       }
