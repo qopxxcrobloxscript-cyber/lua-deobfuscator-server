@@ -180,41 +180,16 @@ function loaderPatternDetected(code) {
 //  #4/#5  safeEnvPreamble 強化版 — 完全サンドボックス環境
 // ────────────────────────────────────────────────────────────────────────
 const safeEnvPreamble = `
--- ══ YAJU SafeEnv v3 ══
-
--- [4] math.random を常に0返しに固定 (ランダム性除去でデコード安定化)
-pcall(function()
-  math.random = function() return 0 end
-  math.randomseed = function() end
-end)
-
--- [5] os.exit を無効化
--- [6] os.date を固定値に
+-- ══ YAJU SafeEnv v2 ══
+-- os.* を完全無効化
 pcall(function()
   os.exit    = function() end
   os.execute = function() return false, "disabled", -1 end
-  os.date    = function() return "2025" end
-  os.time    = function() return 1700000000 end
-  os.clock   = function() return 0 end
 end)
-
--- [7] bit32 互換レイヤー (未定義環境向け)
-if not bit32 then
-  bit32 = {
-    bnot  = function(x) return -x end,
-    band  = function(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 and math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end,
-    bor   = function(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 or math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end,
-    bxor  = function(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2~=math.floor(b/2^i)%2 then r=r+2^i end end;return r end,
-    lshift= function(a,b) return math.floor(a*(2^b))%4294967296 end,
-    rshift= function(a,b) return math.floor(a/(2^b)) end,
-  }
-end
-
 -- io.* 危険関数を無効化
 pcall(function()
   io.popen  = function() return nil, "disabled" end
 end)
-
 -- debug.* を無効化
 pcall(function()
   if debug then
@@ -225,7 +200,6 @@ pcall(function()
     debug.getmetatable = nil; debug.setmetatable = nil
   end
 end)
-
 -- require を制限 (ネットワーク/FFI ライブラリを禁止)
 local __orig_require = require
 pcall(function()
@@ -235,36 +209,8 @@ pcall(function()
     return __orig_require(m)
   end
 end)
-
--- [1] table.concat フック — DECODE_STAGE として出力
-local __orig_table_concat = table.concat
-pcall(function()
-  table.concat = function(t, ...)
-    local r = __orig_table_concat(t, ...)
-    if type(r) == "string" and #r > 10 then
-      io.write("\\n__DECODE_STAGE__\\n")
-      io.write(r)
-      io.write("\\n__DECODE_STAGE_END__\\n")
-      io.flush()
-    end
-    return r
-  end
-end)
-
--- [8] pcall フック — エラー文字列を PCALL として出力
-local __orig_pcall = pcall
-pcall = function(f, ...)
-  local ok, r = __orig_pcall(f, ...)
-  if type(r) == "string" and #r > 0 then
-    io.write("\\n__PCALL__\\n")
-    io.write(tostring(r))
-    io.write("\\n__PCALL_END__\\n")
-    io.flush()
-  end
-  return ok, r
-end
-
--- 暴走防止: デバッグフックで命令数を制限 (500000命令)
+-- #5: while true do / repeat until の暴走防止
+-- デバッグフックで命令数を制限 (500000命令)
 local __safe_ops = 0
 local __safe_max = 500000
 pcall(function()
@@ -285,33 +231,32 @@ end)
 //  #6/#7/#8  hookLoadstringCode 強化版 — 全パターンをフック
 // ────────────────────────────────────────────────────────────────────────
 const hookLoadstringCode = `
--- ══ YAJU hookLoadstring v3 ══
+-- ══ YAJU hookLoadstring v2 ══
 local __orig_ls = loadstring or load
 local __orig_ld = load or loadstring
 local __decoded_count = 0
+local __decoded_best  = nil
 local __decoded_best_len = 0
 
--- [2][3] loadstring / load 共通フック関数
--- LOAD_STAGE として文字列を出力し、元の関数に委譲
+-- #6: 全パターンをフックする共通フック関数
+-- #8: local f = __orig_ls(code_str); if f then return f end (二重実行防止)
 local function __hookLoadstring(code_str, name, mode, env)
   if type(code_str) == "string" and #code_str > 10 then
     __decoded_count = __decoded_count + 1
-    -- __DECODED__ マーカーで出力 (parseDecodedOutputs が拾う)
+    -- #7: __DECODED__ を stdout に出力 (インデックス付き)
     io.write("\\n__DECODED_START_" .. tostring(__decoded_count) .. "__\\n")
     io.write(code_str)
     io.write("\\n__DECODED_END_" .. tostring(__decoded_count) .. "__\\n")
-    -- LOAD_STAGE としても出力 (補助的に)
-    io.write("\\n__LOAD_STAGE__\\n")
-    io.write(code_str)
-    io.write("\\n__LOAD_STAGE_END__\\n")
     io.flush()
     if #code_str > __decoded_best_len then
+      __decoded_best     = code_str
       __decoded_best_len = #code_str
     end
   end
-  -- 二重実行防止: コンパイルのみ、実行は呼び出し元に任せる
+  -- #8: 二重実行防止 — コンパイルのみ、実行は呼び出し元に任せる
   local f, err
   if env ~= nil then
+    -- load(code, name, mode, _ENV) パターン (#6)
     if __orig_ld and __orig_ld ~= __hookLoadstring then
       f, err = __orig_ld(code_str, name, mode, env)
     else
@@ -324,7 +269,7 @@ local function __hookLoadstring(code_str, name, mode, env)
   return nil, err
 end
 
--- loadstring / load を差し替え
+-- #6: loadstring/load の全パターンを差し替え
 _G.loadstring = __hookLoadstring
 _G.load       = __hookLoadstring
 if rawset then
@@ -339,60 +284,20 @@ end
 // ────────────────────────────────────────────────────────────────────────
 function parseDecodedOutputs(stdout) {
   const results = [];
-
-  // __DECODED_START_N__ / __DECODED_END_N__ マーカー
   const re = /__DECODED_START_(\d+)__\n([\s\S]*?)\n__DECODED_END_\1__/g;
   let m;
   while ((m = re.exec(stdout)) !== null) {
     const idx  = parseInt(m[1]);
     const code = m[2];
     if (!code || code.length < 5) continue;
+    // #10: スコアフィルター (30以上のみ採用)
     const score = scoreLuaCode(code);
-    if (score > 15) results.push({ idx, code, score });
+    if (score > 30) results.push({ idx, code, score });
   }
-
-  // __DECODE_STAGE__ (table.concat フック)
-  const reStage = /__DECODE_STAGE__\n([\s\S]*?)\n__DECODE_STAGE_END__/g;
-  let idxStage = 1000;
-  while ((m = reStage.exec(stdout)) !== null) {
-    const code = m[1];
-    if (!code || code.length < 5) continue;
-    const score = scoreLuaCode(code);
-    if (score > 15) results.push({ idx: idxStage++, code, score, source: 'decode_stage' });
-  }
-
-  // __LOAD_STAGE__ (load/loadstring 補助フック)
-  const reLoad = /__LOAD_STAGE__\n([\s\S]*?)\n__LOAD_STAGE_END__/g;
-  let idxLoad = 2000;
-  while ((m = reLoad.exec(stdout)) !== null) {
-    const code = m[1];
-    if (!code || code.length < 5) continue;
-    const score = scoreLuaCode(code);
-    if (score > 15) results.push({ idx: idxLoad++, code, score, source: 'load_stage' });
-  }
-
-  // __PCALL__ (pcall フック — エラー文字列にLuaコードが含まれる場合)
-  const rePcall = /__PCALL__\n([\s\S]*?)\n__PCALL_END__/g;
-  let idxPcall = 3000;
-  while ((m = rePcall.exec(stdout)) !== null) {
-    const code = m[1];
-    if (!code || code.length < 5) continue;
-    const score = scoreLuaCode(code);
-    if (score > 15) results.push({ idx: idxPcall++, code, score, source: 'pcall' });
-  }
-
   // スコア順 (高い順) にソート → 最高スコアを best に
   results.sort((a, b) => b.score - a.score);
-  // 重複除去 (同一コードを1件に)
-  const seen = new Set();
-  const unique = results.filter(r => {
-    const key = r.code.substring(0, 120);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-  const best = unique[0] || null;
-  return { all: unique, best: best ? best.code : null };
+  const best = results[0] || null;
+  return { all: results, best: best ? best.code : null };
 }
 
 
@@ -2053,8 +1958,8 @@ end
   return new Promise(resolve => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
-    // #25: タイムアウト 3000ms
-    exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
+    // #25: タイムアウトを 6000ms に変更 (3000→6000)
+    exec(`${luaBin} ${tempFile}`, { timeout: 6000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
       // #9: __DECODED__ 抽出 (scoreLuaCode フィルター付き #10)
@@ -2138,32 +2043,76 @@ async function autoDeobfuscate(code, _depth) {
     }
   }
 
-  // ══ loaderPatternDetected チェック ═══════════════════════════════════
+  // ══ #2/#3: loaderPatternDetected → dynamicDecode 最優先 ═════════════
   const isLoaderPattern = loaderPatternDetected(current);
   results.push({
     step: 'LoaderPatternCheck', success: true, method: 'loader_pattern',
     loaderPattern: isLoaderPattern,
-    hints: isLoaderPattern ? ['loaderパターン検出'] : [],
+    hints: isLoaderPattern ? ['loaderパターン検出 → dynamicDecode優先'] : [],
   });
 
   let dynDecodedResult = null, dynVmAnalysis = null, wereDevDetected = false;
 
-  // ══ #12: pipeline 先行 (pipeline → dynamicDecode の順) ═══════════════
-  //  junk_clean → char_decoder → constant_array → eval_expressions
-  //  → xor_decoder → str_transform → dead_branch
+  if (luaBin) {
+    // ── #2: dynamicDecode を pipeline 最初に ──
+    const dynRes = await dynamicDecode(current);
+    results.push({
+      step: `dynamicDecode${depth > 0 ? ` (再帰${depth})` : ''}`,
+      success: dynRes.success, result: dynRes.result,
+      method: dynRes.method, error: dynRes.error,
+      decodedCount: dynRes.decodedCount,
+      WereDevVMDetected: dynRes.WereDevVMDetected,
+    });
+
+    if (dynRes.success && dynRes.result) {
+      dynDecodedResult = dynRes.result;
+      dynVmAnalysis    = dynRes.vmAnalysis || null;
+      wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
+      current          = dynRes.result;
+      pool.add(current, 'dynamic_decode');
+
+      // #18: decoded.all を CapturePool に追加
+      if (dynRes.allDecoded) {
+        for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
+      }
+
+      // #11: decoded.best がある場合 → 再帰実行で多段loaderを解読
+      if (depth < 3) {
+        const recurseCheck = /loadstring|load\s*\(|table\.concat\s*\(/.test(current);
+        if (recurseCheck) {
+          const recurse = await autoDeobfuscate(current, depth + 1);
+          if (recurse.finalCode && recurse.finalCode !== current) {
+            current = recurse.finalCode;
+            pool.add(current, `recursive_loader_${depth + 1}`);
+            results.push({
+              step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
+              hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
+            });
+          }
+        }
+      }
+    }
+  } else {
+    results.push({ step: 'dynamicDecode', success: false,
+      error: 'Luaがインストールされていません', method: 'dynamic_decode' });
+  }
+
+  // ══ #12: pipeline 順序 ══════════════════════════════════════════════
+  //  junk_clean → eval_expressions → char_decoder → xor_decoder
+  //  → constant_array → str_transform → dead_branch
   // ══════════════════════════════════════════════════════════════════════
   const staticPipeline = [
     ['JunkClean',         junkAssignmentCleaner],
-    ['CharDecoder',       (c) => staticCharDecoder(c)],   // #13/#14 強化版
-    ['ConstantArray',     constantArrayResolver],
     ['EvalExpressions',   evaluateExpressions],
+    ['CharDecoder',       (c) => staticCharDecoder(c)],   // #13/#14 強化版
     ['XorDecoder',        xorDecoder],
+    ['ConstantArray',     constantArrayResolver],
     ['StringTransform',   stringTransformDecoder],
     ['DeadBranch',        deadBranchRemover],
   ];
 
-  // maxPasses = 5
-  const MAX_PASSES = 5;
+  // #16: maxPasses を 10 に増加
+  const MAX_PASSES = 10;
   let passChanged = true;
   for (let pass = 0; pass < MAX_PASSES && passChanged; pass++) {
     passChanged = false;
@@ -2188,51 +2137,21 @@ async function autoDeobfuscate(code, _depth) {
     }
   }
 
-  // ══ dynamicDecode (pipeline後に実行) ════════════════════════════════
-  if (luaBin) {
-    const dynRes = await dynamicDecode(current);
-    results.push({
-      step: `dynamicDecode${depth > 0 ? ` (再帰${depth})` : ''}`,
-      success: dynRes.success, result: dynRes.result,
-      method: dynRes.method, error: dynRes.error,
-      decodedCount: dynRes.decodedCount,
-      WereDevVMDetected: dynRes.WereDevVMDetected,
-    });
-
-    if (dynRes.success && dynRes.result) {
-      dynDecodedResult = dynRes.result;
-      dynVmAnalysis    = dynRes.vmAnalysis || null;
-      wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
-      current          = dynRes.result;
-      pool.add(current, 'dynamic_decode');
-
-      if (dynRes.allDecoded) {
-        for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
-      }
-
-      // 多段loader再帰 (depth < 5)
-      if (depth < 5) {
-        const recurseCheck = /loadstring|load\s*\(|table\.concat\s*\(/.test(current);
-        if (recurseCheck) {
-          const recurse = await autoDeobfuscate(current, depth + 1);
-          if (recurse.finalCode && recurse.finalCode !== current) {
-            current = recurse.finalCode;
-            pool.add(current, `recursive_loader_${depth + 1}`);
-            results.push({
-              step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
-              hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
-            });
-          }
-        }
+  // 静的後 dynamicDecode 再試行
+  if (luaBin && current !== origCode && !dynDecodedResult) {
+    const dynRes2 = await dynamicDecode(current);
+    results.push({ step: 'dynamicDecode (post-static)', ...dynRes2 });
+    if (dynRes2.success && dynRes2.result) {
+      current = dynRes2.result;
+      pool.add(current, 'dynamic_post_static');
+      if (dynRes2.allDecoded) {
+        for (const dc of dynRes2.allDecoded) pool.add(dc, 'decoded_candidate2');
       }
     }
-  } else {
-    results.push({ step: 'dynamicDecode', success: false,
-      error: 'Luaがインストールされていません', method: 'dynamic_decode' });
   }
 
   // ══ #19: VM検出は dynamicDecode の後にのみ ═══════════════════════════
-  if (!(isLoaderPattern && scoreLuaCode(current) < 20)) {
+  if (!isLoaderPattern) {
     const vmTarget = dynDecodedResult || current;
     const vmRes    = deobfuscateVmify(vmTarget);
 
@@ -2260,7 +2179,7 @@ async function autoDeobfuscate(code, _depth) {
     }
   } else {
     results.push({ step: 'VmDetect (skipped)', success: false,
-      method: 'vm_detect_skipped', error: 'loaderPattern && score<20: VM解析スキップ' });
+      method: 'vm_detect_skipped', error: 'loaderPattern: VM解析スキップ' });
   }
 
   // base64検出
