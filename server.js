@@ -285,22 +285,22 @@ end)
 //  #6/#7/#8  hookLoadstringCode 強化版 — 全パターンをフック
 // ────────────────────────────────────────────────────────────────────────
 const hookLoadstringCode = `
--- ══ YAJU hookLoadstring v3 ══
-local __orig_ls = loadstring or load
-local __orig_ld = load or loadstring
+-- ══ YAJU hookLoadstring v4 ══
+-- [6] __original_loadstring は必ず loadstring or load から取得
+local __original_loadstring = loadstring or load
 local __decoded_count = 0
 local __decoded_best_len = 0
 
--- [2][3] loadstring / load 共通フック関数
--- LOAD_STAGE として文字列を出力し、元の関数に委譲
+-- [1][2][3][6] loadstring / load 共通フック関数
+-- capture条件: #code_str > 10 (短いLuaコードもキャプチャ) [2]
 local function __hookLoadstring(code_str, name, mode, env)
   if type(code_str) == "string" and #code_str > 10 then
     __decoded_count = __decoded_count + 1
-    -- __DECODED__ マーカーで出力 (parseDecodedOutputs が拾う)
+    -- __DECODED__ マーカーで出力
     io.write("\\n__DECODED_START_" .. tostring(__decoded_count) .. "__\\n")
     io.write(code_str)
     io.write("\\n__DECODED_END_" .. tostring(__decoded_count) .. "__\\n")
-    -- LOAD_STAGE としても出力 (補助的に)
+    -- LOAD_STAGE としても補助出力
     io.write("\\n__LOAD_STAGE__\\n")
     io.write(code_str)
     io.write("\\n__LOAD_STAGE_END__\\n")
@@ -309,24 +309,23 @@ local function __hookLoadstring(code_str, name, mode, env)
       __decoded_best_len = #code_str
     end
   end
-  -- 二重実行防止: コンパイルのみ、実行は呼び出し元に任せる
+  -- [6] 元の関数に委譲 (__original_loadstring を直接呼ぶ)
   local f, err
-  if env ~= nil then
-    if __orig_ld and __orig_ld ~= __hookLoadstring then
-      f, err = __orig_ld(code_str, name, mode, env)
-    else
-      f, err = __orig_ls(code_str)
-    end
+  if env ~= nil and __original_loadstring ~= __hookLoadstring then
+    f, err = __original_loadstring(code_str, name, mode, env)
   else
-    f, err = __orig_ls(code_str)
+    f, err = __original_loadstring(code_str)
   end
   if f then return f end
   return nil, err
 end
 
--- loadstring / load を差し替え
+-- [1][7] _G への代入 + loadstring / load への直接代入を両方行う
+-- rawset だけに依存しない
 _G.loadstring = __hookLoadstring
 _G.load       = __hookLoadstring
+loadstring    = __hookLoadstring
+load          = __hookLoadstring
 if rawset then
   pcall(function() rawset(_G, "loadstring", __hookLoadstring) end)
   pcall(function() rawset(_G, "load",       __hookLoadstring) end)
@@ -2014,11 +2013,11 @@ async function dynamicDecode(code) {
   const vmInfo = vmDetector(codeToRun);
 
   const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
-  const safeFullCode = fullCode.replace(/\]\]/g, '] ]');
+  const safeFullCode = fullCode.replace(/\]\]/g, ']] ');
   const tempFile = path.join(tempDir, `dyndec_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
 
   const wrapper = `
--- ══ YAJU dynamicDecode v2 Wrapper ══
+-- ══ YAJU dynamicDecode v3 Wrapper ══
 -- アンチダンプ・アンチデバッグを無効化
 pcall(function()
   if debug then
@@ -2038,7 +2037,25 @@ local __obf_code = [[
 ${safeFullCode}
 ]]
 
+-- [1] preamble 内のフックが確実に有効になるよう
+-- wrapper レベルでも loadstring / load を直接上書き
 local __orig_ls_outer = loadstring or load
+local function __outer_hook(c, ...)
+  if type(c) == "string" and #c > 10 then
+    io.write("\\n__DECODED_START_0__\\n")
+    io.write(c)
+    io.write("\\n__DECODED_END_0__\\n")
+    io.flush()
+  end
+  return __orig_ls_outer(c, ...)
+end
+loadstring = __outer_hook
+load       = __outer_hook
+if rawset then
+  pcall(function() rawset(_G, "loadstring", __outer_hook) end)
+  pcall(function() rawset(_G, "load",       __outer_hook) end)
+end
+
 local __ok, __err = pcall(function()
   local chunk, err = __orig_ls_outer(__obf_code)
   if not chunk then error("parse error: " .. tostring(err)) end
@@ -2054,7 +2071,7 @@ end
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
     // #25: タイムアウト 3000ms
-    exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
+    exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
       // #9: __DECODED__ 抽出 (scoreLuaCode フィルター付き #10)
@@ -2076,8 +2093,8 @@ end
         );
       }
 
-      // __DECODED__ が取れた場合
-      if (decoded.best) {
+      // __DECODED__ が取れた場合 [8] captured が短すぎる場合は success にしない
+      if (decoded.best && decoded.best.length >= 10) {
         return resolve({
           success: true,
           result: decoded.best,
@@ -2090,18 +2107,28 @@ end
 
       // VMトレース再構築が取れた場合
       if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
-        return resolve({
-          success: true,
-          result: vmAnalysis.reconstruction.pseudoCode,
-          method: 'dynamic_decode_vm',
-          vmAnalysis,
-          WereDevVMDetected: true,
-        });
+        const pseudoCode = vmAnalysis.reconstruction.pseudoCode || '';
+        // [8] pseudoCode も短すぎる場合は success にしない
+        if (pseudoCode.length >= 10) {
+          return resolve({
+            success: true,
+            result: pseudoCode,
+            method: 'dynamic_decode_vm',
+            vmAnalysis,
+            WereDevVMDetected: true,
+          });
+        }
       }
 
-      const errMsg = stdout.includes('__EXEC_ERROR__:')
-        ? stdout.split('__EXEC_ERROR__:')[1]?.substring(0, 300) || ''
-        : (stderr || '').substring(0, 300);
+      // [5] __EXEC_ERROR__ の安全な抽出 (indexOf で存在チェック)
+      let errMsg = '';
+      if (stdout && stdout.indexOf('__EXEC_ERROR__:') !== -1) {
+        const errStart = stdout.indexOf('__EXEC_ERROR__:') + '__EXEC_ERROR__:'.length;
+        const errEnd   = stdout.indexOf('\n', errStart);
+        errMsg = (errEnd !== -1 ? stdout.substring(errStart, errEnd) : stdout.substring(errStart)).substring(0, 300);
+      } else if (stderr) {
+        errMsg = stderr.substring(0, 300);
+      }
 
       resolve({
         success: false,
