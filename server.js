@@ -138,26 +138,79 @@ app.post('/api/vm-obfuscate', async (req, res) => {
 /**
  * #7: loaderPatternDetected — table.concat + string.char + loadstring が揃うか
  */
-function loaderPatternDetected(code) {
-  const hasTableConcat  = /table\.concat\s*\(/.test(code);
-  const hasStringChar   = /string\.char\s*\(/.test(code);
-  const hasLoadstring   = /\bloadstring\b|\bload\s*\(/.test(code);
-  return hasTableConcat && hasStringChar && hasLoadstring;
+// ════════════════════════════════════════════════════════════════════════
+//  BLOCK 1: 前処理 / loaderPattern / safeEnv / hookLoadstring (#1-#18)
+// ════════════════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────────────────
+//  #1  stripComments — 巨大コメント難読化を削除
+// ────────────────────────────────────────────────────────────────────────
+function stripComments(code) {
+  if (!code) return code;
+  let result = code;
+  // --[[ 長大コメント ]] を削除 (ネスト非対応・実用的な範囲)
+  result = result.replace(/--\[=*\[[\s\S]*?\]=*\]/g, '');
+  // -- 行コメントを削除 (文字列内は除く: 簡易版)
+  result = result.replace(/--[^\[\n][^\n]*/g, '');
+  result = result.replace(/--\n/g, '\n');
+  // 3行以上の連続空行を1行に
+  result = result.replace(/\n{4,}/g, '\n\n');
+  return result.trim();
 }
 
-/**
- * #9: safeEnv — os.exit / while true do を無力化するLuaヘッダー
- */
+// ────────────────────────────────────────────────────────────────────────
+//  #3  loaderPatternDetected 強化版 — 複合パターン検出
+// ────────────────────────────────────────────────────────────────────────
+function loaderPatternDetected(code) {
+  // パターン1: loadstring + table.concat + string.char
+  const p1 = /table\.concat\s*\(/.test(code) &&
+              /string\.char\s*\(/.test(code) &&
+              /\bloadstring\b|\bload\s*\(/.test(code);
+  // パターン2: load + char table (compact style)
+  const p2 = /\bload\s*\(\s*\{/.test(code) ||
+             (/\bload\s*\(/.test(code) && /\bstring\.char\b/.test(code));
+  // パターン3: 巨大 string.char 連結 (50文字以上)
+  const p3 = /string\.char\s*\(\s*\d[\d\s,]{40,}\)/.test(code);
+  // パターン4: table.concat + number array
+  const p4 = /table\.concat\s*\(\s*\{[\s\d,]+\}/.test(code);
+  return p1 || p2 || p3 || p4;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  #4/#5  safeEnvPreamble 強化版 — 完全サンドボックス環境
+// ────────────────────────────────────────────────────────────────────────
 const safeEnvPreamble = `
--- ══ YAJU SafeEnv ══
--- os.exit を無効化
-pcall(function() os.exit = function() end end)
--- 危険なグローバルを無効化
+-- ══ YAJU SafeEnv v2 ══
+-- os.* を完全無効化
 pcall(function()
-  os.execute = function() return false end
-  io.popen   = function() return nil end
+  os.exit    = function() end
+  os.execute = function() return false, "disabled", -1 end
 end)
--- while true do の暴走防止: デバッグフックで命令数カウント
+-- io.* 危険関数を無効化
+pcall(function()
+  io.popen  = function() return nil, "disabled" end
+end)
+-- debug.* を無効化
+pcall(function()
+  if debug then
+    debug.sethook  = function() end
+    debug.getinfo  = nil
+    debug.getlocal = nil; debug.setlocal  = nil
+    debug.getupvalue= nil; debug.setupvalue= nil
+    debug.getmetatable = nil; debug.setmetatable = nil
+  end
+end)
+-- require を制限 (ネットワーク/FFI ライブラリを禁止)
+local __orig_require = require
+pcall(function()
+  require = function(m)
+    local blocked = {socket=1, ffi=1, jit=1, ["io.popen"]=1}
+    if blocked[tostring(m)] then error("require blocked: "..tostring(m)) end
+    return __orig_require(m)
+  end
+end)
+-- #5: while true do / repeat until の暴走防止
+-- デバッグフックで命令数を制限 (500000命令)
 local __safe_ops = 0
 local __safe_max = 500000
 pcall(function()
@@ -166,7 +219,7 @@ pcall(function()
       __safe_ops = __safe_ops + 1
       if __safe_ops > __safe_max then
         debug.sethook()
-        error("__SAFE_TIMEOUT__: 命令数上限到達", 2)
+        error("__SAFE_TIMEOUT__", 0)
       end
     end, "", 1000)
   end
@@ -174,33 +227,49 @@ end)
 -- ══ SafeEnv End ══
 `;
 
-/**
- * #3: hookLoadstring — loadstring/load を __DECODED__ を printするhookに差し替え
- */
+// ────────────────────────────────────────────────────────────────────────
+//  #6/#7/#8  hookLoadstringCode 強化版 — 全パターンをフック
+// ────────────────────────────────────────────────────────────────────────
 const hookLoadstringCode = `
--- ══ YAJU hookLoadstring ══
+-- ══ YAJU hookLoadstring v2 ══
 local __orig_ls = loadstring or load
 local __orig_ld = load or loadstring
 local __decoded_count = 0
 local __decoded_best  = nil
 local __decoded_best_len = 0
 
-local function __hookLoadstring(code_str, ...)
+-- #6: 全パターンをフックする共通フック関数
+-- #8: local f = __orig_ls(code_str); if f then return f end (二重実行防止)
+local function __hookLoadstring(code_str, name, mode, env)
   if type(code_str) == "string" and #code_str > 10 then
     __decoded_count = __decoded_count + 1
-    -- #4: __DECODED__ を stdout に出力
+    -- #7: __DECODED__ を stdout に出力 (インデックス付き)
     io.write("\\n__DECODED_START_" .. tostring(__decoded_count) .. "__\\n")
     io.write(code_str)
     io.write("\\n__DECODED_END_" .. tostring(__decoded_count) .. "__\\n")
-    -- 最長のものを best として保持
+    io.flush()
     if #code_str > __decoded_best_len then
       __decoded_best     = code_str
       __decoded_best_len = #code_str
     end
   end
-  return __orig_ls(code_str, ...)
+  -- #8: 二重実行防止 — コンパイルのみ、実行は呼び出し元に任せる
+  local f, err
+  if env ~= nil then
+    -- load(code, name, mode, _ENV) パターン (#6)
+    if __orig_ld and __orig_ld ~= __hookLoadstring then
+      f, err = __orig_ld(code_str, name, mode, env)
+    else
+      f, err = __orig_ls(code_str)
+    end
+  else
+    f, err = __orig_ls(code_str)
+  end
+  if f then return f end
+  return nil, err
 end
 
+-- #6: loadstring/load の全パターンを差し替え
 _G.loadstring = __hookLoadstring
 _G.load       = __hookLoadstring
 if rawset then
@@ -210,163 +279,25 @@ end
 -- ══ hookLoadstring End ══
 `;
 
-/**
- * #4: parseDecodedOutputs — stdout から __DECODED__ を抽出して返す
- * 複数存在する場合は全て返し、最も長いものを best とする
- */
+// ────────────────────────────────────────────────────────────────────────
+//  #9/#10  parseDecodedOutputs 強化版 — scoreLuaCodeフィルター付き
+// ────────────────────────────────────────────────────────────────────────
 function parseDecodedOutputs(stdout) {
   const results = [];
-  // 各 __DECODED_START_N__ ... __DECODED_END_N__ を抽出
   const re = /__DECODED_START_(\d+)__\n([\s\S]*?)\n__DECODED_END_\1__/g;
   let m;
   while ((m = re.exec(stdout)) !== null) {
     const idx  = parseInt(m[1]);
     const code = m[2];
-    if (code && code.length > 5) results.push({ idx, code });
+    if (!code || code.length < 5) continue;
+    // #10: スコアフィルター (30以上のみ採用)
+    const score = scoreLuaCode(code);
+    if (score > 30) results.push({ idx, code, score });
   }
-  // 最長を best に
-  const best = results.sort((a, b) => b.code.length - a.code.length)[0] || null;
+  // スコア順 (高い順) にソート → 最高スコアを best に
+  results.sort((a, b) => b.score - a.score);
+  const best = results[0] || null;
   return { all: results, best: best ? best.code : null };
-}
-
-/**
- * #2: dynamicDecode — pipeline最初に置く動的デコードパス
- * loadstring を hookして __DECODED__ をダンプ
- */
-async function dynamicDecode(code) {
-  const luaBin = checkLuaAvailable();
-  if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic_decode' };
-
-  const filtered = sandboxFilter(code);
-  if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic_decode' };
-
-  const safeCode = filtered.code.replace(/\]\]/g, '] ]');
-
-  // #9: safeEnv + #3: hookLoadstring + VMフックBootstrap を先頭に注入
-  const preamble = safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
-
-  // #6: VM検出は dynamicDecode 内で行い、VMループがある場合のみ vmHookInject
-  const vmInfo = vmDetector(filtered.code);
-  let codeToRun = filtered.code;
-  let vmHookInjected = false;
-  let bytecodeCandidates = [];
-
-  // #6: while true do VMloop が検出された場合のみ hook注入
-  if (vmInfo.isVm || vmInfo.isWereDev) {
-    const hasWhileTrue = /while\s+true\s+do/.test(codeToRun);
-    if (hasWhileTrue) {
-      const hookResult = injectVmHook(codeToRun);
-      codeToRun = hookResult.code;
-      vmHookInjected = hookResult.injected;
-    }
-    // bytecodeテーブルのダンプ注入
-    const dumpResult = dumpBytecodeTables(codeToRun);
-    codeToRun = dumpResult.code;
-    bytecodeCandidates = dumpResult.candidates;
-  }
-
-  const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
-  const safeFullCode = fullCode.replace(/\]\]/g, '] ]');
-
-  const tempFile = path.join(tempDir, `dyndec_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
-
-  const wrapper = `
--- ══════════════════════════════════════════════════════
---  YAJU dynamicDecode Wrapper  (hookLoadstring + safeEnv)
--- ══════════════════════════════════════════════════════
-
--- アンチダンプ・アンチデバッグを無効化
-pcall(function()
-  if debug then
-    debug.sethook = function() end
-    debug.getinfo = nil; debug.getlocal = nil
-    debug.setlocal = nil; debug.getupvalue = nil; debug.setupvalue = nil
-  end
-end)
-pcall(function()
-  if getfenv then
-    local env = getfenv()
-    env.saveinstance = nil; env.dumpstring = nil; env.save_instance = nil
-  end
-end)
-
-local __obf_code = [[
-${safeFullCode}
-]]
-
-local __orig_ls_outer = loadstring or load
-local __ok, __err = pcall(function()
-  local chunk, err = __orig_ls_outer(__obf_code)
-  if not chunk then error("parse error: " .. tostring(err)) end
-  chunk()
-end)
-
-if not __ok then
-  io.write("\\n__EXEC_ERROR__:" .. tostring(__err))
-end
-`;
-
-  return new Promise(resolve => {
-    fs.writeFileSync(tempFile, wrapper, 'utf8');
-    exec(`${luaBin} ${tempFile}`, { timeout: 15000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
-      try { fs.unlinkSync(tempFile); } catch {}
-
-      // #4: __DECODED__ 抽出
-      const decoded = parseDecodedOutputs(stdout);
-
-      // VM ログ抽出
-      const vmTrace = parseVmLogs(stdout);
-      const bytecodeDump = parseBytecodeDump(stdout);
-      const wereDevDetected = checkWereDevDetected(vmTrace);
-      const vmAnalysis = { vmTrace, bytecodeDump, wereDevDetected, vmHookInjected, bytecodeCandidates };
-
-      if (wereDevDetected) {
-        vmAnalysis.traceAnalysis   = vmTraceAnalyzer(vmTrace);
-        vmAnalysis.reconstruction  = reconstructedLuaBuilder(vmTrace, bytecodeDump, vmAnalysis.traceAnalysis.opcodeMap);
-      }
-
-      // __DECODED__ が取れた場合
-      if (decoded.best) {
-        return resolve({
-          success: true,
-          result: decoded.best,
-          allDecoded: decoded.all.map(d => d.code),
-          decodedCount: decoded.all.length,
-          method: 'dynamic_decode',
-          vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
-        });
-      }
-
-      // VMトレース再構築が取れた場合
-      if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
-        return resolve({
-          success: true,
-          result: vmAnalysis.reconstruction.pseudoCode,
-          method: 'dynamic_decode_vm',
-          vmAnalysis,
-          WereDevVMDetected: true,
-        });
-      }
-
-      const errMsg = stdout.includes('__EXEC_ERROR__:')
-        ? stdout.split('__EXEC_ERROR__:')[1]?.substring(0, 300) || ''
-        : (stderr || '').substring(0, 300);
-
-      resolve({
-        success: false,
-        error: errMsg || 'loadstringが呼ばれませんでした',
-        method: 'dynamic_decode',
-        vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
-      });
-    });
-  });
-}
-
-// ════════════════════════════════════════════════════════════════════════
-//  tryDynamicExecution — 後方互換ラッパー (dynamicDecode を呼ぶ)
-// ════════════════════════════════════════════════════════════════════════
-async function tryDynamicExecution(code) {
-  return dynamicDecode(code);
 }
 
 
@@ -1028,47 +959,127 @@ function sandboxFilter(code) {
 //  #14  vmDetector  — while true do opcode=... のVMパターン検出
 // ────────────────────────────────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════════════════
-//  WereDev VM 解析システム  (#1〜#20)
+//  BLOCK 2: vmDetector強化 / vmHookBootstrap / injectVmHook (#19-#33)
 // ════════════════════════════════════════════════════════════════════════
 
 // ────────────────────────────────────────────────────────────────────────
-//  #1  vmHookBootstrap  — Luaに注入するフック初期化コード
+//  #20-#22  vmDetector 強化版 — MoonSec / Luraph / WereDev 検出
+// ────────────────────────────────────────────────────────────────────────
+function vmDetector(code) {
+  const hints = [];
+
+  // ── WereDev (#22) ──────────────────────────────────────────────────
+  const weredevPatterns = [
+    { re: /bytecode\s*\[\s*ip\s*\]/,                                  desc: 'WereDev: bytecode[ip]' },
+    { re: /dispatch\s*\[\s*inst\s*\[\s*1\s*\]\s*\]/,                 desc: 'WereDev: dispatch[inst[1]]' },
+    { re: /\bvm_loop\b/,                                              desc: 'WereDev: vm_loop' },
+    { re: /while\s+true\s+do[\s\S]{0,400}bytecode\s*\[\s*ip\s*\]/i,  desc: 'WereDev: while-true+bytecode[ip]' },
+    { re: /local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\]/,              desc: 'WereDev: local inst=bytecode[ip]' },
+    { re: /inst\s*\[\s*1\s*\]/,                                       desc: 'WereDev: inst[1]' },
+    { re: /ip\s*=\s*ip\s*\+\s*1/,                                    desc: 'WereDev: ip+1' },
+  ];
+
+  // ── MoonSec (#20) ──────────────────────────────────────────────────
+  const moonSecPatterns = [
+    { re: /MoonSec/,                                                  desc: 'MoonSec: MoonSec識別子' },
+    { re: /MSVM/,                                                     desc: 'MoonSec: MSVM' },
+    { re: /_ENV\s*\[.+\]/,                                            desc: 'MoonSec: _ENV[key]アクセス' },
+    { re: /dispatch\s*\[opcode\]/,                                    desc: 'MoonSec: dispatch[opcode]' },
+    { re: /stk\s*\[top\]|stk\s*\[top\s*-/,                          desc: 'MoonSec: stack top操作' },
+  ];
+
+  // ── Luraph (#21) ───────────────────────────────────────────────────
+  const luraphPatterns = [
+    { re: /LPH_String/,                                               desc: 'Luraph: LPH_String' },
+    { re: /LPH_GetEnv/,                                               desc: 'Luraph: LPH_GetEnv' },
+    { re: /LPH_JIT/,                                                  desc: 'Luraph: LPH_JIT' },
+    { re: /\bLPH\b/,                                                  desc: 'Luraph: LPH識別子' },
+  ];
+
+  // ── 汎用VM ─────────────────────────────────────────────────────────
+  const genericPatterns = [
+    { re: /while\s+true\s+do[\s\S]{0,200}opcode/i,  desc: 'generic: while-true opcode' },
+    { re: /\bopcode\b.*\bInstructions\b/s,           desc: 'generic: opcode+Instructions' },
+    { re: /local\s+\w+\s*=\s*Instructions\s*\[/,    desc: 'generic: Instructions配列' },
+    { re: /\bProto\b[\s\S]{0,100}\bupValues\b/s,     desc: 'generic: Proto/upValues' },
+    { re: /\bVStack\b|\bVEnv\b|\bVPC\b/,             desc: 'generic: 仮想スタック' },
+    { re: /if\s+opcode\s*==\s*\d+\s*then/,           desc: 'generic: opcodeディスパッチ' },
+    { re: /\{(\s*\d+\s*,){20,}/,                     desc: 'generic: 大規模数値テーブル' },
+    { re: /\bbit\.bxor\b|\bbit\.band\b|\bbit32\./,   desc: 'generic: ビット演算' },
+  ];
+
+  let weredevScore = 0;
+  let moonSecScore = 0;
+  let luraphScore  = 0;
+
+  for (const p of weredevPatterns) {
+    if (p.re.test(code)) { hints.push(p.desc); weredevScore++; }
+  }
+  for (const p of moonSecPatterns) {
+    if (p.re.test(code)) { hints.push(p.desc); moonSecScore++; }
+  }
+  for (const p of luraphPatterns) {
+    if (p.re.test(code)) { hints.push(p.desc); luraphScore++; }
+  }
+  if (/return\s*\(function\s*\([^)]*\)/s.test(code)) hints.push('自己実行関数ラッパー');
+  for (const p of genericPatterns) {
+    if (p.re.test(code)) hints.push(p.desc);
+  }
+
+  const strings = [];
+  const strPattern = /"([^"\\]{4,}(?:\\.[^"\\]*)*)"/g;
+  let ms;
+  while ((ms = strPattern.exec(code)) !== null) {
+    if (ms[1].length > 4) strings.push(ms[1]);
+  }
+  if (strings.length > 0) hints.push(`${strings.length}件の文字列`);
+
+  const isWereDev  = weredevScore >= 2;
+  const isMoonSec  = moonSecScore >= 2;
+  const isLuraph   = luraphScore  >= 1;
+  const isVm       = hints.length >= 2;
+
+  return { isVm, isWereDev, isMoonSec, isLuraph,
+    weredevScore, moonSecScore, luraphScore,
+    hints, strings: strings.slice(0, 50), method: 'vm_detect' };
+}
+
+function deobfuscateVmify(code) {
+  const r = vmDetector(code);
+  if (!r.isVm && r.hints.length === 0)
+    return { success: false, error: 'VMパターンが検出されませんでした', method: 'vmify' };
+  const vmType = r.isWereDev ? 'WereDev' : r.isMoonSec ? 'MoonSec' : r.isLuraph ? 'Luraph' : 'Generic';
+  return { success: true, result: code, hints: r.hints, strings: r.strings,
+    isWereDev: r.isWereDev, isMoonSec: r.isMoonSec, isLuraph: r.isLuraph,
+    vmType, weredevScore: r.weredevScore,
+    warning: `${vmType} VM検出 — 動的実行+フック解析を推奨`, method: 'vmify' };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  #26/#27/#28/#29  vmHookBootstrap 強化版
 // ────────────────────────────────────────────────────────────────────────
 const vmHookBootstrap = `
--- ══ YAJU VM Hook Bootstrap ══
-__vm_logs = {}
+-- ══ YAJU VM Hook Bootstrap v2 ══
+__vm_logs     = {}
 __vm_log_count = 0
-__vm_max_logs  = 2000   -- 無限ループ防止: 最大2000命令を記録
+__vm_max_logs  = 5000   -- #27: 2000→5000に増加
 
+-- #28: ip opcode arg1 arg2 を __VMLOG__ プレフィックスで出力
+-- #29: type(inst) ~= "table" ガード追加
 function __vmhook(ip, inst, stack, reg)
   if __vm_log_count >= __vm_max_logs then return end
   __vm_log_count = __vm_log_count + 1
+  -- #29: inst が table でなければ早期リターン
+  if inst ~= nil and type(inst) ~= "table" and type(inst) ~= "number" then return end
   local entry = { ip = ip, ts = __vm_log_count }
-  -- inst が table の場合は各フィールドを展開
   if type(inst) == "table" then
-    entry.op   = inst[1]
-    entry.arg1 = inst[2]
-    entry.arg2 = inst[3]
-    entry.arg3 = inst[4]
+    -- #29: type check 追加
+    if type(inst[1]) ~= "nil" then entry.op   = inst[1] end
+    if type(inst[2]) ~= "nil" then entry.arg1 = inst[2] end
+    if type(inst[3]) ~= "nil" then entry.arg2 = inst[3] end
+    if type(inst[4]) ~= "nil" then entry.arg3 = inst[4] end
   elseif type(inst) == "number" then
     entry.op = inst
-  end
-  -- stack / reg はオプション（サイズ制限あり）
-  if type(stack) == "table" and #stack <= 32 then
-    local s = {}
-    for i = 1, math.min(#stack, 8) do
-      local v = stack[i]
-      s[i] = type(v) == "number" and v or type(v)
-    end
-    entry.stack = s
-  end
-  if type(reg) == "table" then
-    local r = {}
-    for k, v in pairs(reg) do
-      r[tostring(k)] = type(v) == "number" and v or type(v)
-      if #r >= 8 then break end
-    end
-    entry.reg = r
   end
   table.insert(__vm_logs, entry)
 end
@@ -1076,11 +1087,12 @@ end
 `;
 
 // ────────────────────────────────────────────────────────────────────────
-//  #7  vmDumpFooter  — 実行後に __vm_logs / bytecode を stdout に出力
+//  #28  vmDumpFooter — __VMLOG__ 形式で stdout に出力
 // ────────────────────────────────────────────────────────────────────────
 const vmDumpFooter = `
--- ══ YAJU VM Dump Footer ══
+-- ══ YAJU VM Dump Footer v2 ══
 if __vm_log_count and __vm_log_count > 0 then
+  -- #28: ip\topcode\targ1\targ2 形式
   for i, v in ipairs(__vm_logs) do
     local op   = tostring(v.op   or "nil")
     local arg1 = tostring(v.arg1 or "nil")
@@ -1094,106 +1106,62 @@ end
 `;
 
 // ────────────────────────────────────────────────────────────────────────
-//  #2  runLuaWithHooks  — hookコードをLuaコード先頭に注入
+//  #24/#30/#31/#32/#33  injectVmHook 強化版
+//  — WereDev/MoonSec/Luraph それぞれに対応した注入
 // ────────────────────────────────────────────────────────────────────────
-function runLuaWithHooks(code) {
-  return vmHookBootstrap + '\n' + code + '\n' + vmDumpFooter;
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #3  vmDetector 拡張  — WereDev特有パターンを追加
-//  (既存vmDetectorを上書き)
-// ────────────────────────────────────────────────────────────────────────
-function vmDetector(code) {
-  const hints = [];
-
-  // WereDev VM 特有パターン (#3)
-  const weredevPatterns = [
-    { re: /while\s+true\s+do[\s\S]{0,400}bytecode\s*\[\s*ip\s*\]/i,  desc: 'WereDev: while-true + bytecode[ip]' },
-    { re: /local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\]/,              desc: 'WereDev: local inst = bytecode[ip]' },
-    { re: /inst\s*\[\s*1\s*\]/,                                        desc: 'WereDev: inst[1] opcode access' },
-    { re: /inst\s*\[\s*2\s*\][\s\S]{0,100}inst\s*\[\s*3\s*\]/s,      desc: 'WereDev: inst[2]/inst[3] args' },
-    { re: /ip\s*=\s*ip\s*\+\s*1/,                                     desc: 'WereDev: ip increment pattern' },
-  ];
-
-  // 汎用VMパターン
-  const genericPatterns = [
-    { re: /while\s+true\s+do[\s\S]{0,200}opcode/i,        desc: 'while-true opcodeループ' },
-    { re: /\bopcode\b.*\bInstructions\b/s,                desc: 'opcode+Instructionsテーブル' },
-    { re: /local\s+\w+\s*=\s*Instructions\s*\[/,         desc: 'Instructions配列アクセス' },
-    { re: /\bProto\b[\s\S]{0,100}\bupValues\b/s,          desc: 'Proto/upValues構造体' },
-    { re: /\bVStack\b|\bVEnv\b|\bVPC\b/,                  desc: '仮想スタック/環境変数' },
-    { re: /if\s+opcode\s*==\s*\d+\s*then/,                desc: 'opcodeディスパッチ' },
-    { re: /\{(\s*\d+\s*,){20,}/,                          desc: '大規模バイトコードテーブル' },
-    { re: /\bbit\.bxor\b|\bbit\.band\b|\bbit\.bor\b/,     desc: 'ビット演算 (VM特徴)' },
-  ];
-
-  let weredevScore = 0;
-  for (const p of weredevPatterns) {
-    if (p.re.test(code)) { hints.push(p.desc); weredevScore++; }
-  }
-  if (/return\s*\(function\s*\([^)]*\)/s.test(code)) hints.push('自己実行関数ラッパー');
-  for (const p of genericPatterns) {
-    if (p.re.test(code)) hints.push(p.desc);
-  }
-
-  // 文字列抽出
-  const strings = [];
-  const strPattern = /"([^"\\]{4,}(?:\\.[^"\\]*)*)"/g;
-  let m;
-  while ((m = strPattern.exec(code)) !== null) { if (m[1].length > 4) strings.push(m[1]); }
-  if (strings.length > 0) hints.push(`${strings.length}件の文字列リテラル`);
-
-  const isWereDev = weredevScore >= 2;
-  const isVm      = hints.length >= 2;
-
-  return { isVm, isWereDev, weredevScore, hints, strings: strings.slice(0, 50), method: 'vm_detect' };
-}
-function deobfuscateVmify(code) {
-  const r = vmDetector(code);
-  if (!r.isVm && r.hints.length === 0)
-    return { success: false, error: 'VMパターンが検出されませんでした', method: 'vmify' };
-  return { success: true, result: code, hints: r.hints, strings: r.strings,
-    isWereDev: r.isWereDev, weredevScore: r.weredevScore,
-    warning: 'VM完全解読には動的実行+フック解析を推奨', method: 'vmify' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #4 / #5 / #6  injectVmHook  — VMループに __vmhook を注入
-// ────────────────────────────────────────────────────────────────────────
-function injectVmHook(code) {
+function injectVmHook(code, vmInfo) {
   let modified = code;
-  let injected = false;
+  let injected  = false;
+  const type_   = vmInfo || {};
 
-  // #5: while true do の直後に __vmhook を挿入
+  // #30: while true do / repeat until の直後に __vmhook を挿入
+  // #24: パターンを /while\s+true\s+do|repeat\s+until/ に拡張
   modified = modified.replace(
     /(while\s+true\s+do\s*\n)/g,
-    (match) => {
-      injected = true;
-      return match + '  __vmhook(ip, inst, stack, reg)\n';
-    }
+    (match) => { injected = true; return match + '  __vmhook(ip, inst, stack, reg)\n'; }
+  );
+  modified = modified.replace(
+    /(repeat\s*\n)/g,
+    (match) => { injected = true; return match + '  __vmhook(ip, inst, stack, reg)\n'; }
   );
 
-  // #6: local inst = bytecode[ip] の次行にフォールバックhookを挿入
-  //     (while true do が見つからなかった場合のフォールバック)
-  if (!injected) {
+  // #31: WereDev — bytecode[ip] 実行前に hook を挿入
+  if (!injected || type_.isWereDev) {
     modified = modified.replace(
       /(local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\][^\n]*\n)/g,
-      (match) => {
-        injected = true;
-        return match + '  __vmhook(ip, inst)\n';
-      }
+      (match) => { injected = true; return match + '  __vmhook(ip, inst)\n'; }
     );
   }
 
-  // 汎用フォールバック: opcode = ... の行の後
+  // #32: MoonSec — dispatch[opcode] 呼び出し前に hook を挿入
+  if (!injected || type_.isMoonSec) {
+    modified = modified.replace(
+      /(dispatch\s*\[\s*opcode\s*\]\s*\()/g,
+      (match) => { injected = true; return `__vmhook(ip, opcode); ` + match; }
+    );
+    modified = modified.replace(
+      /(dispatch\s*\[\s*inst\s*\[\s*1\s*\]\s*\]\s*\()/g,
+      (match) => { injected = true; return `__vmhook(ip, inst); ` + match; }
+    );
+  }
+
+  // #33: Luraph — LPH_GetEnv 呼び出しをフック
+  if (type_.isLuraph) {
+    modified = modified.replace(
+      /\bLPH_GetEnv\s*\(/g,
+      (match) => { injected = true; return `__vmhook(0, "LPH_GetEnv"); ` + match; }
+    );
+    modified = modified.replace(
+      /\bLPH_String\s*\(/g,
+      (match) => { injected = true; return `__vmhook(0, "LPH_String"); ` + match; }
+    );
+  }
+
+  // 汎用フォールバック: local opcode = の次行
   if (!injected) {
     modified = modified.replace(
       /(local\s+opcode\s*=\s*[^\n]+\n)/g,
-      (match) => {
-        injected = true;
-        return match + '  __vmhook(ip, opcode)\n';
-      }
+      (match) => { injected = true; return match + '  __vmhook(ip, opcode)\n'; }
     );
   }
 
@@ -1201,35 +1169,19 @@ function injectVmHook(code) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #12 / #13 / #14  dumpBytecodeTables  — bytecodeテーブルをstdoutに出力
+//  runLuaWithHooks  (#26: vmHookBootstrap を先頭に注入)
 // ────────────────────────────────────────────────────────────────────────
-function dumpBytecodeTables(code) {
-  // #13: bytecodeCandidate = 要素50以上・数値のみの配列を検出
-  const candidates = [];
-  const tblPat = /local\s+(\w+)\s*=\s*\{([\s\d,]+)\}/g;
-  let m;
-  while ((m = tblPat.exec(code)) !== null) {
-    const name = m[1];
-    const nums = m[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (nums.length >= 50) candidates.push({ name, count: nums.length });
-  }
-  if (candidates.length === 0) return { code, injected: false, candidates: [] };
-
-  // #14: for ループでstdoutに出力するLuaコードを末尾に挿入
-  let inject = '\n-- ══ YAJU Bytecode Dump ══\n';
-  for (const c of candidates) {
-    inject += `if type(${c.name}) == "table" then\n`;
-    inject += `  for __i, __v in ipairs(${c.name}) do\n`;
-    inject += `    print("__BYTECODE__\t${c.name}\t" .. tostring(__i) .. "\t" .. tostring(__v))\n`;
-    inject += `  end\n`;
-    inject += `end\n`;
-  }
-
-  return { code: code + inject, injected: true, candidates };
+function runLuaWithHooks(code) {
+  return vmHookBootstrap + '\n' + code + '\n' + vmDumpFooter;
 }
 
+
+// ════════════════════════════════════════════════════════════════════════
+//  BLOCK 3: VMログ解析 / 逆コンパイラ (#34-#54)
+// ════════════════════════════════════════════════════════════════════════
+
 // ────────────────────────────────────────────────────────────────────────
-//  #8 / #9  parseVmLogs  — stdout から __VMLOG__ 行を抽出
+//  #34/#35  parseVmLogs 強化版 — split("\t") で構造化
 // ────────────────────────────────────────────────────────────────────────
 function parseVmLogs(stdout) {
   const vmTrace = [];
@@ -1237,78 +1189,113 @@ function parseVmLogs(stdout) {
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed.startsWith('__VMLOG__')) continue;
+    // #35: split("\t") で ip opcode arg1 arg2 を構造化
     const parts = trimmed.split('\t');
-    if (parts.length < 2) continue;
-    // フォーマット: __VMLOG__ \t ip \t op \t arg1 \t arg2 \t arg3
+    if (parts.length < 3) continue;
     const ip   = parseInt(parts[1]) || 0;
-    const op   = parts[2] !== 'nil' ? (isNaN(parseInt(parts[2])) ? parts[2] : parseInt(parts[2])) : null;
-    const arg1 = parts[3] !== 'nil' ? (isNaN(parseInt(parts[3])) ? parts[3] : parseInt(parts[3])) : null;
-    const arg2 = parts[4] !== 'nil' ? (isNaN(parseInt(parts[4])) ? parts[4] : parseInt(parts[4])) : null;
-    const arg3 = parts[5] !== 'nil' ? (isNaN(parseInt(parts[5])) ? parts[5] : parseInt(parts[5])) : null;
+    const op   = parts[2] !== 'nil' ? (isNaN(Number(parts[2])) ? parts[2] : parseInt(parts[2])) : null;
+    const arg1 = parts[3] !== undefined && parts[3] !== 'nil'
+      ? (isNaN(Number(parts[3])) ? parts[3] : parseInt(parts[3])) : null;
+    const arg2 = parts[4] !== undefined && parts[4] !== 'nil'
+      ? (isNaN(Number(parts[4])) ? parts[4] : parseInt(parts[4])) : null;
+    const arg3 = parts[5] !== undefined && parts[5] !== 'nil'
+      ? (isNaN(Number(parts[5])) ? parts[5] : parseInt(parts[5])) : null;
     vmTrace.push({ ip, op, arg1, arg2, arg3 });
   }
   return vmTrace;
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #15  parseBytecodeDump  — stdout から __BYTECODE__ 行を抽出
+//  #36  saveVmTrace — vmトレースをJSONとして保存
 // ────────────────────────────────────────────────────────────────────────
-function parseBytecodeDump(stdout) {
-  // tableName -> number[]
-  const bytecodeDump = {};
-  const lines = stdout.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('__BYTECODE__')) continue;
-    const parts = trimmed.split('\t');
-    if (parts.length < 4) continue;
-    const tblName = parts[1];
-    const idx     = parseInt(parts[2]);
-    const val     = parseInt(parts[3]);
-    if (!bytecodeDump[tblName]) bytecodeDump[tblName] = [];
-    bytecodeDump[tblName][idx - 1] = val; // 1-indexed -> 0-indexed
-  }
-  return bytecodeDump;
+function saveVmTrace(vmTrace, suffix) {
+  if (!vmTrace || vmTrace.length === 0) return null;
+  try {
+    const fname = path.join(tempDir, `vm_trace_${suffix || Date.now()}.json`);
+    fs.writeFileSync(fname, JSON.stringify(vmTrace, null, 2), 'utf8');
+    return fname;
+  } catch { return null; }
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #10  WereDev VM 検出しきい値チェック
+//  #37/#38/#39  vmTraceAnalyzer 強化版 — dispatch table推定 + 挙動推定
 // ────────────────────────────────────────────────────────────────────────
-const VM_TRACE_THRESHOLD = 50;
+const LUA51_OPCODES = {
+  0:'MOVE',1:'LOADK',2:'LOADBOOL',3:'LOADNIL',4:'GETUPVAL',
+  5:'GETGLOBAL',6:'GETTABLE',7:'SETGLOBAL',8:'SETUPVAL',9:'SETTABLE',
+  10:'NEWTABLE',11:'SELF',12:'ADD',13:'SUB',14:'MUL',
+  15:'DIV',16:'MOD',17:'POW',18:'UNM',19:'NOT',
+  20:'LEN',21:'CONCAT',22:'JMP',23:'EQ',24:'LT',
+  25:'LE',26:'TEST',27:'TESTSET',28:'CALL',29:'TAILCALL',
+  30:'RETURN',31:'FORLOOP',32:'FORPREP',33:'TFORLOOP',34:'SETLIST',
+  35:'CLOSE',36:'CLOSURE',37:'VARARG',
+};
 
-function checkWereDevDetected(vmTrace) {
-  return vmTrace.length >= VM_TRACE_THRESHOLD;
-}
+// opcode挙動カテゴリ
+const OPCODE_CATEGORIES = {
+  MOVE:'MOVE', LOADK:'CONST', LOADBOOL:'CONST', LOADNIL:'CONST',
+  GETUPVAL:'LOAD', GETGLOBAL:'LOAD', GETTABLE:'LOAD',
+  SETGLOBAL:'STORE', SETUPVAL:'STORE', SETTABLE:'STORE',
+  NEWTABLE:'TABLE', SELF:'TABLE',
+  ADD:'ARITH', SUB:'ARITH', MUL:'ARITH', DIV:'ARITH', MOD:'ARITH', POW:'ARITH',
+  UNM:'ARITH', NOT:'ARITH', LEN:'ARITH', CONCAT:'ARITH',
+  JMP:'JUMP', EQ:'JUMP', LT:'JUMP', LE:'JUMP', TEST:'JUMP', TESTSET:'JUMP',
+  CALL:'CALL', TAILCALL:'CALL', RETURN:'RETURN',
+  FORLOOP:'LOOP', FORPREP:'LOOP', TFORLOOP:'LOOP',
+  SETLIST:'TABLE', CLOSE:'CLOSE', CLOSURE:'CLOSURE', VARARG:'VARARG',
+};
 
-// ────────────────────────────────────────────────────────────────────────
-//  #11  vmTraceAnalyzer  — opcode頻度分析・opcodeMap生成
-// ────────────────────────────────────────────────────────────────────────
 function vmTraceAnalyzer(vmTrace) {
   if (!vmTrace || vmTrace.length === 0)
-    return { success: false, error: 'vmTraceが空です', opcodeMap: {} };
+    return { success: false, error: 'vmTraceが空', opcodeMap: {} };
 
-  // opcode 頻度カウント
+  // #37: opcode頻度カウント
   const freq = {};
-  for (const entry of vmTrace) {
-    if (entry.op === null || entry.op === undefined) continue;
-    const key = String(entry.op);
-    freq[key] = (freq[key] || 0) + 1;
+  for (const e of vmTrace) {
+    if (e.op === null || e.op === undefined) continue;
+    const k = String(e.op);
+    freq[k] = (freq[k] || 0) + 1;
   }
-
-  // 頻度順にソート
   const sorted = Object.entries(freq)
     .sort((a, b) => b[1] - a[1])
-    .map(([op, count]) => ({ op: isNaN(op) ? op : parseInt(op), count }));
+    .map(([op, count]) => ({ op: isNaN(Number(op)) ? op : parseInt(op), count }));
 
-  // opcodeMap: opcode番号 -> 推定命令名
-  const opcodeMap = buildOpcodeMap(sorted, vmTrace);
+  // #38: dispatch table推定 — opcodeと名前のマッピング
+  const dispatchTable = {};
+  for (const { op } of sorted) {
+    const n = parseInt(op);
+    if (!isNaN(n) && LUA51_OPCODES[n]) dispatchTable[op] = LUA51_OPCODES[n];
+  }
 
-  // ipの変化から制御フロー推測
+  // opcodeExecutionMap (名前付き)
+  const opcodeExecutionMap = {};
+  for (const [num, name] of Object.entries(LUA51_OPCODES)) {
+    const entries = vmTrace.filter(t => String(t.op) === String(num));
+    if (entries.length > 0) {
+      opcodeExecutionMap[name] = {
+        opcode: parseInt(num), count: entries.length,
+        category: OPCODE_CATEGORIES[name] || 'UNKNOWN',
+        sampleArgs: entries.slice(0, 3).map(e => [e.arg1, e.arg2, e.arg3]),
+      };
+    }
+  }
+
+  // #39: カテゴリ別挙動推定
+  const behaviorSummary = {};
+  for (const [name, info] of Object.entries(opcodeExecutionMap)) {
+    const cat = info.category;
+    behaviorSummary[cat] = (behaviorSummary[cat] || 0) + info.count;
+  }
+
+  // IP変化からCFG情報
   const ipJumps = [];
   for (let i = 1; i < vmTrace.length; i++) {
-    const delta = vmTrace[i].ip - vmTrace[i-1].ip;
-    if (delta !== 1 && delta !== 0) ipJumps.push({ from: vmTrace[i-1].ip, to: vmTrace[i].ip, delta });
+    const d = vmTrace[i].ip - vmTrace[i-1].ip;
+    if (d !== 1 && d !== 0) ipJumps.push({ from: vmTrace[i-1].ip, to: vmTrace[i].ip, delta: d });
   }
+
+  const opcodeIndex = { position: 1, confidence: 'high', note: 'inst[1]=opcode' };
+  const opcodeMap = { map: dispatchTable, opcodeIndex, opcodeExecutionMap };
 
   return {
     success: true,
@@ -1316,221 +1303,329 @@ function vmTraceAnalyzer(vmTrace) {
     uniqueOpcodes: sorted.length,
     opcodeFrequency: sorted.slice(0, 20),
     opcodeMap,
-    ipJumps: ipJumps.slice(0, 20),
+    dispatchTable,
+    behaviorSummary,
+    ipJumps: ipJumps.slice(0, 30),
     method: 'vm_trace_analyze',
   };
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #16 / #17 / #18  instructionStructureAnalyzer + opcodeMap生成
+//  #13/#14  staticCharDecoder / tableConcat 静的デコーダ
 // ────────────────────────────────────────────────────────────────────────
+function staticCharDecoder(code) {
+  let modified = code, found = false;
+  // #13: string.char(n, n, ...) の連続パターンを静的に文字列化
+  modified = modified.replace(/string\.char\(([^)]+)\)/g, (match, argsStr) => {
+    const args = argsStr.split(',').map(a => {
+      const n = parseInt(a.trim());
+      return isNaN(n) ? null : n;
+    });
+    if (args.some(a => a === null) || args.some(a => a < 0 || a > 255)) return match;
+    found = true;
+    const str = args.map(n => String.fromCharCode(n)).join('');
+    return `"${str.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r')}"`;
+  });
 
-// 一般的なLua VMオペコードの番号→名前マッピング（Lua5.1標準）
-const LUA51_OPCODES = {
-  0:'MOVE', 1:'LOADK', 2:'LOADBOOL', 3:'LOADNIL', 4:'GETUPVAL',
-  5:'GETGLOBAL', 6:'GETTABLE', 7:'SETGLOBAL', 8:'SETUPVAL', 9:'SETTABLE',
-  10:'NEWTABLE', 11:'SELF', 12:'ADD', 13:'SUB', 14:'MUL',
-  15:'DIV', 16:'MOD', 17:'POW', 18:'UNM', 19:'NOT',
-  20:'LEN', 21:'CONCAT', 22:'JMP', 23:'EQ', 24:'LT',
-  25:'LE', 26:'TEST', 27:'TESTSET', 28:'CALL', 29:'TAILCALL',
-  30:'RETURN', 31:'FORLOOP', 32:'FORPREP', 33:'TFORLOOP', 34:'SETLIST',
-  35:'CLOSE', 36:'CLOSURE', 37:'VARARG',
-};
-
-function buildOpcodeMap(sortedFreq, vmTrace) {
-  const opcodeMap = {};
-
-  // #16: inst[1]/inst[2]/inst[3] の構造推測
-  // 最頻出opcodeを解析して位置を推定
-  for (const { op } of sortedFreq) {
-    const opNum = parseInt(op);
-    if (!isNaN(opNum) && LUA51_OPCODES[opNum]) {
-      opcodeMap[op] = LUA51_OPCODES[opNum];
+  // #14: table.concat({string.char(...)}) パターン
+  modified = modified.replace(
+    /table\.concat\s*\(\s*\{([^}]+)\}\s*(?:,\s*"[^"]*"\s*)?\)/g,
+    (match, inner) => {
+      // inner の各要素が string.char(n,...) や "str" の場合に結合
+      const parts = inner.split(',').map(p => p.trim());
+      const strings = parts.map(p => {
+        const scm = p.match(/^string\.char\((\d+)\)$/);
+        if (scm) return String.fromCharCode(parseInt(scm[1]));
+        const strm = p.match(/^"((?:[^"\\]|\\.)*)"$|^'((?:[^'\\]|\\.)*)'$/);
+        if (strm) return strm[1] || strm[2];
+        return null;
+      });
+      if (strings.some(s => s === null)) return match;
+      found = true;
+      const result = strings.join('');
+      return `"${result.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
     }
+  );
+
+  if (!found) return { success: false, error: 'string.char静的パターンなし', method: 'static_char' };
+  return { success: true, result: modified, method: 'static_char' };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  #15  xorDecoder 強化版 — bit32.bxor + ~ 演算子サポート
+// ────────────────────────────────────────────────────────────────────────
+function xorDecoder(code) {
+  let modified = code, found = false;
+
+  // bit32.bxor(a, b) — Lua 5.2
+  modified = modified.replace(/bit32\.bxor\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/g, (_, a, b) => {
+    found = true; return String(parseInt(a) ^ parseInt(b));
+  });
+  // bit.bxor(a, b) — LuaJIT
+  modified = modified.replace(/bit\.bxor\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/g, (_, a, b) => {
+    found = true; return String(parseInt(a) ^ parseInt(b));
+  });
+  // #15: ~ XOR演算子 (Lua5.3+) — string.char内のみ安全に展開
+  modified = modified.replace(/string\.char\((\d+)\s*~\s*(\d+)\)/g, (_, a, b) => {
+    found = true; return `string.char(${parseInt(a) ^ parseInt(b)})`;
+  });
+  // 255以下の ^ 演算 (XORとして扱う)
+  modified = modified.replace(/\b(\d+)\s*\^\s*(\d+)\b/g, (match, a, b) => {
+    const ia = parseInt(a), ib = parseInt(b);
+    if (ia <= 255 && ib <= 255) { found = true; return String(ia ^ ib); }
+    return match;
+  });
+
+  // XOR配列ブルートフォース
+  function xorByte(b, k) {
+    let r = 0;
+    for (let i = 0; i < 8; i++) {
+      if (((b >> i) & 1) !== ((k >> i) & 1)) r |= (1 << i);
+    }
+    return r;
+  }
+  const patterns = [/local\s+\w+\s*=\s*\{([0-9,\s]+)\}/g, /\{([0-9,\s]+)\}/g];
+  let encArrays = [];
+  for (const pat of patterns) {
+    let m; const p = new RegExp(pat.source, pat.flags);
+    while ((m = p.exec(code)) !== null) {
+      const nums = m[1].split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
+      if (nums.length > 3) encArrays.push(nums);
+    }
+    if (encArrays.length > 0) break;
+  }
+  if (encArrays.length > 0) {
+    let bestResult = null, bestScore = -1, bestKey = -1;
+    for (const arr of encArrays) {
+      for (let key = 0; key <= 255; key++) {
+        const str = arr.map(b => String.fromCharCode(xorByte(b, key))).join('');
+        const score = scoreLuaCode(str);
+        if (score > bestScore) { bestScore = score; bestResult = str; bestKey = key; }
+      }
+    }
+    if (bestScore > 10)
+      return { success: true, result: bestResult, key: bestKey, score: bestScore, method: 'xor_decoder' };
   }
 
-  // #17: opcodeIndex推測
-  // vmTrace内でarg1/arg2/arg3の分布を見て命令構造を推定
-  const arg1Stats = analyzeArgStats(vmTrace.map(t => t.arg1));
-  const arg2Stats = analyzeArgStats(vmTrace.map(t => t.arg2));
-  const opcodeIndex = inferOpcodeIndex(vmTrace, arg1Stats, arg2Stats);
-
-  // #18: opcodeExecutionMap生成
-  const opcodeExecutionMap = {};
-  for (const [num, name] of Object.entries(LUA51_OPCODES)) {
-    const opEntries = vmTrace.filter(t => String(t.op) === String(num));
-    if (opEntries.length > 0) {
-      opcodeExecutionMap[name] = {
-        opcode: parseInt(num),
-        count: opEntries.length,
-        sampleArgs: opEntries.slice(0, 3).map(e => [e.arg1, e.arg2, e.arg3]),
-      };
-    }
-  }
-
-  return { map: opcodeMap, opcodeIndex, opcodeExecutionMap };
-}
-
-function analyzeArgStats(args) {
-  const nums = args.filter(a => typeof a === 'number');
-  if (nums.length === 0) return { min: 0, max: 0, avg: 0, isRegister: false };
-  const min = Math.min(...nums);
-  const max = Math.max(...nums);
-  const avg = nums.reduce((a, b) => a + b, 0) / nums.length;
-  const isRegister = max < 256 && min >= 0; // レジスタっぽい範囲
-  return { min, max, avg: Math.round(avg), isRegister };
-}
-
-function inferOpcodeIndex(vmTrace, arg1Stats, arg2Stats) {
-  // op フィールドが存在する場合はそれが opcodeIndex=0 (inst[1])
-  const hasDirectOp = vmTrace.some(t => t.op !== null && t.op !== undefined);
-  if (hasDirectOp) return { position: 1, confidence: 'high', note: 'inst[1]がopcode' };
-
-  // arg1が小さい整数の場合はarg1がopcodeの可能性
-  if (arg1Stats.max < 40 && arg1Stats.isRegister)
-    return { position: 1, confidence: 'medium', note: 'arg1がopcode候補' };
-
-  return { position: 1, confidence: 'low', note: '推定不能' };
+  if (!found) return { success: false, error: 'XORパターンなし', method: 'xor_decoder' };
+  return { success: true, result: modified, method: 'xor_decoder' };
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #19  reconstructedLuaBuilder  — 疑似Luaコードを再構築
+//  #40-#53  vmDecompiler — VMログから疑似Luaコードを生成
 // ────────────────────────────────────────────────────────────────────────
-function reconstructedLuaBuilder(vmTrace, bytecodeDump, opcodeMap) {
+function vmDecompiler(vmTrace, bytecodeDump, opcodeMap) {
   if (!vmTrace || vmTrace.length === 0)
-    return { success: false, error: 'vmTraceが空', pseudoCode: '' };
+    return { success: false, error: 'vmTraceが空', pseudoCode: '', method: 'vm_decompile' };
 
-  const map    = (opcodeMap && opcodeMap.map) || {};
-  const exMap  = (opcodeMap && opcodeMap.opcodeExecutionMap) || {};
-  const lines  = ['-- ══ YAJU Reconstructed Pseudo-Lua ══'];
-  lines.push(`-- 解析命令数: ${vmTrace.length}, ユニークop: ${new Set(vmTrace.map(t => t.op)).size}`);
-  lines.push('');
+  const map       = (opcodeMap && opcodeMap.map) || {};
+  const exMap     = (opcodeMap && opcodeMap.opcodeExecutionMap) || {};
+  const catMap    = {};
+  for (const [name, info] of Object.entries(exMap)) catMap[info.opcode] = info.category;
 
-  let prevIp = -1;
-  const ipToLine = {};
+  // ── #49/#50: 定数テーブル抽出 ────────────────────────────────────────
+  const constTables = {};
+  for (const [tname, nums] of Object.entries(bytecodeDump || {})) {
+    constTables[tname] = nums;
+  }
 
+  // ── #41: 中間命令(IR)に変換 ─────────────────────────────────────────
+  const ir = [];
+  // map は dispatchTable(string key) か LUA51_OPCODES(number key) を自動選択
+  const resolvedMap = (map && Object.keys(map).length > 0) ? map : LUA51_OPCODES;
   for (const entry of vmTrace) {
     const { ip, op, arg1, arg2, arg3 } = entry;
-    const opName = (op !== null && op !== undefined) ? (map[String(op)] || `OP_${op}`) : 'UNKNOWN';
-
-    // IP変化によるジャンプ検出
-    if (prevIp >= 0 && ip !== prevIp + 1) {
-      if (ip < prevIp) lines.push(`  -- << JUMP BACK to ip=${ip} (loop?) >>`);
-      else if (ip > prevIp + 1) lines.push(`  -- >> JUMP FORWARD to ip=${ip} (skip ${ip-prevIp-1}) >>`);
-    }
-
-    let pseudoLine = `  -- [ip=${ip}] ${opName}`;
-
-    // 命令ごとに疑似コードを生成
-    switch (opName) {
-      case 'MOVE':
-        pseudoLine = `  reg[${arg1}] = reg[${arg2}]  -- MOVE R${arg1} R${arg2}`;
-        break;
-      case 'LOADK':
-        pseudoLine = `  reg[${arg1}] = K[${arg2}]  -- LOADK R${arg1} K${arg2}`;
-        break;
-      case 'LOADBOOL':
-        pseudoLine = `  reg[${arg1}] = ${arg2 ? 'true' : 'false'}  -- LOADBOOL`;
-        break;
-      case 'LOADNIL':
-        pseudoLine = `  for i=${arg1},${arg2} do reg[i]=nil end  -- LOADNIL`;
-        break;
-      case 'GETGLOBAL':
-        pseudoLine = `  reg[${arg1}] = _G[K[${arg2}]]  -- GETGLOBAL`;
-        break;
-      case 'SETGLOBAL':
-        pseudoLine = `  _G[K[${arg2}]] = reg[${arg1}]  -- SETGLOBAL`;
-        break;
-      case 'GETTABLE':
-        pseudoLine = `  reg[${arg1}] = reg[${arg2}][R/K(${arg3})]  -- GETTABLE`;
-        break;
-      case 'SETTABLE':
-        pseudoLine = `  reg[${arg1}][R/K(${arg2})] = R/K(${arg3})  -- SETTABLE`;
-        break;
-      case 'ADD':
-        pseudoLine = `  reg[${arg1}] = R/K(${arg2}) + R/K(${arg3})  -- ADD`;
-        break;
-      case 'SUB':
-        pseudoLine = `  reg[${arg1}] = R/K(${arg2}) - R/K(${arg3})  -- SUB`;
-        break;
-      case 'MUL':
-        pseudoLine = `  reg[${arg1}] = R/K(${arg2}) * R/K(${arg3})  -- MUL`;
-        break;
-      case 'DIV':
-        pseudoLine = `  reg[${arg1}] = R/K(${arg2}) / R/K(${arg3})  -- DIV`;
-        break;
-      case 'MOD':
-        pseudoLine = `  reg[${arg1}] = R/K(${arg2}) % R/K(${arg3})  -- MOD`;
-        break;
-      case 'CONCAT':
-        pseudoLine = `  reg[${arg1}] = reg[${arg2}]..reg[${arg3}]  -- CONCAT`;
-        break;
-      case 'JMP':
-        pseudoLine = `  goto ip+${arg2}+1  -- JMP offset=${arg2}`;
-        break;
-      case 'EQ':
-        pseudoLine = `  if (R/K(${arg2}) == R/K(${arg3})) ~= ${arg1?'true':'false'} then skip  -- EQ`;
-        break;
-      case 'LT':
-        pseudoLine = `  if (R/K(${arg2}) < R/K(${arg3})) ~= ${arg1?'true':'false'} then skip  -- LT`;
-        break;
-      case 'LE':
-        pseudoLine = `  if (R/K(${arg2}) <= R/K(${arg3})) ~= ${arg1?'true':'false'} then skip  -- LE`;
-        break;
-      case 'CALL':
-        pseudoLine = `  reg[${arg1}..${arg1}+${arg3?arg3-1:0}] = reg[${arg1}](reg[${arg1}+1]..reg[${arg1}+${arg2?arg2-1:0}])  -- CALL`;
-        break;
-      case 'RETURN':
-        pseudoLine = `  return reg[${arg1}..${arg1}+${arg2?arg2-2:0}]  -- RETURN`;
-        break;
-      case 'FORLOOP':
-        pseudoLine = `  -- FORLOOP R${arg1} -> ip+=${arg2}`;
-        break;
-      case 'FORPREP':
-        pseudoLine = `  -- FORPREP R${arg1} skip=${arg2}`;
-        break;
-      case 'NEWTABLE':
-        pseudoLine = `  reg[${arg1}] = {}  -- NEWTABLE`;
-        break;
-      case 'SETLIST':
-        pseudoLine = `  -- SETLIST reg[${arg1}][${arg3}*50+1..] = reg[${arg1}+1..]`;
-        break;
-      case 'CLOSURE':
-        pseudoLine = `  reg[${arg1}] = closure(proto[${arg2}])  -- CLOSURE`;
-        break;
-      case 'VARARG':
-        pseudoLine = `  reg[${arg1}..${arg1}+${arg2?arg2-1:0}] = vararg  -- VARARG`;
-        break;
-      default:
-        pseudoLine = `  -- [ip=${ip}] ${opName}(${[arg1,arg2,arg3].filter(v=>v!==null).join(', ')})`;
-    }
-
-    lines.push(pseudoLine);
-    ipToLine[ip] = pseudoLine;
-    prevIp = ip;
+    const opName = (op !== null && op !== undefined)
+      ? (resolvedMap[String(op)] || resolvedMap[op] || `OP_${op}`) : 'UNKNOWN';
+    const cat    = catMap[String(op)] || catMap[op] || OPCODE_CATEGORIES[opName] || 'UNKNOWN';
+    ir.push({ ip, opName, cat, op, arg1, arg2, arg3 });
   }
 
-  lines.push('');
-  lines.push('-- ══ End of Reconstruction ══');
-
-  // 重複を削減してコンパクトに
-  const unique = [];
-  const seen = new Set();
-  for (const l of lines) {
-    if (!seen.has(l) || l.startsWith('--')) { unique.push(l); seen.add(l); }
+  // ── #42: CFG構築 (IPベースの基本ブロック分割) ─────────────────────
+  // leaders: IPセットを ir[0].ipから始め、全IPを登録
+  const firstIp = ir.length > 0 ? ir[0].ip : 0;
+  const leaders   = new Set([firstIp]);
+  // 全IPをリーダー候補として追加
+  for (const inst of ir) leaders.add(inst.ip);
+  const jumpTargets = new Set();
+  for (const inst of ir) {
+    if (['JUMP','EQ','LT','LE','TEST','TESTSET'].includes(inst.cat)) {
+      // JMP offset から飛び先を計算
+      if (inst.opName === 'JMP' && inst.arg2 !== null) {
+        const target = inst.ip + 1 + inst.arg2;
+        leaders.add(target);
+        jumpTargets.add(target);
+      }
+      leaders.add(inst.ip + 1);
+    }
+    if (inst.cat === 'LOOP') {
+      leaders.add(inst.ip);
+      if (inst.arg2 !== null) leaders.add(inst.ip + 1 + inst.arg2);
+    }
   }
+
+  // ── #43: 基本ブロック作成 ──────────────────────────────────────────
+  const blocks = [];
+  let currentBlock = null;
+  for (const inst of ir) {
+    if (leaders.has(inst.ip)) {
+      if (currentBlock) blocks.push(currentBlock);
+      currentBlock = { startIp: inst.ip, instructions: [], isLoopTarget: jumpTargets.has(inst.ip) };
+    }
+    if (currentBlock) currentBlock.instructions.push(inst);
+  }
+  if (currentBlock) blocks.push(currentBlock);
+
+  // ── #44-#48: 基本ブロックから疑似Luaコード生成 ──────────────────────
+  const lines = [];
+  lines.push('-- ══ YAJU VM Decompiled (疑似Lua) ══');
+  if (Object.keys(constTables).length > 0) {
+    // #50: 定数テーブルを local const = {...} として出力
+    for (const [tname, nums] of Object.entries(constTables)) {
+      lines.push(`local ${tname}_const = {${nums.slice(0,16).join(',')}${nums.length > 16 ? ',...' : ''}}`);
+    }
+    lines.push('');
+  }
+
+  // レジスタ名マッピング (#48)
+  const regName = (n) => n !== null ? `v${n}` : '_';
+
+  let indentLevel = 0;
+  const indent = () => '  '.repeat(indentLevel);
+  const prevIp = { val: -1 };
+
+  for (const block of blocks) {
+    if (block.isLoopTarget)
+      lines.push(`${indent()}::lbl_${block.startIp}::`);
+
+    for (const inst of block.instructions) {
+      const { ip, opName, cat, arg1, arg2, arg3 } = inst;
+      let line = '';
+
+      // #44: ジャンプ命令を if/while/for に復元
+      // #45: スタック操作を変数に復元
+      // #46: 算術opcode を + - * / に復元
+      // #47: CALL opcode を関数呼び出しに復元
+      // #48: VM register を Lua ローカル変数に変換
+      switch (opName) {
+        case 'MOVE':     line = `local ${regName(arg1)} = ${regName(arg2)}  -- MOVE`; break;
+        case 'LOADK':    line = `local ${regName(arg1)} = K[${arg2}]  -- LOADK`; break;
+        case 'LOADBOOL': line = `local ${regName(arg1)} = ${arg2 ? 'true' : 'false'}  -- LOADBOOL`; indentLevel=Math.max(0,indentLevel); break;
+        case 'LOADNIL':  line = `for __i=${arg1},(${arg2}) do local _v${arg1}=nil end  -- LOADNIL`; break;
+        case 'GETGLOBAL':line = `local ${regName(arg1)} = _G[K[${arg2}]]  -- GETGLOBAL`; break;
+        case 'SETGLOBAL':line = `_G[K[${arg2}]] = ${regName(arg1)}  -- SETGLOBAL`; break;
+        case 'GETTABLE': line = `local ${regName(arg1)} = ${regName(arg2)}[K_or_R(${arg3})]  -- GETTABLE`; break;
+        case 'SETTABLE': line = `${regName(arg1)}[K_or_R(${arg2})] = K_or_R(${arg3})  -- SETTABLE`; break;
+        case 'NEWTABLE': line = `local ${regName(arg1)} = {}  -- NEWTABLE`; break;
+        // #46: 算術
+        case 'ADD':    line = `local ${regName(arg1)} = ${regName(arg2)} + ${regName(arg3)}  -- ADD`; break;
+        case 'SUB':    line = `local ${regName(arg1)} = ${regName(arg2)} - ${regName(arg3)}  -- SUB`; break;
+        case 'MUL':    line = `local ${regName(arg1)} = ${regName(arg2)} * ${regName(arg3)}  -- MUL`; break;
+        case 'DIV':    line = `local ${regName(arg1)} = ${regName(arg2)} / ${regName(arg3)}  -- DIV`; break;
+        case 'MOD':    line = `local ${regName(arg1)} = ${regName(arg2)} % ${regName(arg3)}  -- MOD`; break;
+        case 'POW':    line = `local ${regName(arg1)} = ${regName(arg2)} ^ ${regName(arg3)}  -- POW`; break;
+        case 'UNM':    line = `local ${regName(arg1)} = -${regName(arg2)}  -- UNM`; break;
+        case 'NOT':    line = `local ${regName(arg1)} = not ${regName(arg2)}  -- NOT`; break;
+        case 'LEN':    line = `local ${regName(arg1)} = #${regName(arg2)}  -- LEN`; break;
+        case 'CONCAT': {
+          const parts = [];
+          for (let i = arg2; i <= arg3; i++) parts.push(regName(i));
+          line = `local ${regName(arg1)} = ${parts.join(' .. ')}  -- CONCAT`;
+          break;
+        }
+        // #44: ジャンプ命令
+        case 'JMP': {
+          const target = ip + 1 + (arg2 || 0);
+          line = `goto lbl_${target}  -- JMP target=${target}`;
+          break;
+        }
+        case 'EQ':  line = `if (${regName(arg2)} == ${regName(arg3)}) ~= ${arg1?'true':'false'} then goto lbl_${ip+2} end  -- EQ`; break;
+        case 'LT':  line = `if (${regName(arg2)} < ${regName(arg3)}) ~= ${arg1?'true':'false'} then goto lbl_${ip+2} end  -- LT`; break;
+        case 'LE':  line = `if (${regName(arg2)} <= ${regName(arg3)}) ~= ${arg1?'true':'false'} then goto lbl_${ip+2} end  -- LE`; break;
+        case 'TEST':    line = `if not ${regName(arg1)} then goto lbl_${ip+2} end  -- TEST`; break;
+        case 'TESTSET': line = `if ${regName(arg2)} then ${regName(arg1)}=${regName(arg2)} else goto lbl_${ip+2} end  -- TESTSET`; break;
+        // #47: CALL
+        case 'CALL': {
+          const nargs  = (arg2 || 1) - 1;
+          const nret   = (arg3 || 1) - 1;
+          const args_  = Array.from({length: nargs}, (_, i) => regName(arg1 + 1 + i));
+          const rets   = Array.from({length: Math.max(1, nret)}, (_, i) => regName(arg1 + i));
+          line = `${rets.join(', ')} = ${regName(arg1)}(${args_.join(', ')})  -- CALL`;
+          break;
+        }
+        case 'TAILCALL': {
+          const nargs_ = (arg2 || 1) - 1;
+          const args__ = Array.from({length: nargs_}, (_, i) => regName(arg1 + 1 + i));
+          line = `return ${regName(arg1)}(${args__.join(', ')})  -- TAILCALL`;
+          break;
+        }
+        case 'RETURN': {
+          if (!arg1 && !arg2) { line = 'return  -- RETURN'; break; }
+          const nvals = (arg2 || 1) - 1;
+          const vals  = Array.from({length: Math.max(1, nvals)}, (_, i) => regName((arg1||0) + i));
+          line = `return ${vals.join(', ')}  -- RETURN`;
+          break;
+        }
+        case 'FORPREP': line = `${regName(arg1)} = ${regName(arg1)} - ${regName(arg1+2)}  -- FORPREP`; indentLevel++; break;
+        case 'FORLOOP': line = `${regName(arg1)} = ${regName(arg1)} + ${regName(arg1+2)}; if ${regName(arg1)} <= ${regName(arg1+1)} then goto lbl_${ip+1+(arg2||0)} end  -- FORLOOP`; indentLevel=Math.max(0,indentLevel-1); break;
+        case 'CLOSURE': line = `local ${regName(arg1)} = function() --[[closure ${arg2}]] end  -- CLOSURE`; break;
+        case 'SETLIST': line = `-- SETLIST ${regName(arg1)}[...]  (#${arg3})`;  break;
+        case 'VARARG':  {
+          const nva = (arg2 || 1) - 1;
+          const vas = Array.from({length: Math.max(1,nva)}, (_, i) => regName((arg1||0)+i));
+          line = `${vas.join(', ')} = ...  -- VARARG`;
+          break;
+        }
+        default: line = `-- [ip=${ip}] ${opName}(${[arg1,arg2,arg3].filter(v=>v!==null).join(', ')})`;
+      }
+
+      lines.push(`${indent()}${line}`);
+      prevIp.val = ip;
+    }
+  }
+
+  lines.push('-- ══ End of Decompilation ══');
+  const pseudoCode = lines.join('\n');
+
+  // #53: decompiled.lua として保存
+  let savedPath = null;
+  try {
+    savedPath = path.join(tempDir, `decompiled_${Date.now()}.lua`);
+    fs.writeFileSync(savedPath, pseudoCode, 'utf8');
+  } catch {}
 
   return {
     success: true,
-    pseudoCode: unique.join('\n'),
+    pseudoCode,
     instructionCount: vmTrace.length,
-    method: 'vm_reconstruct',
+    blockCount: blocks.length,
+    savedPath,
+    method: 'vm_decompile',
   };
 }
 
+// 後方互換: reconstructedLuaBuilder → vmDecompiler に委譲
+function reconstructedLuaBuilder(vmTrace, bytecodeDump, opcodeMap) {
+  return vmDecompiler(vmTrace, bytecodeDump, opcodeMap);
+}
+
 // ────────────────────────────────────────────────────────────────────────
-//  vmBytecodeExtractor  (上書き: より詳細な抽出)
+//  #49/#50  bytecodeテーブル抽出
 // ────────────────────────────────────────────────────────────────────────
+function parseBytecodeDump(stdout) {
+  const bytecodeDump = {};
+  for (const line of stdout.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('__BYTECODE__')) continue;
+    const parts = t.split('\t');
+    if (parts.length < 4) continue;
+    const tblName = parts[1], idx = parseInt(parts[2]), val = parseInt(parts[3]);
+    if (!bytecodeDump[tblName]) bytecodeDump[tblName] = [];
+    bytecodeDump[tblName][idx - 1] = val;
+  }
+  return bytecodeDump;
+}
+
 function vmBytecodeExtractor(code) {
   const tables = [];
   const tblPattern = /local\s+(\w+)\s*=\s*\{((?:\s*\d+\s*,){10,}[^}]*)\}/g;
@@ -1539,18 +1634,55 @@ function vmBytecodeExtractor(code) {
     const name = m[1];
     const nums = m[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
     if (nums.length >= 10) {
-      // バイトコードらしさのスコア計算
       const max = Math.max(...nums);
-      const isLikelyBytecode = max < 65536 && nums.length >= 20;
-      tables.push({ name, count: nums.length, sample: nums.slice(0, 16), isLikelyBytecode });
+      tables.push({ name, count: nums.length, sample: nums.slice(0,16), isLikelyBytecode: max < 65536 });
     }
   }
-  if (tables.length === 0) return { success: false, error: 'バイトコードテーブルが見つかりません', method: 'vm_extract' };
+  if (tables.length === 0) return { success: false, error: 'バイトコードテーブルなし', method: 'vm_extract' };
   return {
     success: true, tables, method: 'vm_extract',
-    hints: tables.map(t => `${t.name}[${t.count}要素]${t.isLikelyBytecode?' (bytecode候補)':''}: [${t.sample.join(',')}...]`),
+    hints: tables.map(t=>`${t.name}[${t.count}]: [${t.sample.join(',')}...]${t.isLikelyBytecode?' (bytecode候補)':''}`),
   };
 }
+
+const VM_TRACE_THRESHOLD = 50;
+function checkWereDevDetected(vmTrace) { return vmTrace.length >= VM_TRACE_THRESHOLD; }
+
+function dumpBytecodeTables(code) {
+  const candidates = [];
+  const tblPat = /local\s+(\w+)\s*=\s*\{([\s\d,]+)\}/g;
+  let m;
+  while ((m = tblPat.exec(code)) !== null) {
+    const nums = m[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    if (nums.length >= 50) candidates.push({ name: m[1], count: nums.length });
+  }
+  if (candidates.length === 0) return { code, injected: false, candidates: [] };
+  let inject = '\n-- ══ YAJU Bytecode Dump ══\n';
+  for (const c of candidates) {
+    inject += `if type(${c.name})=="table" then\n  for __i,__v in ipairs(${c.name}) do\n    print("__BYTECODE__\\t${c.name}\\t"..tostring(__i).."\\t"..tostring(__v))\n  end\nend\n`;
+  }
+  return { code: code + inject, injected: true, candidates };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  #55  beautifyLua — 最終コード整形
+// ────────────────────────────────────────────────────────────────────────
+function beautifyLua(code) {
+  if (!code) return code;
+  let result = code;
+  // 連続した空行を2行以内に
+  result = result.replace(/\n{3,}/g, '\n\n');
+  // end/else/until の前に空行
+  result = result.replace(/([^\n])\n(end|else|elseif|until)\b/g, '$1\n\n$2');
+  // function の前に空行
+  result = result.replace(/([^\n])\n(local\s+function|function)\b/g, '$1\n\n$2');
+  // インデントの正規化 (タブ→2スペース)
+  result = result.replace(/\t/g, '  ');
+  // 末尾空白削除
+  result = result.replace(/[ \t]+$/gm, '');
+  return result.trim();
+}
+
 
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1745,30 +1877,189 @@ function symbolicExecute(code, env, depth, visited) {
 //   ⑥ #10: decode結果がLuaコードなら再帰パイプライン実行
 // ════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════
+//  BLOCK 4: dynamicDecode v2 + autoDeobfuscate v5 (#1-#57 統合)
+// ════════════════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────────────────
+//  dynamicDecode v2  (#2/#4-#11/#23-#25)
+// ────────────────────────────────────────────────────────────────────────
+async function dynamicDecode(code) {
+  const luaBin = checkLuaAvailable();
+  if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic_decode' };
+
+  const filtered = sandboxFilter(code);
+  if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic_decode' };
+  if (filtered.removed.length > 0) console.log('[DynDec] 危険関数除去:', filtered.removed.join(', '));
+
+  // preamble: safeEnv + hookLoadstring + vmHookBootstrap
+  const preamble = safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
+
+  // #23: vmDetector(codeToRun) — hook注入後のコードに対して検出
+  let codeToRun = filtered.code;
+  let vmHookInjected = false, bytecodeCandidates = [];
+
+  const vmInfoPre = vmDetector(codeToRun);  // hook前の初期検出
+
+  // VM検出後に hook注入
+  if (vmInfoPre.isVm || vmInfoPre.isWereDev || vmInfoPre.isMoonSec || vmInfoPre.isLuraph) {
+    // #24: /while\s+true\s+do|repeat\s+until/ に拡張
+    const hasVmLoop = /while\s+true\s+do|repeat\s+until/.test(codeToRun);
+    if (hasVmLoop) {
+      const hookResult = injectVmHook(codeToRun, vmInfoPre);
+      codeToRun = hookResult.code;
+      vmHookInjected = hookResult.injected;
+    }
+    const dumpResult = dumpBytecodeTables(codeToRun);
+    codeToRun = dumpResult.code;
+    bytecodeCandidates = dumpResult.candidates;
+  }
+
+  // #23: hook注入後のコードで再検出
+  const vmInfo = vmDetector(codeToRun);
+
+  const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
+  const safeFullCode = fullCode.replace(/\]\]/g, '] ]');
+  const tempFile = path.join(tempDir, `dyndec_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
+
+  const wrapper = `
+-- ══ YAJU dynamicDecode v2 Wrapper ══
+-- アンチダンプ・アンチデバッグを無効化
+pcall(function()
+  if debug then
+    debug.sethook=function() end; debug.getinfo=nil
+    debug.getlocal=nil; debug.setlocal=nil
+    debug.getupvalue=nil; debug.setupvalue=nil
+  end
+end)
+pcall(function()
+  if getfenv then
+    local env=getfenv()
+    env.saveinstance=nil; env.dumpstring=nil; env.save_instance=nil
+  end
+end)
+
+local __obf_code = [[
+${safeFullCode}
+]]
+
+local __orig_ls_outer = loadstring or load
+local __ok, __err = pcall(function()
+  local chunk, err = __orig_ls_outer(__obf_code)
+  if not chunk then error("parse error: " .. tostring(err)) end
+  chunk()
+end)
+
+if not __ok then
+  io.write("\\n__EXEC_ERROR__:" .. tostring(__err) .. "\\n")
+end
+`;
+
+  return new Promise(resolve => {
+    fs.writeFileSync(tempFile, wrapper, 'utf8');
+
+    // #25: タイムアウトを 6000ms に変更 (3000→6000)
+    exec(`${luaBin} ${tempFile}`, { timeout: 6000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
+      try { fs.unlinkSync(tempFile); } catch {}
+
+      // #9: __DECODED__ 抽出 (scoreLuaCode フィルター付き #10)
+      const decoded = parseDecodedOutputs(stdout);
+
+      // VMログ抽出 (#34/#35)
+      const vmTrace      = parseVmLogs(stdout);
+      const bytecodeDump = parseBytecodeDump(stdout);
+      const wereDevDetected = checkWereDevDetected(vmTrace);
+
+      // #36: vmトレースをJSONで保存
+      if (vmTrace.length > 0) saveVmTrace(vmTrace, Date.now());
+
+      const vmAnalysis = { vmTrace, bytecodeDump, wereDevDetected, vmHookInjected, bytecodeCandidates, vmInfo };
+      if (wereDevDetected) {
+        vmAnalysis.traceAnalysis  = vmTraceAnalyzer(vmTrace);    // #37/#38/#39
+        vmAnalysis.reconstruction = vmDecompiler(               // #40-#52
+          vmTrace, bytecodeDump, vmAnalysis.traceAnalysis.opcodeMap
+        );
+      }
+
+      // __DECODED__ が取れた場合
+      if (decoded.best) {
+        return resolve({
+          success: true,
+          result: decoded.best,
+          allDecoded: decoded.all.map(d => d.code),
+          decodedCount: decoded.all.length,
+          method: 'dynamic_decode',
+          vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
+        });
+      }
+
+      // VMトレース再構築が取れた場合
+      if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
+        return resolve({
+          success: true,
+          result: vmAnalysis.reconstruction.pseudoCode,
+          method: 'dynamic_decode_vm',
+          vmAnalysis,
+          WereDevVMDetected: true,
+        });
+      }
+
+      const errMsg = stdout.includes('__EXEC_ERROR__:')
+        ? stdout.split('__EXEC_ERROR__:')[1]?.substring(0, 300) || ''
+        : (stderr || '').substring(0, 300);
+
+      resolve({
+        success: false,
+        error: errMsg || 'loadstringが呼ばれませんでした',
+        method: 'dynamic_decode',
+        vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
+      });
+    });
+  });
+}
+
+async function tryDynamicExecution(code) { return dynamicDecode(code); }
+
+// ────────────────────────────────────────────────────────────────────────
+//  autoDeobfuscate v5  (#1-#20, #56/#57 最終処理)
+// ────────────────────────────────────────────────────────────────────────
 async function autoDeobfuscate(code, _depth) {
   const depth   = _depth || 0;
   const results = [];
+  const origCode = code;  // #17: 元コード保持用
   let current   = code;
   const luaBin  = checkLuaAvailable();
   const pool    = new CapturePool();
   pool.add(current, 'input');
 
-  // ══════════════════════════════════════════════════════
-  //  ① dynamicDecode — pipeline最初 (#1/#2)
-  //    loadstring/load を hookして __DECODED__ をダンプ
-  // ══════════════════════════════════════════════════════
-  let dynDecodedResult  = null;
-  let dynVmAnalysis     = null;
-  let wereDevDetected   = false;
+  // ══ #1: stripComments ════════════════════════════════════════════════
+  {
+    const stripped = stripComments(current);
+    if (stripped !== current) {
+      results.push({ step: 'StripComments', success: true, method: 'strip_comments',
+        hints: ['巨大コメント難読化を除去'] });
+      current = stripped;
+      pool.add(current, 'strip_comments');
+    }
+  }
+
+  // ══ #2/#3: loaderPatternDetected → dynamicDecode 最優先 ═════════════
+  const isLoaderPattern = loaderPatternDetected(current);
+  results.push({
+    step: 'LoaderPatternCheck', success: true, method: 'loader_pattern',
+    loaderPattern: isLoaderPattern,
+    hints: isLoaderPattern ? ['loaderパターン検出 → dynamicDecode優先'] : [],
+  });
+
+  let dynDecodedResult = null, dynVmAnalysis = null, wereDevDetected = false;
 
   if (luaBin) {
+    // ── #2: dynamicDecode を pipeline 最初に ──
     const dynRes = await dynamicDecode(current);
     results.push({
-      step: `dynamicDecode${depth > 0 ? ` (再帰${depth}回目)` : ''}`,
-      success: dynRes.success,
-      result: dynRes.result,
-      method: dynRes.method,
-      error: dynRes.error,
+      step: `dynamicDecode${depth > 0 ? ` (再帰${depth})` : ''}`,
+      success: dynRes.success, result: dynRes.result,
+      method: dynRes.method, error: dynRes.error,
       decodedCount: dynRes.decodedCount,
       WereDevVMDetected: dynRes.WereDevVMDetected,
     });
@@ -1779,126 +2070,116 @@ async function autoDeobfuscate(code, _depth) {
       wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
       current          = dynRes.result;
       pool.add(current, 'dynamic_decode');
+
+      // #18: decoded.all を CapturePool に追加
+      if (dynRes.allDecoded) {
+        for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
+      }
+
+      // #11: decoded.best がある場合 → 再帰実行で多段loaderを解読
+      if (depth < 3) {
+        const recurseCheck = /loadstring|load\s*\(|table\.concat\s*\(/.test(current);
+        if (recurseCheck) {
+          const recurse = await autoDeobfuscate(current, depth + 1);
+          if (recurse.finalCode && recurse.finalCode !== current) {
+            current = recurse.finalCode;
+            pool.add(current, `recursive_loader_${depth + 1}`);
+            results.push({
+              step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
+              hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
+            });
+          }
+        }
+      }
     }
   } else {
-    results.push({ step: 'dynamicDecode', success: false, error: 'Luaがインストールされていません', method: 'dynamic_decode' });
+    results.push({ step: 'dynamicDecode', success: false,
+      error: 'Luaがインストールされていません', method: 'dynamic_decode' });
   }
 
-  // ══════════════════════════════════════════════════════
-  //  ② loaderPatternDetected チェック (#7/#8)
-  //    table.concat + string.char + loadstring が揃う → VM解析スキップ
-  // ══════════════════════════════════════════════════════
-  const isLoaderPattern = loaderPatternDetected(code); // 元コードに対してチェック
-  results.push({
-    step: 'LoaderPatternCheck',
-    success: true,
-    method: 'loader_pattern',
-    loaderPattern: isLoaderPattern,
-    hints: isLoaderPattern ? ['table.concat+string.char+loadstringパターン検出 → VM解析スキップ'] : [],
-  });
+  // ══ #12: pipeline 順序 ══════════════════════════════════════════════
+  //  junk_clean → eval_expressions → char_decoder → xor_decoder
+  //  → constant_array → str_transform → dead_branch
+  // ══════════════════════════════════════════════════════════════════════
+  const staticPipeline = [
+    ['JunkClean',         junkAssignmentCleaner],
+    ['EvalExpressions',   evaluateExpressions],
+    ['CharDecoder',       (c) => staticCharDecoder(c)],   // #13/#14 強化版
+    ['XorDecoder',        xorDecoder],
+    ['ConstantArray',     constantArrayResolver],
+    ['StringTransform',   stringTransformDecoder],
+    ['DeadBranch',        deadBranchRemover],
+  ];
 
-  // ══════════════════════════════════════════════════════
-  //  ③ 静的解析群 (loaderPatternでも実行: 静的は常に有益)
-  // ══════════════════════════════════════════════════════
+  // #16: maxPasses を 10 に増加
+  const MAX_PASSES = 10;
+  let passChanged = true;
+  for (let pass = 0; pass < MAX_PASSES && passChanged; pass++) {
+    passChanged = false;
+    for (const [name, fn] of staticPipeline) {
+      const res = fn(current);
+      if (res.success && res.result && res.result !== current) {
+        results.push({ step: `${name} (pass${pass+1})`, ...res });
+        current = res.result;
+        pool.add(current, name.toLowerCase());
+        passChanged = true;
+      }
+    }
+  }
+
+  // AdvancedStatic (SymExec + ConstantFolding)
   {
     const advRes = advancedStaticDeobfuscate(current);
-    results.push({
-      step: 'AdvancedStatic',
-      success: advRes.success,
-      result: advRes.result,
-      method: advRes.method,
-      hints: advRes.steps && advRes.steps.length ? [`ステップ: ${advRes.steps.join(' → ')}`] : undefined,
-    });
-    if (advRes.success && advRes.result && advRes.result !== current) {
+    if (advRes.success && advRes.result !== current) {
+      results.push({ step: 'AdvancedStatic', ...advRes });
       current = advRes.result;
       pool.add(current, 'advanced_static');
     }
   }
-  for (const [name, fn] of [
-    ['EvaluateExpressions', evaluateExpressions],
-    ['SplitStrings',        deobfuscateSplitStrings],
-    ['XOR',                 xorDecoder],
-    ['ConstantArray',       constantArrayResolver],
-  ]) {
-    const res = fn(current);
-    results.push({ step: name, ...res });
-    if (res.success && res.result && res.result !== current) {
-      current = res.result;
-      pool.add(current, name.toLowerCase());
-    }
-  }
 
-  // 静的解析後に再度 dynamicDecode を試みる（静的で変化があった場合のみ）
-  if (luaBin && current !== code && !dynDecodedResult) {
+  // 静的後 dynamicDecode 再試行
+  if (luaBin && current !== origCode && !dynDecodedResult) {
     const dynRes2 = await dynamicDecode(current);
     results.push({ step: 'dynamicDecode (post-static)', ...dynRes2 });
     if (dynRes2.success && dynRes2.result) {
-      current       = dynRes2.result;
-      dynDecodedResult = dynRes2.result;
+      current = dynRes2.result;
       pool.add(current, 'dynamic_post_static');
+      if (dynRes2.allDecoded) {
+        for (const dc of dynRes2.allDecoded) pool.add(dc, 'decoded_candidate2');
+      }
     }
   }
 
-  // ══════════════════════════════════════════════════════
-  //  ④/#5 VM検出 — dynamicDecode結果コードに対してのみ (#5)
-  //       loaderPatternDetected の場合はスキップ (#8)
-  // ══════════════════════════════════════════════════════
+  // ══ #19: VM検出は dynamicDecode の後にのみ ═══════════════════════════
   if (!isLoaderPattern) {
-    // VM検出対象: dynamicDecodeの結果 or 現在のコード
     const vmTarget = dynDecodedResult || current;
     const vmRes    = deobfuscateVmify(vmTarget);
 
     if (vmRes.success) {
       results.push({ step: 'VmDetect', ...vmRes });
-
-      // バイトコード抽出
       const vmEx = vmBytecodeExtractor(vmTarget);
       if (vmEx.success) results.push({ step: 'VmBytecodeExtract', ...vmEx });
 
-      // ⑤ VM深層解析 — dynVmAnalysis か vmAnalysis から vmTrace を取得
       const vmAnalysis = dynVmAnalysis ||
         results.map(r => r.vmAnalysis).find(a => a && a.vmTrace && a.vmTrace.length > 0);
 
       if (vmAnalysis && vmAnalysis.vmTrace && vmAnalysis.vmTrace.length > 0) {
         const { vmTrace, bytecodeDump } = vmAnalysis;
-        const traceResult = vmTraceAnalyzer(vmTrace);
+        const traceResult = vmTraceAnalyzer(vmTrace);            // #37-#39
         results.push({ step: 'VmTraceAnalyzer', ...traceResult });
 
-        if (wereDevDetected || vmTrace.length >= 10) {
-          const reconResult = reconstructedLuaBuilder(vmTrace, bytecodeDump, traceResult.opcodeMap);
-          results.push({ step: 'VmReconstruct', ...reconResult });
-          if (reconResult.success && reconResult.pseudoCode) {
-            current = reconResult.pseudoCode;
-            pool.add(current, 'vm_reconstruct');
-          }
-        }
-      } else if (vmRes.isWereDev || vmRes.isVm) {
-        // 静的 bytecodeCandidate 抽出
-        const tblPat = /local\s+(\w+)\s*=\s*\{([\s\d,]+)\}/g;
-        const candidates = [];
-        let m2;
-        while ((m2 = tblPat.exec(vmTarget)) !== null) {
-          const nums = m2[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-          if (nums.length >= 50) candidates.push({ name: m2[1], count: nums.length });
-        }
-        if (candidates.length > 0) {
-          results.push({
-            step: 'BytecodeCandidate',
-            success: true,
-            method: 'bytecode_static',
-            hints: candidates.map(c => `${c.name}[${c.count}要素]`),
-          });
+        // #54: vmDecompiler を実行して VMコードを Lua に戻す
+        const decompResult = vmDecompiler(vmTrace, bytecodeDump, traceResult.opcodeMap);  // #40-#53
+        results.push({ step: 'VmDecompiler', ...decompResult });
+        if (decompResult.success && decompResult.pseudoCode) {
+          current = decompResult.pseudoCode;
+          pool.add(current, 'vm_decompiled');
         }
       }
     }
   } else {
-    // #8: loaderPattern → VM解析スキップ、dynamicDecodeのみ
-    results.push({
-      step: 'VmDetect (skipped)',
-      success: false,
-      method: 'vm_detect_skipped',
-      error: 'loaderPatternDetected: VM解析スキップ',
-    });
+    results.push({ step: 'VmDetect (skipped)', success: false,
+      method: 'vm_detect_skipped', error: 'loaderPattern: VM解析スキップ' });
   }
 
   // base64検出
@@ -1907,41 +2188,43 @@ async function autoDeobfuscate(code, _depth) {
     if (b64res.success) results.push({ step: 'Base64Detect', ...b64res });
   }
 
-  // ══════════════════════════════════════════════════════
-  //  ⑥ #10: decode結果がLuaコードなら再帰パイプライン実行
-  //         最大4回、スコアが改善した場合のみ
-  // ══════════════════════════════════════════════════════
-  const MAX_RECURSIVE_DEPTH = 4;
-  if (depth < MAX_RECURSIVE_DEPTH && luaBin) {
-    const prevScore  = scoreLuaCode(code);
-    const currScore  = scoreLuaCode(current);
-    const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+\/]{60,}={0,2}/.test(current);
+  // ══ #55: beautifyLua で整形 ══════════════════════════════════════════
+  const beautified = beautifyLua(current);
+  if (beautified !== current) {
+    current = beautified;
+    results.push({ step: 'BeautifyLua', success: true, method: 'beautify' });
+  }
 
-    // スコアが改善 かつ まだ難読化されている兆候がある場合
-    if (stillObfuscated && currScore > prevScore + 10 && current !== code) {
-      const recurseRes = await autoDeobfuscate(current, depth + 1);
-      results.push({
-        step: `RecursivePipeline (depth=${depth + 1})`,
-        success: recurseRes.success,
-        method: 'recursive_pipeline',
-        hints: [`再帰解析: ${recurseRes.steps.length}ステップ, スコア改善: ${prevScore.toFixed(0)}→${currScore.toFixed(0)}`],
-      });
-      if (recurseRes.finalCode && recurseRes.finalCode !== current) {
-        current = recurseRes.finalCode;
-        pool.add(current, `recursive_${depth + 1}`);
-        // 再帰結果のステップも追加
-        for (const s of recurseRes.steps) {
-          results.push({ ...s, step: `  [depth${depth+1}] ${s.step}` });
-        }
-      }
+  // ══ #56: スコア再計算 — 元コードより低ければ元コードを保持 ═══════════
+  // #17
+  const origScore = scoreLuaCode(origCode);
+  const finalScore = scoreLuaCode(current);
+  if (finalScore < origScore && current !== origCode) {
+    const poolBest = pool.getBest();
+    if (poolBest && scoreLuaCode(poolBest) >= origScore) {
+      current = poolBest;
+      results.push({ step: 'ScoreFallback', success: true, method: 'score_fallback',
+        hints: [`スコア改善: CapturePool最善候補を使用 (${finalScore.toFixed(0)} < ${origScore.toFixed(0)})`] });
     }
   }
+  const bestFinal = pool.getBest() || current;
+  const bestScore = Math.max(scoreLuaCode(current), scoreLuaCode(bestFinal));
+  if (scoreLuaCode(bestFinal) > scoreLuaCode(current)) current = bestFinal;
+
+  // ══ #57: result.lua として保存 ═══════════════════════════════════════
+  let savedResultPath = null;
+  try {
+    savedResultPath = path.join(tempDir, `result_${Date.now()}.lua`);
+    fs.writeFileSync(savedResultPath, current, 'utf8');
+  } catch {}
 
   return {
     success: results.some(r => r.success && r.result),
     steps: results,
     finalCode: current,
+    finalScore: scoreLuaCode(current),
     poolSize: pool.entries.length,
+    savedResultPath,
     depth,
   };
 }
