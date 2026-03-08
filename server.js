@@ -131,51 +131,149 @@ app.post('/api/vm-obfuscate', async (req, res) => {
 //   3. 多段難読化に対応（動的実行の結果を再帰的に動的実行）
 //   4. アンチダンプ・アンチデバッグを無効化してから実行
 // ════════════════════════════════════════════════════════
-async function tryDynamicExecution(code) {
+// ════════════════════════════════════════════════════════════════════════
+//  dynamicDecode — #2/#3/#4/#7/#9 統合: loadstring hookedで __DECODED__ dump
+// ════════════════════════════════════════════════════════════════════════
+
+/**
+ * #7: loaderPatternDetected — table.concat + string.char + loadstring が揃うか
+ */
+function loaderPatternDetected(code) {
+  const hasTableConcat  = /table\.concat\s*\(/.test(code);
+  const hasStringChar   = /string\.char\s*\(/.test(code);
+  const hasLoadstring   = /\bloadstring\b|\bload\s*\(/.test(code);
+  return hasTableConcat && hasStringChar && hasLoadstring;
+}
+
+/**
+ * #9: safeEnv — os.exit / while true do を無力化するLuaヘッダー
+ */
+const safeEnvPreamble = `
+-- ══ YAJU SafeEnv ══
+-- os.exit を無効化
+pcall(function() os.exit = function() end end)
+-- 危険なグローバルを無効化
+pcall(function()
+  os.execute = function() return false end
+  io.popen   = function() return nil end
+end)
+-- while true do の暴走防止: デバッグフックで命令数カウント
+local __safe_ops = 0
+local __safe_max = 500000
+pcall(function()
+  if debug and debug.sethook then
+    debug.sethook(function()
+      __safe_ops = __safe_ops + 1
+      if __safe_ops > __safe_max then
+        debug.sethook()
+        error("__SAFE_TIMEOUT__: 命令数上限到達", 2)
+      end
+    end, "", 1000)
+  end
+end)
+-- ══ SafeEnv End ══
+`;
+
+/**
+ * #3: hookLoadstring — loadstring/load を __DECODED__ を printするhookに差し替え
+ */
+const hookLoadstringCode = `
+-- ══ YAJU hookLoadstring ══
+local __orig_ls = loadstring or load
+local __orig_ld = load or loadstring
+local __decoded_count = 0
+local __decoded_best  = nil
+local __decoded_best_len = 0
+
+local function __hookLoadstring(code_str, ...)
+  if type(code_str) == "string" and #code_str > 10 then
+    __decoded_count = __decoded_count + 1
+    -- #4: __DECODED__ を stdout に出力
+    io.write("\\n__DECODED_START_" .. tostring(__decoded_count) .. "__\\n")
+    io.write(code_str)
+    io.write("\\n__DECODED_END_" .. tostring(__decoded_count) .. "__\\n")
+    -- 最長のものを best として保持
+    if #code_str > __decoded_best_len then
+      __decoded_best     = code_str
+      __decoded_best_len = #code_str
+    end
+  end
+  return __orig_ls(code_str, ...)
+end
+
+_G.loadstring = __hookLoadstring
+_G.load       = __hookLoadstring
+if rawset then
+  pcall(function() rawset(_G, "loadstring", __hookLoadstring) end)
+  pcall(function() rawset(_G, "load",       __hookLoadstring) end)
+end
+-- ══ hookLoadstring End ══
+`;
+
+/**
+ * #4: parseDecodedOutputs — stdout から __DECODED__ を抽出して返す
+ * 複数存在する場合は全て返し、最も長いものを best とする
+ */
+function parseDecodedOutputs(stdout) {
+  const results = [];
+  // 各 __DECODED_START_N__ ... __DECODED_END_N__ を抽出
+  const re = /__DECODED_START_(\d+)__\n([\s\S]*?)\n__DECODED_END_\1__/g;
+  let m;
+  while ((m = re.exec(stdout)) !== null) {
+    const idx  = parseInt(m[1]);
+    const code = m[2];
+    if (code && code.length > 5) results.push({ idx, code });
+  }
+  // 最長を best に
+  const best = results.sort((a, b) => b.code.length - a.code.length)[0] || null;
+  return { all: results, best: best ? best.code : null };
+}
+
+/**
+ * #2: dynamicDecode — pipeline最初に置く動的デコードパス
+ * loadstring を hookして __DECODED__ をダンプ
+ */
+async function dynamicDecode(code) {
   const luaBin = checkLuaAvailable();
-  if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic' };
+  if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic_decode' };
 
-  // #12 sandboxFilter — 危険関数除去 + サイズ制限
   const filtered = sandboxFilter(code);
-  if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic' };
-  if (filtered.removed.length > 0)
-    console.log('[Dynamic] 危険関数を除去:', filtered.removed.join(', '));
+  if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic_decode' };
 
+  const safeCode = filtered.code.replace(/\]\]/g, '] ]');
 
-  // VM検出 (#3)
+  // #9: safeEnv + #3: hookLoadstring + VMフックBootstrap を先頭に注入
+  const preamble = safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
+
+  // #6: VM検出は dynamicDecode 内で行い、VMループがある場合のみ vmHookInject
   const vmInfo = vmDetector(filtered.code);
-
-  // VMが検出された場合: hookを注入 (#4/#5/#6) + bytecodeダンプ (#12/#13/#14)
   let codeToRun = filtered.code;
   let vmHookInjected = false;
   let bytecodeCandidates = [];
 
+  // #6: while true do VMloop が検出された場合のみ hook注入
   if (vmInfo.isVm || vmInfo.isWereDev) {
-    // #4/#5/#6: __vmhook を VMループに注入
-    const hookResult = injectVmHook(codeToRun);
-    codeToRun = hookResult.code;
-    vmHookInjected = hookResult.injected;
-
-    // #12/#13/#14: bytecodeテーブルをstdoutに出力するコードを挿入
+    const hasWhileTrue = /while\s+true\s+do/.test(codeToRun);
+    if (hasWhileTrue) {
+      const hookResult = injectVmHook(codeToRun);
+      codeToRun = hookResult.code;
+      vmHookInjected = hookResult.injected;
+    }
+    // bytecodeテーブルのダンプ注入
     const dumpResult = dumpBytecodeTables(codeToRun);
     codeToRun = dumpResult.code;
     bytecodeCandidates = dumpResult.candidates;
   }
 
-  // #2: vmHookBootstrap をコード先頭に注入 (#7: vmDumpFooterを末尾に追加)
-  const hookedCode = runLuaWithHooks(codeToRun);
-  const safeCode   = hookedCode.replace(/\]\]/g, '] ]');
-  const tempFile   = path.join(tempDir, `obf_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
+  const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
+  const safeFullCode = fullCode.replace(/\]\]/g, '] ]');
+
+  const tempFile = path.join(tempDir, `dyndec_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
 
   const wrapper = `
--- ══════════════════════════════════════════
---  YAJU Deobfuscator - Dynamic Execution Wrapper (v3 VM-Hook)
--- ══════════════════════════════════════════
-
-local __captures = {}
-local __capture_count = 0
-local __original_loadstring = loadstring or load
-local __original_load = load or loadstring
+-- ══════════════════════════════════════════════════════
+--  YAJU dynamicDecode Wrapper  (hookLoadstring + safeEnv)
+-- ══════════════════════════════════════════════════════
 
 -- アンチダンプ・アンチデバッグを無効化
 pcall(function()
@@ -192,122 +290,86 @@ pcall(function()
   end
 end)
 
--- loadstring / load を完全フック
-local function __hook(code_str, ...)
-  if type(code_str) == "string" and #code_str > 20 then
-    __capture_count = __capture_count + 1
-    __captures[__capture_count] = code_str
-  end
-  return __original_loadstring(code_str, ...)
-end
-_G.loadstring = __hook
-_G.load       = __hook
-if rawset then
-  pcall(function() rawset(_G, "loadstring", __hook) end)
-  pcall(function() rawset(_G, "load",       __hook) end)
-end
-
--- 難読化コード (VM Hook 注入済み) を実行
 local __obf_code = [[
-\${safeCode}
+${safeFullCode}
 ]]
 
+local __orig_ls_outer = loadstring or load
 local __ok, __err = pcall(function()
-  local chunk, err = __original_loadstring(__obf_code)
+  local chunk, err = __orig_ls_outer(__obf_code)
   if not chunk then error("parse error: " .. tostring(err)) end
   chunk()
 end)
 
--- loadstring キャプチャ結果を出力
-if __capture_count > 0 then
-  local best = __captures[1]
-  for i = 2, __capture_count do
-    if #__captures[i] > #best then best = __captures[i] end
-  end
-  io.write("__CAPTURED_START__")
-  io.write(best)
-  io.write("__CAPTURED_END__")
-  if __capture_count > 1 then
-    io.write("__LAYERS__:" .. tostring(__capture_count))
-  end
-else
-  io.write("__NO_CAPTURE__")
-  if not __ok then
-    io.write("__ERROR__:" .. tostring(__err))
-  end
+if not __ok then
+  io.write("\\n__EXEC_ERROR__:" .. tostring(__err))
 end
 `;
+
   return new Promise(resolve => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
-
-    // #13 timeout=15秒, maxBuffer=5MB に制限して無限ループ・大量出力を防止
     exec(`${luaBin} ${tempFile}`, { timeout: 15000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
-      // #8/#9: parseVmLogs で __VMLOG__ 行を抽出
+      // #4: __DECODED__ 抽出
+      const decoded = parseDecodedOutputs(stdout);
+
+      // VM ログ抽出
       const vmTrace = parseVmLogs(stdout);
-
-      // #15: parseBytecodeDump で __BYTECODE__ 行を抽出
       const bytecodeDump = parseBytecodeDump(stdout);
-      const hasBytecode  = Object.keys(bytecodeDump).length > 0;
-
-      // #10: WereDev VM検出しきい値チェック
       const wereDevDetected = checkWereDevDetected(vmTrace);
-
-      // VM解析結果をまとめる
       const vmAnalysis = { vmTrace, bytecodeDump, wereDevDetected, vmHookInjected, bytecodeCandidates };
+
       if (wereDevDetected) {
-        // #11: vmTraceAnalyzer
-        vmAnalysis.traceAnalysis = vmTraceAnalyzer(vmTrace);
-        // #19: reconstructedLuaBuilder
-        const opcodeMap = vmAnalysis.traceAnalysis.opcodeMap;
-        vmAnalysis.reconstruction = reconstructedLuaBuilder(vmTrace, bytecodeDump, opcodeMap);
-        console.log(`[VM] WereDev VM検出! 命令数=${vmTrace.length}, 再構築: ${vmAnalysis.reconstruction.success}`);
+        vmAnalysis.traceAnalysis   = vmTraceAnalyzer(vmTrace);
+        vmAnalysis.reconstruction  = reconstructedLuaBuilder(vmTrace, bytecodeDump, vmAnalysis.traceAnalysis.opcodeMap);
       }
 
-      // キャプチャ成功
-      if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
-        const start    = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
-        const end      = stdout.indexOf('__CAPTURED_END__');
-        const captured = stdout.substring(start, end).trim();
-
-        if (captured && captured.length > 5) {
-          const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
-          const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
-          return resolve({ success: true, result: captured, layers, method: 'dynamic',
-            vmAnalysis: wereDevDetected ? vmAnalysis : undefined });
-        }
+      // __DECODED__ が取れた場合
+      if (decoded.best) {
+        return resolve({
+          success: true,
+          result: decoded.best,
+          allDecoded: decoded.all.map(d => d.code),
+          decodedCount: decoded.all.length,
+          method: 'dynamic_decode',
+          vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
+        });
       }
 
-      // VMトレースがあれば疑似コードを結果として返す
+      // VMトレース再構築が取れた場合
       if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
         return resolve({
           success: true,
           result: vmAnalysis.reconstruction.pseudoCode,
-          layers: 0,
-          method: 'dynamic_vm_reconstruct',
+          method: 'dynamic_decode_vm',
           vmAnalysis,
           WereDevVMDetected: true,
         });
       }
 
-      // エラー情報
-      if (stdout.includes('__ERROR__:')) {
-        const errMsg = stdout.split('__ERROR__:')[1] || '';
-        return resolve({ success: false, error: 'Luaエラー: ' + errMsg.substring(0, 300), method: 'dynamic',
-          vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined });
-      }
+      const errMsg = stdout.includes('__EXEC_ERROR__:')
+        ? stdout.split('__EXEC_ERROR__:')[1]?.substring(0, 300) || ''
+        : (stderr || '').substring(0, 300);
 
-      if (error && stderr) {
-        return resolve({ success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic',
-          vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined });
-      }
-
-      resolve({ success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic',
-        vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined });
+      resolve({
+        success: false,
+        error: errMsg || 'loadstringが呼ばれませんでした',
+        method: 'dynamic_decode',
+        vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
+      });
     });
   });
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  tryDynamicExecution — 後方互換ラッパー (dynamicDecode を呼ぶ)
+// ════════════════════════════════════════════════════════════════════════
+async function tryDynamicExecution(code) {
+  return dynamicDecode(code);
+}
+
+
 
 // ════════════════════════════════════════════════════════════════════════
 //  YAJU Deobfuscator Engine v3
@@ -1671,178 +1733,220 @@ function symbolicExecute(code, env, depth, visited) {
 //   6. dynamic (Lua実行 → 多段ループ)
 //   7. vmify (VM検出ヒント)
 // ════════════════════════════════════════════════════════
-async function autoDeobfuscate(code) {
+// ════════════════════════════════════════════════════════════════════════
+//  autoDeobfuscate  v4  — 全10項目対応パイプライン
+//
+//  処理順:
+//   ① dynamicDecode (loadstring hook, safeEnv, __DECODED__ dump) ← #1/#2 最初に配置
+//   ② loaderPatternDetected チェック → true なら VM解析スキップ   ← #7/#8
+//   ③ 静的解析群 (advanced_static, eval, split, xor, constantArray)
+//   ④ VM検出 → dynamicDecode結果に対してのみ実行                  ← #1/#5
+//   ⑤ VM解析 (vmTraceAnalyzer, reconstructedLuaBuilder)
+//   ⑥ #10: decode結果がLuaコードなら再帰パイプライン実行
+// ════════════════════════════════════════════════════════════════════════
+
+async function autoDeobfuscate(code, _depth) {
+  const depth   = _depth || 0;
   const results = [];
-  let current = code;
-  const luaBin = checkLuaAvailable();
-  const pool = new CapturePool();
+  let current   = code;
+  const luaBin  = checkLuaAvailable();
+  const pool    = new CapturePool();
   pool.add(current, 'input');
 
-  // ── ① advanced_static ──────────────────────────────
+  // ══════════════════════════════════════════════════════
+  //  ① dynamicDecode — pipeline最初 (#1/#2)
+  //    loadstring/load を hookして __DECODED__ をダンプ
+  // ══════════════════════════════════════════════════════
+  let dynDecodedResult  = null;
+  let dynVmAnalysis     = null;
+  let wereDevDetected   = false;
+
+  if (luaBin) {
+    const dynRes = await dynamicDecode(current);
+    results.push({
+      step: `dynamicDecode${depth > 0 ? ` (再帰${depth}回目)` : ''}`,
+      success: dynRes.success,
+      result: dynRes.result,
+      method: dynRes.method,
+      error: dynRes.error,
+      decodedCount: dynRes.decodedCount,
+      WereDevVMDetected: dynRes.WereDevVMDetected,
+    });
+
+    if (dynRes.success && dynRes.result) {
+      dynDecodedResult = dynRes.result;
+      dynVmAnalysis    = dynRes.vmAnalysis || null;
+      wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
+      current          = dynRes.result;
+      pool.add(current, 'dynamic_decode');
+    }
+  } else {
+    results.push({ step: 'dynamicDecode', success: false, error: 'Luaがインストールされていません', method: 'dynamic_decode' });
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  ② loaderPatternDetected チェック (#7/#8)
+  //    table.concat + string.char + loadstring が揃う → VM解析スキップ
+  // ══════════════════════════════════════════════════════
+  const isLoaderPattern = loaderPatternDetected(code); // 元コードに対してチェック
+  results.push({
+    step: 'LoaderPatternCheck',
+    success: true,
+    method: 'loader_pattern',
+    loaderPattern: isLoaderPattern,
+    hints: isLoaderPattern ? ['table.concat+string.char+loadstringパターン検出 → VM解析スキップ'] : [],
+  });
+
+  // ══════════════════════════════════════════════════════
+  //  ③ 静的解析群 (loaderPatternでも実行: 静的は常に有益)
+  // ══════════════════════════════════════════════════════
   {
-    const res = advancedStaticDeobfuscate(current);
+    const advRes = advancedStaticDeobfuscate(current);
     results.push({
       step: 'AdvancedStatic',
-      success: res.success,
-      result: res.result,
-      method: res.method,
-      hints: res.steps && res.steps.length ? [`ステップ: ${res.steps.join(' → ')}`] : undefined,
+      success: advRes.success,
+      result: advRes.result,
+      method: advRes.method,
+      hints: advRes.steps && advRes.steps.length ? [`ステップ: ${advRes.steps.join(' → ')}`] : undefined,
     });
-    if (res.success && res.result && res.result !== current) {
-      current = res.result;
+    if (advRes.success && advRes.result && advRes.result !== current) {
+      current = advRes.result;
       pool.add(current, 'advanced_static');
     }
   }
-
-  // ── ② evaluate_expressions ─────────────────────────
-  {
-    const res = evaluateExpressions(current);
-    results.push({ step: 'EvaluateExpressions', ...res });
+  for (const [name, fn] of [
+    ['EvaluateExpressions', evaluateExpressions],
+    ['SplitStrings',        deobfuscateSplitStrings],
+    ['XOR',                 xorDecoder],
+    ['ConstantArray',       constantArrayResolver],
+  ]) {
+    const res = fn(current);
+    results.push({ step: name, ...res });
     if (res.success && res.result && res.result !== current) {
       current = res.result;
-      pool.add(current, 'eval_expr');
+      pool.add(current, name.toLowerCase());
     }
   }
 
-  // ── ③ split_strings ────────────────────────────────
-  {
-    const res = deobfuscateSplitStrings(current);
-    results.push({ step: 'SplitStrings', ...res });
-    if (res.success && res.result && res.result !== current) {
-      current = res.result;
-      pool.add(current, 'split_strings');
+  // 静的解析後に再度 dynamicDecode を試みる（静的で変化があった場合のみ）
+  if (luaBin && current !== code && !dynDecodedResult) {
+    const dynRes2 = await dynamicDecode(current);
+    results.push({ step: 'dynamicDecode (post-static)', ...dynRes2 });
+    if (dynRes2.success && dynRes2.result) {
+      current       = dynRes2.result;
+      dynDecodedResult = dynRes2.result;
+      pool.add(current, 'dynamic_post_static');
     }
   }
 
-  // ── ④ xor ──────────────────────────────────────────
-  {
-    const res = xorDecoder(current);
-    results.push({ step: 'XOR', ...res });
-    if (res.success && res.result && res.result !== current) {
-      current = res.result;
-      pool.add(current, 'xor');
-    }
-  }
+  // ══════════════════════════════════════════════════════
+  //  ④/#5 VM検出 — dynamicDecode結果コードに対してのみ (#5)
+  //       loaderPatternDetected の場合はスキップ (#8)
+  // ══════════════════════════════════════════════════════
+  if (!isLoaderPattern) {
+    // VM検出対象: dynamicDecodeの結果 or 現在のコード
+    const vmTarget = dynDecodedResult || current;
+    const vmRes    = deobfuscateVmify(vmTarget);
 
-  // ── ⑤ constant_array ───────────────────────────────
-  {
-    const res = constantArrayResolver(current);
-    results.push({ step: 'ConstantArray', ...res });
-    if (res.success && res.result && res.result !== current) {
-      current = res.result;
-      pool.add(current, 'constant_array');
-    }
-  }
-
-  // ── ⑥ dynamic (Lua実行) ────────────────────────────
-  if (luaBin) {
-    const dynRes = await tryDynamicExecution(current);
-    results.push({ step: '動的実行 (1回目)', ...dynRes });
-    if (dynRes.success && dynRes.result) {
-      current = dynRes.result;
-      pool.add(current, 'dynamic_1');
-
-      // #18 recursiveDeobfuscate: 動的実行後も静的解析を再試行
-      const postRes = advancedStaticDeobfuscate(current);
-      if (postRes.success && postRes.result !== current) {
-        results.push({ step: 'AdvancedStatic (post-dynamic)', success: true, method: 'advanced_static' });
-        current = postRes.result;
-        pool.add(current, 'post_dynamic_static');
-      }
-
-      // 多段難読化: 最大3回動的実行を繰り返す
-      for (let round = 2; round <= 4; round++) {
-        const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+\/]{60,}={0,2}/.test(current);
-        if (!stillObfuscated) break;
-        const dynRes2 = await tryDynamicExecution(current);
-        results.push({ step: `動的実行 (${round}回目)`, ...dynRes2 });
-        if (dynRes2.success && dynRes2.result && dynRes2.result !== current) {
-          current = dynRes2.result;
-          pool.add(current, `dynamic_${round}`);
-        } else break;
-      }
-    } else {
-      // 動的実行失敗 → capturePool の最善候補を使う
-      const poolBest = pool.getBest();
-      if (poolBest && poolBest !== current) {
-        results.push({ step: 'CapturePool fallback', success: true, method: 'pool', result: poolBest });
-        current = poolBest;
-      }
-    }
-  } else {
-    results.push({ step: '動的実行', success: false, error: 'Luaがインストールされていません', method: 'dynamic' });
-  }
-
-  // ── ⑦ vmify + WereDev VM深層解析 (#20) ──────────────
-  {
-    const vmRes = deobfuscateVmify(current);
     if (vmRes.success) {
       results.push({ step: 'VmDetect', ...vmRes });
 
       // バイトコード抽出
-      const vmEx = vmBytecodeExtractor(current);
+      const vmEx = vmBytecodeExtractor(vmTarget);
       if (vmEx.success) results.push({ step: 'VmBytecodeExtract', ...vmEx });
 
-      // #20: dynamic pass の vmAnalysis から vmTrace を取得して解析
-      const dynStep = results.find(r => r.vmAnalysis && r.vmAnalysis.vmTrace && r.vmAnalysis.vmTrace.length > 0);
-      if (dynStep && dynStep.vmAnalysis) {
-        const { vmTrace, bytecodeDump, wereDevDetected } = dynStep.vmAnalysis;
+      // ⑤ VM深層解析 — dynVmAnalysis か vmAnalysis から vmTrace を取得
+      const vmAnalysis = dynVmAnalysis ||
+        results.map(r => r.vmAnalysis).find(a => a && a.vmTrace && a.vmTrace.length > 0);
 
-        // #11 vmTraceAnalyzer
-        if (vmTrace.length > 0) {
-          const traceResult = vmTraceAnalyzer(vmTrace);
-          results.push({ step: 'VmTraceAnalyzer', ...traceResult });
+      if (vmAnalysis && vmAnalysis.vmTrace && vmAnalysis.vmTrace.length > 0) {
+        const { vmTrace, bytecodeDump } = vmAnalysis;
+        const traceResult = vmTraceAnalyzer(vmTrace);
+        results.push({ step: 'VmTraceAnalyzer', ...traceResult });
 
-          // #19 reconstructedLuaBuilder
-          if (wereDevDetected || vmTrace.length >= 10) {
-            const reconResult = reconstructedLuaBuilder(vmTrace, bytecodeDump, traceResult.opcodeMap);
-            results.push({ step: 'VmReconstruct', ...reconResult });
-            if (reconResult.success && reconResult.pseudoCode) {
-              current = reconResult.pseudoCode;
-              pool.add(current, 'vm_reconstruct');
-            }
+        if (wereDevDetected || vmTrace.length >= 10) {
+          const reconResult = reconstructedLuaBuilder(vmTrace, bytecodeDump, traceResult.opcodeMap);
+          results.push({ step: 'VmReconstruct', ...reconResult });
+          if (reconResult.success && reconResult.pseudoCode) {
+            current = reconResult.pseudoCode;
+            pool.add(current, 'vm_reconstruct');
           }
         }
       } else if (vmRes.isWereDev || vmRes.isVm) {
-        // Lua実行なしでもバイトコードテーブルから静的解析を試みる
-        const vmEx2 = vmBytecodeExtractor(current);
-        if (vmEx2.success) {
-          // bytecodeCandidate静的抽出 (#13)
-          const candidates = [];
-          const tblPat = /local\s+(\w+)\s*=\s*\{([\s\d,]+)\}/g;
-          let m2;
-          while ((m2 = tblPat.exec(current)) !== null) {
-            const nums = m2[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-            if (nums.length >= 50) {
-              candidates.push({ name: m2[1], nums });
-            }
-          }
-          if (candidates.length > 0) {
-            results.push({
-              step: 'BytecodeCandidate',
-              success: true,
-              method: 'bytecode_static',
-              hints: candidates.map(c => `${c.name}[${c.nums.length}要素]: [${c.nums.slice(0,8).join(',')}...]`),
-            });
-          }
+        // 静的 bytecodeCandidate 抽出
+        const tblPat = /local\s+(\w+)\s*=\s*\{([\s\d,]+)\}/g;
+        const candidates = [];
+        let m2;
+        while ((m2 = tblPat.exec(vmTarget)) !== null) {
+          const nums = m2[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+          if (nums.length >= 50) candidates.push({ name: m2[1], count: nums.length });
+        }
+        if (candidates.length > 0) {
+          results.push({
+            step: 'BytecodeCandidate',
+            success: true,
+            method: 'bytecode_static',
+            hints: candidates.map(c => `${c.name}[${c.count}要素]`),
+          });
         }
       }
     }
+  } else {
+    // #8: loaderPattern → VM解析スキップ、dynamicDecodeのみ
+    results.push({
+      step: 'VmDetect (skipped)',
+      success: false,
+      method: 'vm_detect_skipped',
+      error: 'loaderPatternDetected: VM解析スキップ',
+    });
   }
 
-  // base64検出結果もステップに追加
+  // base64検出
   {
     const b64res = base64Detector(current, pool);
     if (b64res.success) results.push({ step: 'Base64Detect', ...b64res });
   }
 
+  // ══════════════════════════════════════════════════════
+  //  ⑥ #10: decode結果がLuaコードなら再帰パイプライン実行
+  //         最大4回、スコアが改善した場合のみ
+  // ══════════════════════════════════════════════════════
+  const MAX_RECURSIVE_DEPTH = 4;
+  if (depth < MAX_RECURSIVE_DEPTH && luaBin) {
+    const prevScore  = scoreLuaCode(code);
+    const currScore  = scoreLuaCode(current);
+    const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+\/]{60,}={0,2}/.test(current);
+
+    // スコアが改善 かつ まだ難読化されている兆候がある場合
+    if (stillObfuscated && currScore > prevScore + 10 && current !== code) {
+      const recurseRes = await autoDeobfuscate(current, depth + 1);
+      results.push({
+        step: `RecursivePipeline (depth=${depth + 1})`,
+        success: recurseRes.success,
+        method: 'recursive_pipeline',
+        hints: [`再帰解析: ${recurseRes.steps.length}ステップ, スコア改善: ${prevScore.toFixed(0)}→${currScore.toFixed(0)}`],
+      });
+      if (recurseRes.finalCode && recurseRes.finalCode !== current) {
+        current = recurseRes.finalCode;
+        pool.add(current, `recursive_${depth + 1}`);
+        // 再帰結果のステップも追加
+        for (const s of recurseRes.steps) {
+          results.push({ ...s, step: `  [depth${depth+1}] ${s.step}` });
+        }
+      }
+    }
+  }
+
   return {
-    success: results.some(r => r.success),
+    success: results.some(r => r.success && r.result),
     steps: results,
     finalCode: current,
     poolSize: pool.entries.length,
+    depth,
   };
 }
+
+
 
 // ════════════════════════════════════════════════════════
 //  Prometheus 難読化
