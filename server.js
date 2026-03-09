@@ -1093,7 +1093,7 @@ function sandboxFilter(code) {
 function vmDetector(code) {
   const hints = [];
 
-  // ── WereDev (#22) ──────────────────────────────────────────────────
+  // ── WereDev (#22) + 項目5/9追加 ────────────────────────────────────
   const weredevPatterns = [
     { re: /bytecode\s*\[\s*ip\s*\]/,                                  desc: 'WereDev: bytecode[ip]' },
     { re: /dispatch\s*\[\s*inst\s*\[\s*1\s*\]\s*\]/,                 desc: 'WereDev: dispatch[inst[1]]' },
@@ -1102,6 +1102,12 @@ function vmDetector(code) {
     { re: /local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\]/,              desc: 'WereDev: local inst=bytecode[ip]' },
     { re: /inst\s*\[\s*1\s*\]/,                                       desc: 'WereDev: inst[1]' },
     { re: /ip\s*=\s*ip\s*\+\s*1/,                                    desc: 'WereDev: ip+1' },
+    // 項目5: while true do / while 1 do + B[pc]
+    { re: /while\s*(?:true|1)\s*do[\s\S]{0,200}\bB\s*\[/,            desc: 'WereDev: while(true/1)+B[pc]' },
+    // 項目5: local l = B[...] パターン
+    { re: /local\s+l\s*=\s*\w+\s*\[\s*\w+\s*\]/,                    desc: 'WereDev: local l=B[pc]' },
+    // 項目9: return(function トリガー
+    { re: /return\s*\(\s*function\s*\(/,                              desc: 'WereDev: return(function' },
   ];
 
   // ── MoonSec (#20) ──────────────────────────────────────────────────
@@ -2249,6 +2255,481 @@ function reconstructedLuaBuilder(vmTrace, bytecodeDump, opcodeMap) {
   return vmDecompiler(vmTrace, bytecodeDump, opcodeMap);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  BLOCK W: Weredev VM 専用解析エンジン (項目 1〜10)
+// ════════════════════════════════════════════════════════════════════════
+
+// ── 項目 9: /return\s*\(\s*function/ を Weredev トリガーとして検出 ────
+// vmDetector のスコアに統合し、単体でも呼べるようにエクスポート
+function isWeredevObfuscated(code) {
+  if (!code) return false;
+  // トリガー1: return(function(...) パターン
+  if (/return\s*\(\s*function\s*\(/.test(code)) return true;
+  // トリガー2: while true do + B[pc] + V レジスタ
+  if (/while\s*(?:true|1)\s*do/i.test(code) && /\bB\s*\[/.test(code) && /\bV\s*\[/.test(code)) return true;
+  // トリガー3: local l = B[pc] 形式
+  if (/local\s+l\s*=\s*\w+\s*\[\s*\w+\s*\]/.test(code)) return true;
+  return false;
+}
+
+// ── 項目 1: /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*{/ で動的テーブル名取得 ──
+function extractVmTableNames(code) {
+  const names = [];
+  const seen  = new Set();
+  const re    = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{/g;
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    const name = m[1];
+    if (!seen.has(name)) {
+      seen.add(name);
+      names.push(name);
+    }
+  }
+  return names;
+}
+
+// ── 項目 2: new RegExp で VMテーブルを抽出 ──────────────────────────────
+// WeredevのBテーブル(bytecode)・定数テーブルなど数値が50要素以上のものを抽出
+function extractVmTable(code, vmTableName) {
+  if (!vmTableName || !code) return null;
+  // ネストした {} を正しく扱うため、{ の位置から対応する } を探す
+  const startRe = new RegExp('local\\s+' + vmTableName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*=\\s*\\{');
+  const startM  = startRe.exec(code);
+  if (!startM) return null;
+
+  // 対応する閉じ括弧を探す（ネスト深度カウント）
+  let depth = 0, pos = startM.index + startM[0].length - 1;
+  const end = Math.min(code.length, pos + 200000);
+  let tableEnd = -1;
+  for (let i = pos; i < end; i++) {
+    if (code[i] === '{') depth++;
+    else if (code[i] === '}') {
+      depth--;
+      if (depth === 0) { tableEnd = i; break; }
+    }
+  }
+  if (tableEnd === -1) return null;
+
+  const body = code.substring(pos + 1, tableEnd);
+  // 数値要素を抽出
+  const nums  = body.split(',').map(s => {
+    const t = s.trim().replace(/\s*--[^\n]*/g, '');
+    return isNaN(Number(t)) ? null : Number(t);
+  }).filter(n => n !== null);
+
+  // テーブルの内容を構造化（要素がテーブル形式 {a,b,c,d} の場合も対応）
+  const subTables = [];
+  const subRe = /\{([^{}]+)\}/g;
+  let sm;
+  while ((sm = subRe.exec(body)) !== null) {
+    const inner = sm[1].split(',').map(s => {
+      const t = s.trim();
+      return isNaN(Number(t)) ? t : Number(t);
+    });
+    subTables.push(inner);
+  }
+
+  return {
+    name: vmTableName,
+    raw:  body.substring(0, 500),
+    nums,
+    subTables: subTables.slice(0, 200),
+    count: nums.length,
+    isLikelyBytecode: nums.length >= 10 && Math.max(...nums.filter(n=>typeof n==='number')) < 65536,
+  };
+}
+
+// ── 項目 3: decodeEscapedString — \DDD → ASCII 変換 ─────────────────────
+function decodeEscapedString(str) {
+  if (!str) return str;
+  // \000〜\255 の数値エスケープ
+  let result = str.replace(/\\([0-9]{1,3})/g, (_, n) => {
+    const code = parseInt(n, 10);
+    return code <= 255 ? String.fromCharCode(code) : _;
+  });
+  // \xHH 形式
+  result = result.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) =>
+    String.fromCharCode(parseInt(h, 16))
+  );
+  // \uHHHH 形式
+  result = result.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) =>
+    String.fromCharCode(parseInt(h, 16))
+  );
+  return result;
+}
+
+// コード全体の文字列リテラルをデコード
+function decodeAllEscapedStrings(code) {
+  if (!code) return { result: code, count: 0 };
+  let count = 0;
+  const result = code.replace(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/g, (match, d, s) => {
+    const inner = d !== undefined ? d : s;
+    const q     = d !== undefined ? '"' : "'";
+    const decoded = inner.replace(/\\([0-9]{1,3})/g, (_, n) => {
+      const c = parseInt(n, 10);
+      if (c <= 255) { count++; return String.fromCharCode(c); }
+      return _;
+    });
+    if (decoded !== inner) return q + decoded + q;
+    return match;
+  });
+  return { result, count };
+}
+
+// ── 項目 8: decodeStringBuilder — string.char + table.concat 復号 ──────
+function decodeStringBuilder(code) {
+  if (!code) return { result: code, found: false, decoded: [] };
+  let modified = code;
+  const decoded = [];
+
+  // パターン1: table.concat({string.char(n,n,...), string.char(...),...})
+  modified = modified.replace(
+    /table\.concat\s*\(\s*\{((?:\s*string\.char\s*\([^)]+\)\s*,?\s*)+)\}\s*(?:,\s*(?:"[^"]*"|'[^']*'))?\s*\)/g,
+    (match, inner) => {
+      const chars = [];
+      const scRe  = /string\.char\s*\(([^)]+)\)/g;
+      let sm;
+      while ((sm = scRe.exec(inner)) !== null) {
+        for (const n of sm[1].split(',')) {
+          const c = parseInt(n.trim());
+          if (!isNaN(c) && c >= 0 && c <= 255) chars.push(c);
+          else return match;  // 非定数ならスキップ
+        }
+      }
+      if (chars.length === 0) return match;
+      const str = chars.map(c => String.fromCharCode(c)).join('');
+      decoded.push({ pattern: 'table.concat+string.char', value: str });
+      const safe = str.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\0/g,'\\0');
+      return `"${safe}"`;
+    }
+  );
+
+  // パターン2: string.char(n,n,...) の直接リスト (長いもの優先)
+  modified = modified.replace(/string\.char\(([^)]+)\)/g, (match, args) => {
+    const nums = args.split(',').map(a => {
+      const t = a.trim();
+      // 算術式 (XOR など) も簡易評価
+      try { const v = Function('"use strict";return(' + t + ')')(); return typeof v==='number' ? Math.round(v) : null; }
+      catch { return null; }
+    });
+    if (nums.some(n => n === null || n < 0 || n > 255)) return match;
+    const str = nums.map(n => String.fromCharCode(n)).join('');
+    decoded.push({ pattern: 'string.char', value: str });
+    const safe = str.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\0/g,'\\0');
+    return `"${safe}"`;
+  });
+
+  // パターン3: ("str1") .. ("str2") .. ... の連結を結合
+  modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g,
+    (_, a, b) => { decoded.push({ pattern: 'concat', value: a + b }); return `"${a}${b}"`; }
+  );
+  // 繰り返し適用 (最大5回)
+  for (let i = 0; i < 5; i++) {
+    const prev = modified;
+    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g,
+      (_, a, b) => `"${a}${b}"`
+    );
+    if (modified === prev) break;
+  }
+
+  return { result: modified, found: decoded.length > 0, decoded };
+}
+
+// ── 項目 4: vmhookログから opcodeMap を生成 ──────────────────────────────
+// vmTrace (parseVmTrace の entries) を受け取り、Weredev固有の
+// opcode番号→名前マッピングを構築する
+function buildOpcodeMapFromTrace(vmTraceEntries, bTableInstructions) {
+  if (!vmTraceEntries || vmTraceEntries.length === 0)
+    return { opcodeMap: {}, remapped: false, method: 'trace_build' };
+
+  // 頻度カウント (l フィールドを使用)
+  const freq = {};
+  for (const e of vmTraceEntries) {
+    const op = e.l !== null && e.l !== undefined ? e.l : e.op;
+    if (op === null || op === undefined) continue;
+    const k = String(op);
+    freq[k] = (freq[k] || 0) + 1;
+  }
+
+  const sorted = Object.entries(freq)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, count]) => ({ opcode: isNaN(Number(k)) ? k : parseInt(k), count }));
+
+  // bTableInstructions が存在すれば命令構造から opcode を推定
+  const opcodeMap = {};
+  if (bTableInstructions && bTableInstructions.length > 0) {
+    // B テーブルの各命令の op フィールドと、対応する trace 上の l を突き合わせ
+    for (const inst of bTableInstructions.slice(0, 200)) {
+      const op = inst.op;
+      if (op === null || op === undefined) continue;
+      const lua51Name = LUA51_OPCODES[op];
+      if (lua51Name) opcodeMap[String(op)] = lua51Name;
+    }
+  }
+
+  // 頻度が高い opcode を Lua5.1 標準 opcode にヒューリスティックマッピング
+  // MOVE(0), LOADK(1), RETURN(30) などは出現頻度パターンが特徴的
+  const heuristic = {
+    RETURN: null, CALL: null, MOVE: null, LOADK: null,
+    GETGLOBAL: null, SETGLOBAL: null, JMP: null,
+  };
+  // 最頻出 top3 を CALL/MOVE/LOADK に割り当て（確率的）
+  for (let i = 0; i < Math.min(3, sorted.length); i++) {
+    const names = ['CALL', 'MOVE', 'LOADK'];
+    if (!(String(sorted[i].opcode) in opcodeMap)) {
+      heuristic[names[i]] = sorted[i].opcode;
+      opcodeMap[String(sorted[i].opcode)] = names[i];
+    }
+  }
+
+  return { opcodeMap, sorted, heuristic, remapped: Object.keys(opcodeMap).length > 0, method: 'trace_build' };
+}
+
+// ── 項目 10: remapOpcodes — vmhookログのopcode順序でVMテーブルを再マッピング ──
+// Weredev は opcode 番号をランダムシャッフルすることがある。
+// trace の実行順序と既知の Lua5.1 意味論を使って再マッピングを試みる。
+function remapOpcodes(vmTraceEntries, knownOpcodeMap) {
+  if (!vmTraceEntries || vmTraceEntries.length === 0)
+    return { remapped: {}, confidence: 0, method: 'remap_opcodes' };
+
+  const known  = knownOpcodeMap || {};
+  const remapped = { ...known };
+  let   mapped   = Object.keys(remapped).length;
+
+  // 実行コンテキストから opcode 意味を推定
+  // レジスタ変化 + operand パターンで判定
+  const candidates = {};
+  for (let i = 0; i < Math.min(vmTraceEntries.length, 5000); i++) {
+    const e   = vmTraceEntries[i];
+    const op  = String(e.l !== undefined ? e.l : e.op);
+    const A   = e.A !== undefined ? e.A : e.a;
+    const B   = e.B !== undefined ? e.B : e.b;
+    const C   = e.C !== undefined ? e.C : e.c;
+    if (op === 'null' || op === 'undefined') continue;
+    if (op in remapped) continue;  // 既知ならスキップ
+
+    if (!candidates[op]) candidates[op] = { votes: {}, count: 0, samples: [] };
+    candidates[op].count++;
+    if (candidates[op].samples.length < 5) candidates[op].samples.push({ A, B, C });
+
+    // 推論ルール
+    // A=小, B=小, C=null → MOVE候補
+    if (typeof A === 'number' && typeof B === 'number' && (C === null || C === undefined) && A < 256 && B < 256)
+      candidates[op].votes['MOVE'] = (candidates[op].votes['MOVE'] || 0) + 1;
+    // A=小, B=大(定数インデックス), C=null → LOADK候補
+    if (typeof A === 'number' && typeof B === 'number' && B > 100 && (C === null || C === undefined))
+      candidates[op].votes['LOADK'] = (candidates[op].votes['LOADK'] || 0) + 1;
+    // A=0, B=1以下, C=0 → RETURN候補
+    if (A === 0 && (B === 0 || B === 1) && (C === null || C === 0))
+      candidates[op].votes['RETURN'] = (candidates[op].votes['RETURN'] || 0) + 1;
+    // A=小, B=小, C=小 (3オペランド) → CALL/ADD/SUB 候補
+    if (typeof A === 'number' && typeof B === 'number' && typeof C === 'number' && A < 64 && B < 64 && C < 64)
+      candidates[op].votes['CALL'] = (candidates[op].votes['CALL'] || 0) + 1;
+  }
+
+  // 各候補に対して最多投票の名前を採用
+  const usedNames = new Set(Object.values(remapped));
+  for (const [op, info] of Object.entries(candidates)) {
+    const best = Object.entries(info.votes).sort((a,b) => b[1]-a[1])[0];
+    if (!best) continue;
+    const [name, votes] = best;
+    if (!usedNames.has(name) && votes >= 3) {
+      remapped[op] = name + '_inferred';
+      usedNames.add(name);
+      mapped++;
+    }
+  }
+
+  const confidence = Math.min(100, Math.round((mapped / 38) * 100));
+  return { remapped, mapped, total: 38, confidence, candidates: Object.keys(candidates).length, method: 'remap_opcodes' };
+}
+
+// ── 項目 5/6: while true do / while 1 do 検出 + vmDecompileInstruction ──
+// VM ディスパッチループ検出
+function detectVmDispatchLoop(code) {
+  const patterns = [
+    { re: /while\s+true\s+do\b/,                        label: 'while true do' },
+    { re: /while\s+1\s+do\b/,                           label: 'while 1 do' },
+    { re: /while\s+true\s+do[\s\S]{0,60}local\s+l\s*=/, label: 'while true do + local l=' },
+    { re: /repeat[\s\S]{0,200}until\s+false/,           label: 'repeat..until false' },
+  ];
+  const found = [];
+  for (const p of patterns) {
+    if (p.re.test(code)) {
+      // ループ本体を少し抽出
+      const m = p.re.exec(code);
+      const snippet = code.substring(m.index, m.index + 200).replace(/\n/g, ' ');
+      found.push({ label: p.label, pos: m.index, snippet });
+    }
+  }
+  return { found, isVmDispatch: found.length > 0 };
+}
+
+// 項目 6: vmDecompileInstruction — 単一 opcode を Lua コードへ変換
+// vmDecompiler の命令生成ロジックを単体関数として公開
+function vmDecompileInstruction(opName, pc, A, B, C, opcodeMapExt) {
+  const map = opcodeMapExt || LUA51_OPCODES;
+  const r   = (n) => n !== null && n !== undefined ? `v${n}` : '_';
+  const resolvedName = typeof opName === 'number'
+    ? (map[String(opName)] || `OP_${opName}`) : (opName || 'UNKNOWN');
+
+  switch (resolvedName) {
+    case 'MOVE':      return `${r(A)} = ${r(B)}`;
+    case 'LOADK':     return `${r(A)} = K[${B}]`;
+    case 'LOADBOOL':  return `${r(A)} = ${B ? 'true' : 'false'}${C ? '; pc=pc+1' : ''}`;
+    case 'LOADNIL':   return `${r(A)}..${r(B)} = nil`;
+    case 'GETUPVAL':  return `${r(A)} = UpValue[${B}]`;
+    case 'GETGLOBAL': return `${r(A)} = _G[K[${B}]]`;
+    case 'SETGLOBAL': return `_G[K[${B}]] = ${r(A)}`;
+    case 'GETTABLE':  return `${r(A)} = ${r(B)}[RK(${C})]`;
+    case 'SETTABLE':  return `${r(A)}[RK(${B})] = RK(${C})`;
+    case 'NEWTABLE':  return `${r(A)} = {} -- size B=${B} C=${C}`;
+    case 'SELF':      return `${r(A+1)} = ${r(B)}; ${r(A)} = ${r(B)}[RK(${C})]`;
+    case 'ADD':       return `${r(A)} = RK(${B}) + RK(${C})`;
+    case 'SUB':       return `${r(A)} = RK(${B}) - RK(${C})`;
+    case 'MUL':       return `${r(A)} = RK(${B}) * RK(${C})`;
+    case 'DIV':       return `${r(A)} = RK(${B}) / RK(${C})`;
+    case 'MOD':       return `${r(A)} = RK(${B}) % RK(${C})`;
+    case 'POW':       return `${r(A)} = RK(${B}) ^ RK(${C})`;
+    case 'UNM':       return `${r(A)} = -${r(B)}`;
+    case 'NOT':       return `${r(A)} = not ${r(B)}`;
+    case 'LEN':       return `${r(A)} = #${r(B)}`;
+    case 'CONCAT': {
+      const parts = [];
+      for (let i = B; i <= C; i++) parts.push(r(i));
+      return `${r(A)} = ${parts.join(' .. ')}`;
+    }
+    case 'JMP':       return `pc = pc + ${B + 1}  -- jump to ${pc + 1 + B}`;
+    case 'EQ':        return `if (RK(${B}) == RK(${C})) ~= ${A?'true':'false'} then pc=pc+1 end`;
+    case 'LT':        return `if (RK(${B}) < RK(${C})) ~= ${A?'true':'false'} then pc=pc+1 end`;
+    case 'LE':        return `if (RK(${B}) <= RK(${C})) ~= ${A?'true':'false'} then pc=pc+1 end`;
+    case 'TEST':      return `if not ${r(A)} then pc=pc+1 end`;
+    case 'TESTSET':   return `if ${r(B)} then ${r(A)} = ${r(B)} else pc=pc+1 end`;
+    case 'CALL': {
+      const nargs = (B || 1) - 1;
+      const nret  = (C || 1) - 1;
+      const args_ = Array.from({length: nargs}, (_, i) => r(A + 1 + i));
+      const rets  = Array.from({length: Math.max(1,nret)}, (_, i) => r(A + i));
+      return `${rets.join(', ')} = ${r(A)}(${args_.join(', ')})`;
+    }
+    case 'TAILCALL': {
+      const nargs_ = (B || 1) - 1;
+      const args__ = Array.from({length: nargs_}, (_, i) => r(A + 1 + i));
+      return `return ${r(A)}(${args__.join(', ')})`;
+    }
+    case 'RETURN': {
+      if (!A && !B) return 'return';
+      const nv  = (B || 1) - 1;
+      const vs  = Array.from({length: Math.max(1,nv)}, (_, i) => r((A||0) + i));
+      return `return ${vs.join(', ')}`;
+    }
+    case 'FORPREP':  return `${r(A)} = ${r(A)} - ${r(A+2)}; goto forloop_${pc+1+B}`;
+    case 'FORLOOP':  return `${r(A)} += ${r(A+2)}; if ${r(A)} <= ${r(A+1)} then goto forloop_${pc+1+B} end`;
+    case 'TFORLOOP': return `${r(A+2)}..${r(A+2+(C||1))} = ${r(A)}(${r(A+1)}, ${r(A+2)}); if ${r(A+2)} ~= nil then ${r(A+1)} = ${r(A+2)} end`;
+    case 'SETLIST':  return `${r(A)}[${((C||1)-1)*50+1}..] = ${r(A+1)}..${r(A+B)}`;
+    case 'CLOSE':    return `close upvalues ${r(A)}..top`;
+    case 'CLOSURE':  return `${r(A)} = closure(Proto[${B}])`;
+    case 'VARARG': {
+      const nva = (B || 1) - 1;
+      const vas = Array.from({length: Math.max(1,nva)}, (_, i) => r((A||0)+i));
+      return `${vas.join(', ')} = ...`;
+    }
+    default:
+      return `-- ${resolvedName}(A=${A}, B=${B}, C=${C})`;
+  }
+}
+
+// ── 項目 7: VM解析に maxInstructions=100000 ガードを適用した weredevAnalyze ──
+function weredevAnalyze(code, vmTraceEntries, bTableLog, strLogEntries, options) {
+  const MAX_INSTRUCTIONS = (options && options.maxInstructions) || 100000;
+  const result = {
+    isWeredev:      false,
+    dispatchLoop:   null,
+    tableNames:     [],
+    tables:         {},
+    escapedStrings: null,
+    stringBuilder:  null,
+    opcodeMap:      {},
+    remapped:       {},
+    decompiled:     [],
+    stringsFound:   [],
+    method:         'weredev_analyze',
+  };
+
+  // ── 項目 9: トリガー判定 ────────────────────────────────────────────
+  result.isWeredev = isWeredevObfuscated(code);
+
+  // ── 項目 5: dispatch ループ検出 ─────────────────────────────────────
+  result.dispatchLoop = detectVmDispatchLoop(code);
+
+  // ── 項目 1: 動的テーブル名取得 ──────────────────────────────────────
+  result.tableNames = extractVmTableNames(code);
+
+  // ── 項目 2: VMテーブル抽出 ───────────────────────────────────────────
+  for (const name of result.tableNames.slice(0, 20)) {
+    const tbl = extractVmTable(code, name);
+    if (tbl && tbl.count >= 8) result.tables[name] = tbl;
+  }
+
+  // ── 項目 3: エスケープ文字列デコード ────────────────────────────────
+  const escResult = decodeAllEscapedStrings(code);
+  result.escapedStrings = { count: escResult.count, sample: escResult.result.substring(0, 200) };
+
+  // ── 項目 8: string.char + table.concat 復号 ─────────────────────────
+  result.stringBuilder = decodeStringBuilder(code);
+
+  // ── 項目 4: opcodeMap 構築 ───────────────────────────────────────────
+  const bInstructions = bTableLog && bTableLog.found ? bTableLog.instructions : [];
+  const mapResult     = buildOpcodeMapFromTrace(vmTraceEntries || [], bInstructions);
+  result.opcodeMap    = mapResult.opcodeMap;
+
+  // ── 項目 10: opcode 再マッピング ─────────────────────────────────────
+  const remapResult = remapOpcodes(vmTraceEntries || [], result.opcodeMap);
+  result.remapped   = remapResult.remapped;
+  result.remapConfidence = remapResult.confidence;
+
+  // ── 項目 6: vmDecompileInstruction で命令列を疑似コードに変換 ─────────
+  // MAX_INSTRUCTIONS ガードを適用 (項目 7)
+  const traceToDecompile = (vmTraceEntries || []).slice(0, MAX_INSTRUCTIONS);
+  const decompLines = [];
+  decompLines.push(`-- ══ Weredev VM Decompiled (maxInstructions=${MAX_INSTRUCTIONS}) ══`);
+
+  let prevPc = -1;
+  for (const e of traceToDecompile) {
+    const pc     = e.pc !== undefined ? e.pc : (e.ip || 0);
+    const opcode = e.l  !== undefined ? e.l  : e.op;
+    const A      = e.A  !== undefined ? e.A  : e.arg1;
+    const B      = e.B  !== undefined ? e.B  : e.arg2;
+    const C      = e.C  !== undefined ? e.C  : e.arg3;
+
+    // ラベル挿入 (PC が非連続の場合)
+    if (prevPc !== -1 && pc !== prevPc + 1) {
+      decompLines.push(`::lbl_${pc}::`);
+    }
+
+    const lua = vmDecompileInstruction(opcode, pc, A, B, C, result.remapped);
+    decompLines.push(`  -- [${pc}] ${String(opcode).padStart(3)} | ${lua}`);
+    prevPc = pc;
+  }
+
+  if (traceToDecompile.length >= MAX_INSTRUCTIONS) {
+    decompLines.push(`-- [WARNING] maxInstructions=${MAX_INSTRUCTIONS} に達したため出力を打ち切りました`);
+  }
+  decompLines.push('-- ══ End ══');
+  result.decompiled     = decompLines;
+  result.decompiledCode = decompLines.join('\n');
+
+  // ── m() strlog から文字列定数を収集 ─────────────────────────────────
+  if (strLogEntries && strLogEntries.length > 0) {
+    result.stringsFound = strLogEntries
+      .filter(e => e.val && e.val.length > 0)
+      .slice(0, 200)
+      .map(e => ({ idx: e.idx, val: e.val }));
+  }
+
+  return result;
+}
+
 // ────────────────────────────────────────────────────────────────────────
 //  #49/#50  bytecodeテーブル抽出
 // ────────────────────────────────────────────────────────────────────────
@@ -2641,38 +3122,61 @@ end
       const bytecodeDump = parseBytecodeDump(stdout);
 
       // vmTrace 統合（新形式優先、フォールバックは旧形式）
+      // 新形式エントリは l/A/B/C/pc フィールドを持つ
+      const traceEntries = vmTraceNew.found ? vmTraceNew.entries : [];
       const traceForAnalysis = vmTraceNew.found
-        ? vmTraceNew.entries.map(e => ({ ip: e.pc || 0, op: e.l, arg1: e.A, arg2: e.B, arg3: e.C }))
+        ? traceEntries.map(e => ({ ip: e.pc || 0, op: e.l, arg1: e.A, arg2: e.B, arg3: e.C }))
         : vmTrace;
 
-      const wereDevDetected = checkWereDevDetected(traceForAnalysis);
+      const wereDevDetected = checkWereDevDetected(traceForAnalysis) || isWeredevObfuscated(codeToRun);
       if (traceForAnalysis.length > 0) saveVmTrace(traceForAnalysis, Date.now());
 
+      // ── Weredev 専用解析 (項目1〜10) ──────────────────────────────────
+      const weredevResult = weredevAnalyze(
+        codeToRun,
+        traceEntries.length > 0 ? traceEntries : traceForAnalysis,
+        bTableLog,
+        strLog.found ? strLog.entries : [],
+        { maxInstructions: 100000 }  // 項目7
+      );
+
       const vmAnalysis = {
-        vmTrace:      traceForAnalysis,
-        vmTraceRaw:   vmTraceNew.found  ? vmTraceNew  : null,   // [1] l/A/B/C/regs
-        bTable:       bTableLog.found   ? bTableLog   : null,   // [2] bytecode
-        vTable:       vTableLog.found   ? vTableLog   : null,   // [2] registers
-        strLog:       strLog.found      ? strLog      : null,   // [3] m() strings
-        strCharLog:   strCharLog.found  ? strCharLog  : null,
-        tConcatLog:   tConcatLog.found  ? tConcatLog  : null,
+        vmTrace:          traceForAnalysis,
+        vmTraceRaw:       vmTraceNew.found  ? vmTraceNew  : null,
+        bTable:           bTableLog.found   ? bTableLog   : null,
+        vTable:           vTableLog.found   ? vTableLog   : null,
+        strLog:           strLog.found      ? strLog      : null,
+        strCharLog:       strCharLog.found  ? strCharLog  : null,
+        tConcatLog:       tConcatLog.found  ? tConcatLog  : null,
         bytecodeDump,
         wereDevDetected,
         vmHookInjected,
         bytecodeCandidates,
         vmInfo,
-        traceCount:   vmTraceNew.found  ? vmTraceNew.count : vmTrace.length,
-        bTableCount:  bTableLog.found   ? bTableLog.count  : 0,
-        strLogCount:  strLog.found      ? strLog.count      : 0,
+        traceCount:       vmTraceNew.found  ? vmTraceNew.count : vmTrace.length,
+        bTableCount:      bTableLog.found   ? bTableLog.count  : 0,
+        strLogCount:      strLog.found      ? strLog.count      : 0,
+        // Weredev 専用解析結果 (項目1〜10)
+        weredev:          weredevResult,
       };
       if (wereDevDetected) {
         vmAnalysis.traceAnalysis  = vmTraceAnalyzer(traceForAnalysis);
+        // remapped opcodeMap を優先使用
+        const finalOpcodeMap = {
+          map: weredevResult.remapped,
+          opcodeExecutionMap: vmAnalysis.traceAnalysis.opcodeMap &&
+                              vmAnalysis.traceAnalysis.opcodeMap.opcodeExecutionMap || {},
+        };
         vmAnalysis.reconstruction = vmDecompiler(
-          traceForAnalysis, bytecodeDump, vmAnalysis.traceAnalysis.opcodeMap
+          traceForAnalysis, bytecodeDump, finalOpcodeMap
         );
+        // 項目6の vmDecompileInstruction による疑似コードも保持
+        if (weredevResult.decompiledCode && weredevResult.decompiledCode.length > 50) {
+          vmAnalysis.weredevDecompiled = weredevResult.decompiledCode;
+        }
       }
 
-      // __DECODED__ が取れた場合 [8] captured が短すぎる場合は success にしない
+      // __DECODED__ が取れた場合
       if (decoded.best && decoded.best.length >= 10) {
         return resolve({
           success: true,
@@ -2680,14 +3184,13 @@ end
           allDecoded: decoded.all.map(d => d.code),
           decodedCount: decoded.all.length,
           method: 'dynamic_decode',
-          vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
+          vmAnalysis: (vmTrace.length > 0 || wereDevDetected) ? vmAnalysis : undefined,
         });
       }
 
-      // VMトレース再構築が取れた場合
+      // VMトレース再構築が取れた場合（vmDecompiler の結果）
       if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
         const pseudoCode = vmAnalysis.reconstruction.pseudoCode || '';
-        // [8] pseudoCode も短すぎる場合は success にしない
         if (pseudoCode.length >= 10) {
           return resolve({
             success: true,
@@ -2697,6 +3200,17 @@ end
             WereDevVMDetected: true,
           });
         }
+      }
+
+      // 項目6/7: weredevAnalyze の疑似コードをフォールバックとして使用
+      if (wereDevDetected && vmAnalysis.weredevDecompiled && vmAnalysis.weredevDecompiled.length >= 50) {
+        return resolve({
+          success: true,
+          result: vmAnalysis.weredevDecompiled,
+          method: 'weredev_decompile',
+          vmAnalysis,
+          WereDevVMDetected: true,
+        });
       }
 
       // [5] __EXEC_ERROR__ の安全な抽出 (indexOf で存在チェック)
