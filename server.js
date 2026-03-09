@@ -180,16 +180,15 @@ function loaderPatternDetected(code) {
 //  #4/#5  safeEnvPreamble 強化版 — 完全サンドボックス環境
 // ────────────────────────────────────────────────────────────────────────
 const safeEnvPreamble = `
--- ══ YAJU SafeEnv v3 ══
+-- ══ YAJU SafeEnv v4 ══
 
--- [4] math.random を常に0返しに固定 (ランダム性除去でデコード安定化)
+-- math.random を常に0返しに固定 (ランダム性除去でデコード安定化)
 pcall(function()
   math.random = function() return 0 end
   math.randomseed = function() end
 end)
 
--- [5] os.exit を無効化
--- [6] os.date を固定値に
+-- os.* を固定値/無効化
 pcall(function()
   os.exit    = function() end
   os.execute = function() return false, "disabled", -1 end
@@ -198,7 +197,7 @@ pcall(function()
   os.clock   = function() return 0 end
 end)
 
--- [7] bit32 互換レイヤー (未定義環境向け)
+-- bit32 互換レイヤー (未定義環境向け)
 if not bit32 then
   bit32 = {
     bnot  = function(x) return -x end,
@@ -212,7 +211,7 @@ end
 
 -- io.* 危険関数を無効化
 pcall(function()
-  io.popen  = function() return nil, "disabled" end
+  io.popen = function() return nil, "disabled" end
 end)
 
 -- debug.* を無効化
@@ -220,8 +219,8 @@ pcall(function()
   if debug then
     debug.sethook  = function() end
     debug.getinfo  = nil
-    debug.getlocal = nil; debug.setlocal  = nil
-    debug.getupvalue= nil; debug.setupvalue= nil
+    debug.getlocal = nil; debug.setlocal   = nil
+    debug.getupvalue= nil; debug.setupvalue = nil
     debug.getmetatable = nil; debug.setmetatable = nil
   end
 end)
@@ -236,22 +235,58 @@ pcall(function()
   end
 end)
 
--- [1] table.concat フック — DECODE_STAGE として出力
-local __orig_table_concat = table.concat
-pcall(function()
-  table.concat = function(t, ...)
-    local r = __orig_table_concat(t, ...)
-    if type(r) == "string" and #r > 10 then
-      io.write("\\n__DECODE_STAGE__\\n")
-      io.write(r)
-      io.write("\\n__DECODE_STAGE_END__\\n")
-      io.flush()
-    end
-    return r
-  end
-end)
+-- ──────────────────────────────────────────────────────
+-- [1] string.char フック
+--   VM bytecode テーブルが string.char(n1,n2,...) で文字列化される
+--   パターンを捕捉して __STRCHAR__ マーカーでログ出力する
+-- ──────────────────────────────────────────────────────
+local __orig_string_char = string.char
+local __strchar_log = {}
+local __strchar_count = 0
+local __strchar_max   = 500   -- 最大500件キャプチャ
 
--- [8] pcall フック — エラー文字列を PCALL として出力
+string.char = function(...)
+  local result = __orig_string_char(...)
+  if type(result) == "string" and #result > 3 then
+    __strchar_count = __strchar_count + 1
+    if __strchar_count <= __strchar_max then
+      -- bytecodeらしい長さ (4バイト以上) のみ記録
+      __strchar_log[__strchar_count] = result
+    end
+  end
+  return result
+end
+-- string.char 自体のグローバルも上書き
+pcall(function() rawset(_G, "string", string) end)
+
+-- ──────────────────────────────────────────────────────
+-- [1] table.concat フック
+--   ① デコードステージ出力 (Lua コード復元用)
+--   ② VM bytecode テーブル結合のキャプチャ
+-- ──────────────────────────────────────────────────────
+local __orig_table_concat = table.concat
+local __tconcat_log   = {}
+local __tconcat_count = 0
+local __tconcat_max   = 500
+
+table.concat = function(t, sep, ...)
+  local r = __orig_table_concat(t, sep, ...)
+  if type(r) == "string" and #r > 10 then
+    -- デコードステージ出力
+    io.write("\\n__DECODE_STAGE__\\n")
+    io.write(r)
+    io.write("\\n__DECODE_STAGE_END__\\n")
+    io.flush()
+    -- VM bytecode 候補として記録 (バイナリっぽい短い結果も含む)
+    __tconcat_count = __tconcat_count + 1
+    if __tconcat_count <= __tconcat_max then
+      __tconcat_log[__tconcat_count] = r
+    end
+  end
+  return r
+end
+
+-- pcall フック — エラー文字列を PCALL として出力
 local __orig_pcall = pcall
 pcall = function(f, ...)
   local ok, r = __orig_pcall(f, ...)
@@ -1152,48 +1187,41 @@ function deobfuscateVmify(code) {
 //  #26/#27/#28/#29  vmHookBootstrap 強化版
 // ────────────────────────────────────────────────────────────────────────
 const vmHookBootstrap = `
--- ══ YAJU VM Hook Bootstrap v3 ══
-__vm_logs     = {}
+-- ══ YAJU VM Hook Bootstrap v4 ══
+
+-- ── 旧 __vmhook 互換テーブル ──────────────────────────────────────────
+__vm_logs      = {}
 __vm_log_count = 0
 __vm_max_logs  = 5000
 
--- [1] __vmtrace: WereDev カスタム VM instruction trace テーブル
+-- ── [2] __vmtrace: instruction trace テーブル ────────────────────────
 __vmtrace       = {}
 __vmtrace_count = 0
-__vmtrace_max   = 10000  -- 最大 10000 命令まで記録
+__vmtrace_max   = 10000   -- 最大 10000 命令
 
--- [1][2] VM instruction trace hook
--- opcode / a / b / c を __vmtrace に蓄積する
+-- ── [2] __vmtrace_hook: opcode/a/b/c を trace に蓄積 ─────────────────
 -- 呼び出し規約: __vmtrace_hook(ip, opcode, a, b, c)
---   ip     : instruction pointer (数値 or nil)
---   opcode : opcode 番号 or 名前
---   a,b,c  : オペランド (省略可)
 function __vmtrace_hook(ip, opcode, a, b, c)
   if __vmtrace_count >= __vmtrace_max then return end
   __vmtrace_count = __vmtrace_count + 1
-  local entry = {
+  __vmtrace[__vmtrace_count] = {
     i  = __vmtrace_count,
-    ip = ip or 0,
+    ip = ip  or 0,
     op = opcode,
     a  = a,
     b  = b,
     c  = c,
   }
-  __vmtrace[__vmtrace_count] = entry
 end
 
--- 旧来の __vmhook も維持 (既存注入コードとの互換)
+-- ── 旧 __vmhook (互換) ────────────────────────────────────────────────
 function __vmhook(ip, inst, stack, reg)
   if __vm_log_count >= __vm_max_logs then return end
   __vm_log_count = __vm_log_count + 1
-  if inst ~= nil and type(inst) ~= "table" and type(inst) ~= "number" then return end
   local entry = { ip = ip, ts = __vm_log_count }
   if type(inst) == "table" then
-    if type(inst[1]) ~= "nil" then entry.op   = inst[1] end
-    if type(inst[2]) ~= "nil" then entry.arg1 = inst[2] end
-    if type(inst[3]) ~= "nil" then entry.arg2 = inst[3] end
-    if type(inst[4]) ~= "nil" then entry.arg3 = inst[4] end
-    -- [1] __vmtrace にも転送
+    entry.op   = inst[1]; entry.arg1 = inst[2]
+    entry.arg2 = inst[3]; entry.arg3 = inst[4]
     __vmtrace_hook(ip, inst[1], inst[2], inst[3], inst[4])
   elseif type(inst) == "number" then
     entry.op = inst
@@ -1201,6 +1229,69 @@ function __vmhook(ip, inst, stack, reg)
   end
   table.insert(__vm_logs, entry)
 end
+
+-- ── [2] while dispatch ループ自己検出フック ───────────────────────────
+-- WeredevのVMは通常:
+--   local inst = bytecode[ip]  → opcode=inst[1], A=inst[2], B=inst[3], C=inst[4]
+-- または:
+--   local opcode = inst[1]     → dispatch[opcode](...)
+-- の形を取る。
+-- debug.sethook で "line" イベントをトリガーして変数を覗く方法は
+-- Lua5.1では使えないため、代わりに __index メタメソッドで
+-- bytecode テーブルへのアクセスをインターセプトする。
+--
+-- アプローチ: グローバルに存在しうる bytecode / instructions / proto
+-- テーブルに __index フックを仕込み、アクセスのたびに trace する。
+-- ──────────────────────────────────────────────────────────────────────
+local function __install_vm_intercept()
+  -- 候補テーブル名（WereDev / MoonSec / Luraph で使われる変数名）
+  local candidates = {
+    "bytecode","instructions","Bytecode","Instructions",
+    "proto","Proto","code","Code","ops","Ops",
+  }
+  for _, name in ipairs(candidates) do
+    local tbl = rawget(_G, name)
+    if type(tbl) == "table" and #tbl > 8 then
+      -- 既にメタテーブルが設定されている場合はスキップ
+      local ok, mt = pcall(getmetatable, tbl)
+      if ok and mt == nil then
+        local orig_index = nil
+        local new_mt = {
+          __index = function(t, k)
+            local v = rawget(t, k)
+            -- アクセスが数値キーで値がテーブルなら instruction と見なす
+            if type(k) == "number" and type(v) == "table" then
+              __vmtrace_hook(k, v[1], v[2], v[3], v[4])
+            elseif type(k) == "number" and type(v) == "number" then
+              __vmtrace_hook(k, v, nil, nil, nil)
+            end
+            return v
+          end
+        }
+        -- setmetatable はエラーになりうるので pcall で保護
+        pcall(setmetatable, tbl, new_mt)
+      end
+    end
+  end
+end
+-- 実行開始後に少し遅延してインターセプトを試みる
+-- (VMの初期化が完了するのを待つため coroutine.wrap で遅延)
+local __intercept_installed = false
+local __orig_coroutine_wrap = coroutine and coroutine.wrap
+if __orig_coroutine_wrap then
+  pcall(function()
+    local co = coroutine.create(function()
+      coroutine.yield()
+      if not __intercept_installed then
+        __intercept_installed = true
+        __install_vm_intercept()
+      end
+    end)
+    coroutine.resume(co)
+  end)
+end
+-- 即時もトライ（すでにテーブルが存在する場合）
+pcall(__install_vm_intercept)
 -- ══ Bootstrap End ══
 `;
 
@@ -1208,35 +1299,67 @@ end
 //  #28  vmDumpFooter — __VMLOG__ 形式で stdout に出力
 // ────────────────────────────────────────────────────────────────────────
 const vmDumpFooter = `
--- ══ YAJU VM Dump Footer v3 ══
+-- ══ YAJU VM Dump Footer v4 ══
 
--- 旧 __VMLOG__ 形式出力 (既存 parseVmLogs との互換)
+-- ── [1] string.char キャプチャログ出力 ────────────────────────────────
+-- VM bytecode が string.char で構築されたバイト列をログに出す
+if __strchar_count and __strchar_count > 0 then
+  io.write("\\n__STRCHAR_START__\\n")
+  for i = 1, math.min(__strchar_count, __strchar_max or 500) do
+    local s = __strchar_log[i]
+    if s then
+      -- 各バイトを10進数コンマ区切りで出力 (バイナリ安全)
+      local bytes = {}
+      for j = 1, #s do
+        bytes[j] = tostring(s:byte(j))
+      end
+      io.write(tostring(i) .. "\\t" .. (#s) .. "\\t" .. table.concat(bytes, ",") .. "\\n")
+    end
+  end
+  io.write("__STRCHAR_END__\\t" .. tostring(__strchar_count) .. "\\n")
+  io.flush()
+end
+
+-- ── [1] table.concat キャプチャログ出力 ──────────────────────────────
+if __tconcat_count and __tconcat_count > 0 then
+  io.write("\\n__TCONCAT_START__\\n")
+  for i = 1, math.min(__tconcat_count, __tconcat_max or 500) do
+    local s = __tconcat_log[i]
+    if s then
+      local bytes = {}
+      for j = 1, #s do bytes[j] = tostring(s:byte(j)) end
+      io.write(tostring(i) .. "\\t" .. (#s) .. "\\t" .. table.concat(bytes, ",") .. "\\n")
+    end
+  end
+  io.write("__TCONCAT_END__\\t" .. tostring(__tconcat_count) .. "\\n")
+  io.flush()
+end
+
+-- ── 旧 __VMLOG__ 形式出力 (既存 parseVmLogs との互換) ────────────────
 if __vm_log_count and __vm_log_count > 0 then
   for i, v in ipairs(__vm_logs) do
     local op   = tostring(v.op   or "nil")
     local arg1 = tostring(v.arg1 or "nil")
     local arg2 = tostring(v.arg2 or "nil")
     local arg3 = tostring(v.arg3 or "nil")
-    print("__VMLOG__\t" .. tostring(v.ip) .. "\t" .. op .. "\t" .. arg1 .. "\t" .. arg2 .. "\t" .. arg3)
+    print("__VMLOG__\\t" .. tostring(v.ip) .. "\\t" .. op .. "\\t" .. arg1 .. "\\t" .. arg2 .. "\\t" .. arg3)
   end
-  print("__VMLOG_END__\t" .. tostring(__vm_log_count))
+  print("__VMLOG_END__\\t" .. tostring(__vm_log_count))
 end
 
--- [3] __VMTRACE__ 形式出力: JSON-lines で instruction trace をダンプ
--- server.js の parseVmTrace() が __VMTRACE_START__ / __VMTRACE_END__ を検出して読み込む
+-- ── [3] __VMTRACE_START__ / __VMTRACE_END__: instruction trace ダンプ ─
+-- フォーマット: idx \\t ip \\t op \\t a \\t b \\t c (タブ区切り)
 if __vmtrace_count and __vmtrace_count > 0 then
   io.write("\\n__VMTRACE_START__\\n")
   for i = 1, __vmtrace_count do
     local v = __vmtrace[i]
     if v then
-      -- 各フィールドを安全に文字列化
-      local ip_s  = tostring(v.ip  or 0)
-      local op_s  = tostring(v.op  or "nil")
-      local a_s   = tostring(v.a   or "nil")
-      local b_s   = tostring(v.b   or "nil")
-      local c_s   = tostring(v.c   or "nil")
-      -- タブ区切り: idx \\t ip \\t op \\t a \\t b \\t c
-      io.write(tostring(i) .. "\\t" .. ip_s .. "\\t" .. op_s .. "\\t" .. a_s .. "\\t" .. b_s .. "\\t" .. c_s .. "\\n")
+      local ip_s = tostring(v.ip or 0)
+      local op_s = tostring(v.op or "nil")
+      local a_s  = tostring(v.a  or "nil")
+      local b_s  = tostring(v.b  or "nil")
+      local c_s  = tostring(v.c  or "nil")
+      io.write(tostring(i).."\\t"..ip_s.."\\t"..op_s.."\\t"..a_s.."\\t"..b_s.."\\t"..c_s.."\\n")
     end
   end
   io.write("__VMTRACE_END__\\t" .. tostring(__vmtrace_count) .. "\\n")
@@ -1423,6 +1546,66 @@ function parseVmTrace(stdout) {
   const reportedCount = countMatch ? parseInt(countMatch[1]) : entries.length;
 
   return { entries, count: reportedCount, found: true };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  [1] parseStrCharLog — __STRCHAR_START__ / __STRCHAR_END__ を解析して
+//      string.char でキャプチャされた VM bytecode バイト列を取得する
+// ────────────────────────────────────────────────────────────────────────
+function parseStrCharLog(stdout) {
+  if (!stdout) return { entries: [], count: 0, found: false };
+  const startIdx = stdout.indexOf('__STRCHAR_START__');
+  const endIdx   = stdout.indexOf('__STRCHAR_END__');
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx)
+    return { entries: [], count: 0, found: false };
+
+  const raw = stdout.substring(startIdx + '__STRCHAR_START__'.length, endIdx).trim();
+  const entries = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    // フォーマット: idx \t len \t b0,b1,b2,...
+    const parts = t.split('\t');
+    if (parts.length < 3) continue;
+    const idx  = parseInt(parts[0]) || 0;
+    const len  = parseInt(parts[1]) || 0;
+    const bytes = parts[2].split(',').map(n => parseInt(n)).filter(n => !isNaN(n));
+    // バイト列を文字列に復元
+    const str = bytes.map(b => String.fromCharCode(b)).join('');
+    entries.push({ idx, len, bytes, str });
+  }
+  const countLine = stdout.substring(endIdx, stdout.indexOf('\n', endIdx));
+  const countMatch = countLine.match(/__STRCHAR_END__\t(\d+)/);
+  return { entries, count: countMatch ? parseInt(countMatch[1]) : entries.length, found: true };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  [1] parseTConcatLog — __TCONCAT_START__ / __TCONCAT_END__ を解析して
+//      table.concat でキャプチャされた VM bytecode 結合文字列を取得する
+// ────────────────────────────────────────────────────────────────────────
+function parseTConcatLog(stdout) {
+  if (!stdout) return { entries: [], count: 0, found: false };
+  const startIdx = stdout.indexOf('__TCONCAT_START__');
+  const endIdx   = stdout.indexOf('__TCONCAT_END__');
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx)
+    return { entries: [], count: 0, found: false };
+
+  const raw = stdout.substring(startIdx + '__TCONCAT_START__'.length, endIdx).trim();
+  const entries = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const parts = t.split('\t');
+    if (parts.length < 3) continue;
+    const idx   = parseInt(parts[0]) || 0;
+    const len   = parseInt(parts[1]) || 0;
+    const bytes = parts[2].split(',').map(n => parseInt(n)).filter(n => !isNaN(n));
+    const str   = bytes.map(b => String.fromCharCode(b)).join('');
+    entries.push({ idx, len, bytes, str });
+  }
+  const countLine = stdout.substring(endIdx, stdout.indexOf('\n', endIdx));
+  const countMatch = countLine.match(/__TCONCAT_END__\t(\d+)/);
+  return { entries, count: countMatch ? parseInt(countMatch[1]) : entries.length, found: true };
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2210,6 +2393,9 @@ end
       const vmTrace      = parseVmLogs(stdout);
       // [4] 新 __VMTRACE__ 形式のトレース（WereDev カスタム VM 対応）
       const vmTraceNew   = parseVmTrace(stdout);
+      // [1] string.char / table.concat キャプチャ (VM bytecode 取得)
+      const strCharLog   = parseStrCharLog(stdout);
+      const tConcatLog   = parseTConcatLog(stdout);
       const bytecodeDump = parseBytecodeDump(stdout);
 
       // vmTrace を統合（新形式を優先、なければ旧形式）
@@ -2224,7 +2410,9 @@ end
 
       const vmAnalysis = {
         vmTrace: traceForAnalysis,
-        vmTraceRaw: vmTraceNew.found ? vmTraceNew : null,  // [4] 生の新形式トレース
+        vmTraceRaw:  vmTraceNew.found  ? vmTraceNew  : null,
+        strCharLog:  strCharLog.found  ? strCharLog  : null,  // [1]
+        tConcatLog:  tConcatLog.found  ? tConcatLog  : null,  // [1]
         bytecodeDump,
         wereDevDetected,
         vmHookInjected,
