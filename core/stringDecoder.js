@@ -22,7 +22,7 @@ class CapturePool {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  共通ユーティリティ  (v2から引継ぎ + 拡張)
+//  共通ユーティリティ
 // ────────────────────────────────────────────────────────────────────────
 
 class SymbolicEnv {
@@ -104,6 +104,7 @@ function evalLuaNumExpr(expr) {
     return result;
   } catch { return null; }
 }
+
 function evalSimpleExpr(expr) {
   try {
     const clean = expr.trim();
@@ -114,9 +115,6 @@ function evalSimpleExpr(expr) {
   } catch { return null; }
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  SymbolicEnv  (v2から引継ぎ)
-// ────────────────────────────────────────────────────────────────────────
 function evalStringChar(argsStr,env) {
   const args=splitByComma(argsStr); const chars=[];
   for(const a of args){
@@ -127,6 +125,7 @@ function evalStringChar(argsStr,env) {
   }
   return chars.join('');
 }
+
 function evalArithWithEnv(expr,env){
   if(!env) return evalLuaNumExpr(expr);
   let resolved=expr.replace(/\b([a-zA-Z_]\w*)\b/g,(m)=>{
@@ -138,6 +137,7 @@ function evalArithWithEnv(expr,env){
   if(/[a-zA-Z_]/.test(resolved.replace(/math\./g,''))) return null;
   return evalLuaNumExpr(resolved);
 }
+
 function evalExprWithEnv(expr,env){
   if(!expr) return null; expr=expr.trim();
   const strVal=stripLuaString(expr); if(strVal!==null) return strVal;
@@ -203,12 +203,8 @@ function evalExprWithEnv(expr,env){
   return null;
 }
 
-// ════════════════════════════════════════════════════════════════════════
-//  #1  autoDeobfuscate 処理順は後述 — まず全パスを実装
-// ════════════════════════════════════════════════════════════════════════
-
 // ────────────────────────────────────────────────────────────────────────
-//  #2  evaluateExpressions  — Lua定数式を正規表現で検出して評価
+//  deobfuscateSplitStrings
 // ────────────────────────────────────────────────────────────────────────
 function deobfuscateSplitStrings(code) {
   let modified = code, found = false, iterations = 0;
@@ -227,12 +223,11 @@ function deobfuscateSplitStrings(code) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #4  charDecoder  — string.char(n,n,...) を文字列へ復元
+//  charDecoder
 // ────────────────────────────────────────────────────────────────────────
 function charDecoder(code, env) {
   env=env||new SymbolicEnv();
   let modified=code, found=false;
-  // まず定数式を畳み込む
   modified=modified.replace(/string\.char\(([^)]+)\)/g,(match,argsStr)=>{
     const val=evalStringChar(argsStr,env); if(val===null) return match;
     const esc=val.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r').replace(/\0/g,'\\0');
@@ -243,40 +238,46 @@ function charDecoder(code, env) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #5  xorDecoder  — string.char(x^y) や bit.bxor(x,y) パターンのXOR復号
+//  staticCharDecoder
 // ────────────────────────────────────────────────────────────────────────
-function xorDecoder(code) {
-  let modified=code, found=false;
-
-  // string.char(a ~ b) — Lua5.3以降の ~ 演算子
-  modified=modified.replace(/string\.char\((\d+)\s*~\s*(\d+)\)/g,(_,a,b)=>{
-    const v=parseInt(a)^parseInt(b); found=true;
-    return `string.char(${v})`;
+function staticCharDecoder(code) {
+  let modified = code, found = false;
+  modified = modified.replace(/string\.char\(([^)]+)\)/g, (match, argsStr) => {
+    const args = argsStr.split(',').map(a => {
+      const n = parseInt(a.trim());
+      return isNaN(n) ? null : n;
+    });
+    if (args.some(a => a === null) || args.some(a => a < 0 || a > 255)) return match;
+    found = true;
+    const str = args.map(n => String.fromCharCode(n)).join('');
+    return `"${str.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r')}"`;
   });
 
-  // bit.bxor(a, b) パターン
-  modified=modified.replace(/bit\.bxor\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/g,(_,a,b)=>{
-    found=true; return String(parseInt(a)^parseInt(b));
-  });
+  modified = modified.replace(
+    /table\.concat\s*\(\s*\{([^}]+)\}\s*(?:,\s*"[^"]*"\s*)?\)/g,
+    (match, inner) => {
+      const parts = inner.split(',').map(p => p.trim());
+      const strings = parts.map(p => {
+        const scm = p.match(/^string\.char\((\d+)\)$/);
+        if (scm) return String.fromCharCode(parseInt(scm[1]));
+        const strm = p.match(/^"((?:[^"\\]|\\.)*)"$|^'((?:[^'\\]|\\.)*)'$/);
+        if (strm) return strm[1] || strm[2];
+        return null;
+      });
+      if (strings.some(s => s === null)) return match;
+      found = true;
+      const result = strings.join('');
+      return `"${result.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
+    }
+  );
 
-  // string.char(x ^ y) — Lua5.3 XOR
-  modified=modified.replace(/\b(\d+)\s*\^\s*(\d+)\b/g,(match,a,b)=>{
-    // ^ がべき乗ではなくXORとして使われているかを判断
-    // 両方255以下なら XOR として扱う（べき乗なら結果が大きすぎる）
-    const ia=parseInt(a),ib=parseInt(b);
-    if(ia<=255&&ib<=255){ found=true; return String(ia^ib); }
-    return match;
-  });
-
-  // XOR配列ブルートフォース (既存コード)
-  const xorRes=deobfuscateXOR(code);
-  if(xorRes.success) return { ...xorRes, method:'xor_decoder' };
-
-  if(!found) return { success:false, error:'XORパターンが見つかりません', method:'xor_decoder' };
-  return { success:true, result:modified, method:'xor_decoder' };
+  if (!found) return { success: false, error: 'string.char静的パターンなし', method: 'static_char' };
+  return { success: true, result: modified, method: 'static_char' };
 }
 
-// XOR配列ブルートフォース（後方互換）
+// ────────────────────────────────────────────────────────────────────────
+//  xorDecoder
+// ────────────────────────────────────────────────────────────────────────
 function deobfuscateXOR(code) {
   function xorByte(b,k){ let r=0; for(let i=0;i<8;i++){const a=(b>>i)&1,bk=(k>>i)&1; if(a!==bk)r|=(1<<i);} return r; }
   const patterns=[/local\s+\w+\s*=\s*\{([0-9,\s]+)\}/g,/\{([0-9,\s]+)\}/g];
@@ -302,50 +303,6 @@ function deobfuscateXOR(code) {
   return { success:true, result:bestResult, key:bestKey, score:bestScore, method:'xor' };
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  #6  constantArrayResolver  — local t={...} の t[i] を直接値へ置換
-// ────────────────────────────────────────────────────────────────────────
-function staticCharDecoder(code) {
-  let modified = code, found = false;
-  // #13: string.char(n, n, ...) の連続パターンを静的に文字列化
-  modified = modified.replace(/string\.char\(([^)]+)\)/g, (match, argsStr) => {
-    const args = argsStr.split(',').map(a => {
-      const n = parseInt(a.trim());
-      return isNaN(n) ? null : n;
-    });
-    if (args.some(a => a === null) || args.some(a => a < 0 || a > 255)) return match;
-    found = true;
-    const str = args.map(n => String.fromCharCode(n)).join('');
-    return `"${str.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r')}"`;
-  });
-
-  // #14: table.concat({string.char(...)}) パターン
-  modified = modified.replace(
-    /table\.concat\s*\(\s*\{([^}]+)\}\s*(?:,\s*"[^"]*"\s*)?\)/g,
-    (match, inner) => {
-      // inner の各要素が string.char(n,...) や "str" の場合に結合
-      const parts = inner.split(',').map(p => p.trim());
-      const strings = parts.map(p => {
-        const scm = p.match(/^string\.char\((\d+)\)$/);
-        if (scm) return String.fromCharCode(parseInt(scm[1]));
-        const strm = p.match(/^"((?:[^"\\]|\\.)*)"$|^'((?:[^'\\]|\\.)*)'$/);
-        if (strm) return strm[1] || strm[2];
-        return null;
-      });
-      if (strings.some(s => s === null)) return match;
-      found = true;
-      const result = strings.join('');
-      return `"${result.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
-    }
-  );
-
-  if (!found) return { success: false, error: 'string.char静的パターンなし', method: 'static_char' };
-  return { success: true, result: modified, method: 'static_char' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #15  xorDecoder 強化版 — bit32.bxor + ~ 演算子サポート
-// ────────────────────────────────────────────────────────────────────────
 function xorDecoder(code) {
   let modified = code, found = false;
 
@@ -357,7 +314,7 @@ function xorDecoder(code) {
   modified = modified.replace(/bit\.bxor\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/g, (_, a, b) => {
     found = true; return String(parseInt(a) ^ parseInt(b));
   });
-  // #15: ~ XOR演算子 (Lua5.3+) — string.char内のみ安全に展開
+  // ~ XOR演算子 (Lua5.3+) — string.char内のみ安全に展開
   modified = modified.replace(/string\.char\((\d+)\s*~\s*(\d+)\)/g, (_, a, b) => {
     found = true; return `string.char(${parseInt(a) ^ parseInt(b)})`;
   });
@@ -404,19 +361,16 @@ function xorDecoder(code) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #40-#53  vmDecompiler — VMログから疑似Luaコードを生成
+//  stringTransformDecoder
 // ────────────────────────────────────────────────────────────────────────
 function stringTransformDecoder(code) {
   let modified=code, found=false;
-  const env=new SymbolicEnv();
-  // string.reverse("...") を直接評価
   modified=modified.replace(/string\.reverse\s*\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*\)/g,(match,strExpr)=>{
     const s=stripLuaString(strExpr); if(s===null) return match;
     found=true;
     const rev=s.split('').reverse().join('');
     return `"${rev.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
   });
-  // string.sub("...", i, j)
   modified=modified.replace(/string\.sub\s*\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*,\s*(-?\d+)\s*(?:,\s*(-?\d+))?\s*\)/g,(match,strExpr,iStr,jStr)=>{
     const s=stripLuaString(strExpr); if(s===null) return match;
     let i=parseInt(iStr),j=jStr!==undefined?parseInt(jStr):s.length;
@@ -425,7 +379,6 @@ function stringTransformDecoder(code) {
     const sub=s.slice(i-1,j);
     return `"${sub.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
   });
-  // string.rep("...", n)
   modified=modified.replace(/string\.rep\s*\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*,\s*(\d+)\s*\)/g,(match,strExpr,nStr)=>{
     const s=stripLuaString(strExpr); const n=parseInt(nStr);
     if(s===null||isNaN(n)) return match;
@@ -437,7 +390,7 @@ function stringTransformDecoder(code) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  #17  base64Detector  — Base64文字列を自動デコード
+//  base64Detector
 // ────────────────────────────────────────────────────────────────────────
 function base64Detector(code, pool) {
   const B64_RE=/[A-Za-z0-9+\/]{32,}={0,2}/g;
@@ -446,7 +399,6 @@ function base64Detector(code, pool) {
     const b64=m[0];
     try {
       const decoded=Buffer.from(b64,'base64').toString('utf8');
-      // デコード結果がLuaコードっぽければプールに追加
       if(scoreLuaCode(decoded)>20){
         if(pool) pool.add(decoded,'base64_decode');
         found.push({ b64:b64.substring(0,30)+'...', score:scoreLuaCode(decoded).toFixed(1), decoded:decoded.substring(0,60) });
@@ -458,7 +410,7 @@ function base64Detector(code, pool) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  EncryptStrings  (後方互換 + charDecoder統合)
+//  deobfuscateEncryptStrings
 // ────────────────────────────────────────────────────────────────────────
 function deobfuscateEncryptStrings(code) {
   let modified = code, found = false;
@@ -483,28 +435,33 @@ function deobfuscateEncryptStrings(code) {
   return { success: true, result: modified, method: 'encrypt_strings' };
 }
 
-// ════════════════════════════════════════════════════════════════════════
-//  #18 + #19  recursiveDeobfuscate  — 再帰的解析 + seenCodeCache
-// ════════════════════════════════════════════════════════════════════════
+// ────────────────────────────────────────────────────────────────────────
+//  [NEW] decodeLuaEscapes — Lua数値エスケープ \072 → "H" などをデコード
+// ────────────────────────────────────────────────────────────────────────
+function decodeLuaEscapes(str) {
+  return str.replace(/\\(\d{1,3})/g, (_, num) => {
+    return String.fromCharCode(parseInt(num, 10));
+  });
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  decodeEscapedString / decodeAllEscapedStrings
+// ────────────────────────────────────────────────────────────────────────
 function decodeEscapedString(str) {
   if (!str) return str;
-  // \000〜\255 の数値エスケープ
   let result = str.replace(/\\([0-9]{1,3})/g, (_, n) => {
     const code = parseInt(n, 10);
     return code <= 255 ? String.fromCharCode(code) : _;
   });
-  // \xHH 形式
   result = result.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) =>
     String.fromCharCode(parseInt(h, 16))
   );
-  // \uHHHH 形式
   result = result.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) =>
     String.fromCharCode(parseInt(h, 16))
   );
   return result;
 }
 
-// コード全体の文字列リテラルをデコード
 function decodeAllEscapedStrings(code) {
   if (!code) return { result: code, count: 0 };
   let count = 0;
@@ -522,13 +479,14 @@ function decodeAllEscapedStrings(code) {
   return { result, count };
 }
 
-// ── 項目 8: decodeStringBuilder — string.char + table.concat 復号 ──────
+// ────────────────────────────────────────────────────────────────────────
+//  decodeStringBuilder
+// ────────────────────────────────────────────────────────────────────────
 function decodeStringBuilder(code) {
   if (!code) return { result: code, found: false, decoded: [] };
   let modified = code;
   const decoded = [];
 
-  // パターン1: table.concat({string.char(n,n,...), string.char(...),...})
   modified = modified.replace(
     /table\.concat\s*\(\s*\{((?:\s*string\.char\s*\([^)]+\)\s*,?\s*)+)\}\s*(?:,\s*(?:"[^"]*"|'[^']*'))?\s*\)/g,
     (match, inner) => {
@@ -539,7 +497,7 @@ function decodeStringBuilder(code) {
         for (const n of sm[1].split(',')) {
           const c = parseInt(n.trim());
           if (!isNaN(c) && c >= 0 && c <= 255) chars.push(c);
-          else return match;  // 非定数ならスキップ
+          else return match;
         }
       }
       if (chars.length === 0) return match;
@@ -550,11 +508,9 @@ function decodeStringBuilder(code) {
     }
   );
 
-  // パターン2: string.char(n,n,...) の直接リスト (長いもの優先)
   modified = modified.replace(/string\.char\(([^)]+)\)/g, (match, args) => {
     const nums = args.split(',').map(a => {
       const t = a.trim();
-      // 算術式 (XOR など) も簡易評価
       try { const v = Function('"use strict";return(' + t + ')')(); return typeof v==='number' ? Math.round(v) : null; }
       catch { return null; }
     });
@@ -565,11 +521,9 @@ function decodeStringBuilder(code) {
     return `"${safe}"`;
   });
 
-  // パターン3: ("str1") .. ("str2") .. ... の連結を結合
   modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g,
     (_, a, b) => { decoded.push({ pattern: 'concat', value: a + b }); return `"${a}${b}"`; }
   );
-  // 繰り返し適用 (最大5回)
   for (let i = 0; i < 5; i++) {
     const prev = modified;
     modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g,
@@ -581,9 +535,29 @@ function decodeStringBuilder(code) {
   return { result: modified, found: decoded.length > 0, decoded };
 }
 
-// ── 項目 4: vmhookログから opcodeMap を生成 ──────────────────────────────
-// vmTrace (parseVmTrace の entries) を受け取り、Weredev固有の
-// opcode番号→名前マッピングを構築する
+// ────────────────────────────────────────────────────────────────────────
+//  [NEW] decodeWeredevsString
+//  処理順: 1. Lua escape decode  2. Base64 decode  3. XOR decode
+// ────────────────────────────────────────────────────────────────────────
+function decodeWeredevsString(str) {
+  // 1. Lua数値エスケープ (\072 → "H" など)
+  let result = decodeLuaEscapes(str);
+
+  // 2. Base64デコード (純粋なBase64文字列の場合のみ)
+  if (/^[A-Za-z0-9+\/]{4,}={0,2}$/.test(result.trim())) {
+    try {
+      const decoded = Buffer.from(result.trim(), 'base64').toString('utf8');
+      // デコード結果が有効なUTF-8テキストなら採用
+      if (!decoded.includes('\uFFFD')) result = decoded;
+    } catch {}
+  }
+
+  // 3. XORデコード (将来的にキーが判明した場合に適用)
+  // xorDecoder は code全体を対象とするため、単一文字列には適用しない
+  // 呼び出し元で必要に応じて xorDecoder(result) を使用すること
+
+  return result;
+}
 
 module.exports = {
   CapturePool, SymbolicEnv,
@@ -591,4 +565,5 @@ module.exports = {
   deobfuscateSplitStrings, charDecoder, xorDecoder, deobfuscateXOR,
   staticCharDecoder, stringTransformDecoder, base64Detector, deobfuscateEncryptStrings,
   decodeEscapedString, decodeAllEscapedStrings, decodeStringBuilder,
+  decodeLuaEscapes, decodeWeredevsString,
 };
