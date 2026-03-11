@@ -68,6 +68,25 @@ app.use((err, req, res, next) => {
 const tempDir = path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
+// ════════════════════════════════════════════════════════
+//  VMhook ログ グローバルストア
+//  dynamicDecode 実行時に push → GET /vmhook-logs で参照
+// ════════════════════════════════════════════════════════
+global.vmLogs = [];
+const VM_LOGS_MAX = 500; // メモリ溢れ防止: 最大保持件数
+
+// ヘルパー: logEntry を global.vmLogs に安全に追記
+function pushVmLog(logEntry) {
+  global.vmLogs.push({
+    ...logEntry,
+    _ts: Date.now(),
+  });
+  // 上限超えたら古いものを捨てる
+  if (global.vmLogs.length > VM_LOGS_MAX) {
+    global.vmLogs = global.vmLogs.slice(-VM_LOGS_MAX);
+  }
+}
+
 // ── MoonSec V3 デコンパイラのパス ─────────────────────────────────────────
 // プロジェクトルートに moonsecv3decompiler.lua を配置すること
 const DECOMPILER_LUA = path.join(__dirname, 'moonsecv3decompiler.lua');
@@ -146,6 +165,37 @@ app.get('/api/status', (req, res) => {
     ],
     obfuscatePresets: ['Minify', 'Weak', 'Medium', 'Strong'],
     obfuscateSteps:   ['SplitStrings', 'EncryptStrings', 'ConstantArray', 'ProxifyLocals', 'WrapInFunction', 'Vmify'],
+  });
+});
+
+// ════════════════════════════════════════════════════════
+//  GET /vmhook-logs  — VMhook 実行ログ取得
+//
+//  クエリパラメータ:
+//    limit  : 取得件数上限 (デフォルト 100, 最大 500)
+//    since  : このタイムスタンプ (ms) 以降のエントリのみ返す
+//    method : "dynamic_decode" などでフィルタ
+//    clear  : "1" を渡すと取得後に global.vmLogs をリセット
+// ════════════════════════════════════════════════════════
+app.get('/vmhook-logs', (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit  || '100'), VM_LOGS_MAX);
+  const since  = parseInt(req.query.since  || '0');
+  const method = req.query.method || null;
+  const clear  = req.query.clear === '1';
+
+  let logs = global.vmLogs;
+
+  if (since > 0)  logs = logs.filter(e => e._ts >= since);
+  if (method)     logs = logs.filter(e => e.method === method);
+  logs = logs.slice(-limit);
+
+  if (clear) global.vmLogs = [];
+
+  res.json({
+    success: true,
+    count:   logs.length,
+    total:   global.vmLogs.length,
+    logs,
   });
 });
 
@@ -422,6 +472,23 @@ end
       const wereDevDetected = checkWereDevDetected(traceForAnalysis) || isWeredevObfuscated(codeToRun);
       if (traceForAnalysis.length > 0) saveVmTrace(traceForAnalysis, Date.now());
 
+      // ── VMhook ログを global.vmLogs に記録 ──────────────────────────
+      if (traceForAnalysis.length > 0 || vmTraceNew.found || bTableLog.found || strLog.found) {
+        pushVmLog({
+          method:        'dynamic_decode',
+          traceCount:    vmTraceNew.found ? vmTraceNew.count : vmTrace.length,
+          bTableCount:   bTableLog.found  ? bTableLog.count  : 0,
+          strLogCount:   strLog.found     ? strLog.count      : 0,
+          wereDevDetected,
+          vmHookInjected,
+          // トレースは先頭 200 件だけ保持してメモリを節約
+          traceEntries:  traceForAnalysis.slice(0, 200),
+          strEntries:    strLog.found ? strLog.entries.slice(0, 100) : [],
+          bTableEntries: bTableLog.found ? (bTableLog.instructions || []).slice(0, 100) : [],
+          bytecodeDump:  bytecodeDump || {},
+        });
+      }
+
       const weredevResult = weredevAnalyze(
         codeToRun,
         traceEntries.length > 0 ? traceEntries : traceForAnalysis,
@@ -579,14 +646,23 @@ end
           if (diffRatio <= 0.05 && captured === code.trim())
             return resolve({ success: false, error: 'capturedが元コードと同一のため停止', method: 'dynamic' });
           const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
-          return resolve({ success: true, result: captured, layers: layerMatch ? parseInt(layerMatch[1]) : 1, method: 'dynamic' });
+          const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
+          // ── VMhook ログ記録 ─────────────────────────────────────────
+          pushVmLog({ method: 'dynamic', success: true, layers, capturedLength: captured.length });
+          return resolve({ success: true, result: captured, layers, method: 'dynamic' });
         }
       }
-      if (stdout.includes('__ERROR__:'))
-        return resolve({ success: false, error: 'Luaエラー: ' + (stdout.split('__ERROR__:')[1] || '').substring(0, 300), method: 'dynamic' });
-      if (error && stderr)
+      if (stdout.includes('__ERROR__:')) {
+        const errMsg = (stdout.split('__ERROR__:')[1] || '').substring(0, 300);
+        pushVmLog({ method: 'dynamic', success: false, error: errMsg });
+        return resolve({ success: false, error: 'Luaエラー: ' + errMsg, method: 'dynamic' });
+      }
+      if (error && stderr) {
+        pushVmLog({ method: 'dynamic', success: false, error: stderr.substring(0, 300) });
         return resolve({ success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic' });
+      }
 
+      pushVmLog({ method: 'dynamic', success: false, error: 'no_capture' });
       resolve({ success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic' });
     });
   });
