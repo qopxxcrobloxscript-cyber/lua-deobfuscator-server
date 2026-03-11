@@ -1,239 +1,421 @@
 // vm/weredevs/interpreterParser.js
 'use strict';
 
-const { _wdEscapeRegex } = require('./extractor');
-const { LUA51_OPCODES, _inferOpNameFromOperands } = require('./opcodeMap');
+// ────────────────────────────────────────────────────────────────────────
+//  項目14: while true do 解析専用の最大イテレーション制限
+// ────────────────────────────────────────────────────────────────────────
+const MAX_DISPATCH_ITERATIONS = 100000;
 
-function detectVmDispatchLoop(code) {
-  const patterns = [
-    { re: /while\s+true\s+do\b/,                        label: 'while true do' },
-    { re: /while\s+1\s+do\b/,                           label: 'while 1 do' },
-    { re: /while\s+true\s+do[\s\S]{0,60}local\s+l\s*=/, label: 'while true do + local l=' },
-    { re: /repeat[\s\S]{0,200}until\s+false/,           label: 'repeat..until false' },
-  ];
-  const found = [];
-  for (const p of patterns) {
-    if (p.re.test(code)) {
-      // ループ本体を少し抽出
-      const m = p.re.exec(code);
-      const snippet = code.substring(m.index, m.index + 200).replace(/\n/g, ' ');
-      found.push({ label: p.label, pos: m.index, snippet });
-    }
-  }
-  return { found, isVmDispatch: found.length > 0 };
-}
-
-// 項目 6: vmDecompileInstruction — 単一 opcode を Lua コードへ変換
-// vmDecompiler の命令生成ロジックを単体関数として公開
+// ────────────────────────────────────────────────────────────────────────
+//  detectWeredevContext — VM変数名をコードから動的検出
+// ────────────────────────────────────────────────────────────────────────
 function detectWeredevContext(code) {
-  const ctx = { loopVar:'J', regVar:'V', pcVar:'pc', poolVar:'R', zFunc:'Z', instrVar:'I', stackVar:'S' };
-  // loopVar
-  const wvc = {};
-  const wRe = /\bwhile\s+([A-Za-z_]\w*)\s+do\b/g;
-  let m;
-  while ((m = wRe.exec(code)) !== null) wvc[m[1]] = (wvc[m[1]]||0) + 1;
-  delete wvc['true'];
-  const lve = Object.entries(wvc).sort((a,b)=>b[1]-a[1]);
-  if (lve.length > 0) ctx.loopVar = lve[0][0];
-  // regVar (テーブル代入頻度)
-  const tac = {};
-  const taRe = /\b([A-Za-z_]\w*)\s*\[[^\]]+\]\s*=/g;
-  while ((m = taRe.exec(code)) !== null) tac[m[1]] = (tac[m[1]]||0) + 1;
-  const rc = Object.entries(tac)
-    .filter(([k]) => k !== ctx.poolVar && !['string','table','math'].includes(k))
-    .sort((a,b)=>b[1]-a[1]);
-  if (rc.length > 0) ctx.regVar = rc[0][0];
-  // zFunc / poolVar
-  const zRe = /local\s+([A-Za-z_]\w*)\s*=\s*function\s*\([^)]+\)\s*return\s+([A-Za-z_]\w*)\s*\[/g;
-  while ((m = zRe.exec(code)) !== null) { ctx.zFunc = m[1]; ctx.poolVar = m[2]; break; }
-  // pcVar
-  const pcc = {};
-  const pcRe = /\b([A-Za-z_]\w*)\s*=\s*\1\s*\+\s*1\b/g;
-  while ((m = pcRe.exec(code)) !== null) {
-    const vn = m[1];
-    if (vn !== ctx.loopVar && vn !== ctx.regVar) pcc[vn] = (pcc[vn]||0) + 1;
-  }
-  const pce = Object.entries(pcc).sort((a,b)=>b[1]-a[1]);
-  if (pce.length > 0) ctx.pcVar = pce[0][0];
+  const ctx = {
+    loopVar:   null,
+    regVar:    'V',
+    pcVar:     'pc',
+    poolVar:   null,
+    zFunc:     null,
+    stackVar:  null,
+    instrVar:  null,
+  };
+
+  // while VAR do → loopVar
+  const whileM = code.match(/while\s+([A-Za-z_]\w*)\s+do\b/);
+  if (whileM && whileM[1] !== 'true' && whileM[1] !== '1') ctx.loopVar = whileM[1];
+
+  // local V[...] = ... → regVar
+  const regM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*\{\s*\}/);
+  if (regM) ctx.regVar = regM[1];
+
+  // local pc = 1 → pcVar
+  const pcM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*1\b/);
+  if (pcM) ctx.pcVar = pcM[1];
+
+  // local Z = function(i) return POOL[i ...] end → zFunc/poolVar
+  const zM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*function\s*\(\s*\w+\s*\)\s*return\s+([A-Za-z_]\w*)\s*\[/);
+  if (zM) { ctx.zFunc = zM[1]; ctx.poolVar = zM[2]; }
+
+  // local stk = {} → stackVar
+  const stkM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*\{\}[^\n]*stack/i);
+  if (stkM) ctx.stackVar = stkM[1];
+
+  // local inst / local l = B[pc] → instrVar
+  const instrM = code.match(/local\s+(inst|[A-Za-z_]\w*)\s*=\s*\w+\s*\[\s*\w+\s*\]/);
+  if (instrM) ctx.instrVar = instrM[1];
+
   return ctx;
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  Step 7: Z(N) 呼び出しを定数値に解決
+//  項目3: while state do VM ループ検出 → dispatcher 展開処理へ渡す
+//  AST変換は行わず、dispatcherFlatten() に直接渡す
+// ────────────────────────────────────────────────────────────────────────
+function detectVmDispatchLoop(code) {
+  const loops = [];
+
+  // while VAR do（state-machine形式、VAR が真偽値変数）
+  const stateLoopRe = /while\s+([A-Za-z_]\w*)\s+do\b/g;
+  let m;
+  while ((m = stateLoopRe.exec(code)) !== null) {
+    const loopVar = m[1];
+    if (loopVar === 'true' || loopVar === '1') continue;
+
+    const loopStart = m.index;
+    const loopBody  = _extractLoopBody(code, m.index + m[0].length);
+    if (!loopBody) continue;
+
+    // 項目3: while state do を検出したら AST に変換せず dispatcher 展開へ
+    const dispatchInfo = _expandDispatcher(loopBody, loopVar);
+    if (dispatchInfo.blocks.length > 0) {
+      loops.push({
+        type:       'state_machine',
+        loopVar,
+        loopStart,
+        loopEnd:    loopStart + loopBody.length,
+        body:       loopBody,
+        dispatched: true,           // dispatcher 展開済みフラグ
+        blocks:     dispatchInfo.blocks,
+        blockCount: dispatchInfo.blocks.length,
+        flatInstructions: dispatchInfo.flatInstructions,
+      });
+    }
+  }
+
+  // while true do / while 1 do（無限ループ型）
+  const infLoopRe = /while\s+(?:true|1)\s+do\b/g;
+  while ((m = infLoopRe.exec(code)) !== null) {
+    const loopBody = _extractLoopBody(code, m.index + m[0].length);
+    if (!loopBody) continue;
+
+    // jVar を動的検出
+    const jVarM = loopBody.match(/\bif\s+([A-Za-z_]\w*)\s*[<>=!]/);
+    const jVar  = jVarM ? jVarM[1] : 'l';
+
+    // 項目3同様: AST変換せず dispatcher 展開へ
+    const dispatchInfo = _expandDispatcher(loopBody, jVar);
+    if (dispatchInfo.blocks.length >= 3) {
+      loops.push({
+        type:       'infinite_loop',
+        loopVar:    jVar,
+        loopStart:  m.index,
+        loopEnd:    m.index + loopBody.length,
+        body:       loopBody,
+        dispatched: true,
+        blocks:     dispatchInfo.blocks,
+        blockCount: dispatchInfo.blocks.length,
+        flatInstructions: dispatchInfo.flatInstructions,
+        isWhileTrue: true,
+      });
+    }
+  }
+
+  return loops;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  _expandDispatcher — if l < N then チェーンをフラットな命令列へ展開
+//  項目3: AST変換なし、項目9: switch-case構造への変換
+// ────────────────────────────────────────────────────────────────────────
+function _expandDispatcher(loopBody, jVar) {
+  const blocks = [];
+  const flatInstructions = [];
+
+  // 項目9: 巨大な if l < 数値 then チェーンを検出
+  const ifChainDepth = _countIfChainDepth(loopBody, jVar);
+  const isSwitchCandidate = ifChainDepth >= 4;
+
+  _flattenDispatchTree(loopBody, jVar, blocks, 0, MAX_DISPATCH_ITERATIONS);
+
+  // ソートしてフラット命令列を生成
+  blocks.sort((a, b) => a.opcodeEstimate - b.opcodeEstimate);
+
+  for (const block of blocks) {
+    flatInstructions.push({
+      opcode:      block.opcodeEstimate,
+      body:        block.body,
+      threshold:   block.threshold,
+      switchLabel: isSwitchCandidate ? `case_${block.opcodeEstimate}` : null,
+    });
+  }
+
+  return { blocks, flatInstructions, isSwitchCandidate };
+}
+
+function _countIfChainDepth(src, jVar) {
+  const re = new RegExp(`\\bif\\s+${_escRe(jVar)}\\s*<\\s*\\d+\\s*then`, 'g');
+  let count = 0, m;
+  while ((m = re.exec(src)) !== null) count++;
+  return count;
+}
+
+function _flattenDispatchTree(src, jVar, out, depth, maxDepth) {
+  if (depth > maxDepth) return;  // 項目14: 無限ループ防止
+
+  const ifRe = new RegExp(`\\bif\\s+${_escRe(jVar)}\\s*(<|<=|==)\\s*(\\d+)\\s*then`);
+  const m = ifRe.exec(src);
+  if (!m) {
+    // 末端ノード: opcode ブロックとして収集
+    const trimmed = src.trim();
+    if (trimmed.length > 3 && !/^end\s*$/.test(trimmed)) {
+      out.push({
+        opcodeEstimate: out.length,
+        threshold:      out.length,
+        body:           trimmed,
+        depth,
+      });
+    }
+    return;
+  }
+
+  const threshold = parseInt(m[2]);
+  const thenStart = m.index + m[0].length;
+  const { thenBody, elseBody } = _splitThenElse(src, thenStart);
+
+  // then 側を再帰展開
+  const hasNestedIf = new RegExp(`\\bif\\s+${_escRe(jVar)}\\s*[<>=!]`).test(thenBody);
+  if (hasNestedIf) {
+    _flattenDispatchTree(thenBody, jVar, out, depth + 1, maxDepth);
+  } else if (thenBody.trim().length > 3) {
+    out.push({
+      opcodeEstimate: threshold - 1,
+      threshold,
+      body:           thenBody.trim(),
+      depth,
+    });
+  }
+
+  // else 側を再帰展開
+  if (elseBody && elseBody.trim().length > 3) {
+    const hasNestedIfElse = new RegExp(`\\bif\\s+${_escRe(jVar)}\\s*[<>=!]`).test(elseBody);
+    if (hasNestedIfElse) {
+      _flattenDispatchTree(elseBody, jVar, out, depth + 1, maxDepth);
+    } else {
+      out.push({
+        opcodeEstimate: threshold,
+        threshold:      threshold + 1,
+        body:           elseBody.trim(),
+        depth,
+      });
+    }
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  項目4: dynamic opcode resolver
+//  opcodeMap を固定参照せず vmhook ログ（実行トレース）から再構築する
+// ────────────────────────────────────────────────────────────────────────
+function dynamicOpcodeResolver(vmTraceEntries, bTableInstructions, staticFallback) {
+  // 項目15: VMhookログが存在する場合は opcode 実行順を優先
+  if (vmTraceEntries && vmTraceEntries.length > 0) {
+    return _buildFromTrace(vmTraceEntries, bTableInstructions);
+  }
+  // 項目15: ログが存在しない場合のみ静的解析へフォールバック
+  if (staticFallback) {
+    return { opcodeMap: staticFallback, source: 'static_fallback', confidence: 30 };
+  }
+  return { opcodeMap: {}, source: 'empty', confidence: 0 };
+}
+
+function _buildFromTrace(entries, bInstructions) {
+  // opcode 実行順カウント（l フィールド優先）
+  const execOrder  = [];   // 実行順に並んだ opcode 値
+  const freq       = {};
+  const seqPairs   = {};   // 連続 opcode ペア (A→B) の頻度
+
+  let prev = null;
+  for (const e of entries) {
+    const op = e.l !== undefined ? e.l : e.op;
+    if (op === null || op === undefined) continue;
+    const k = String(op);
+    freq[k]  = (freq[k] || 0) + 1;
+    execOrder.push(op);
+    if (prev !== null) {
+      const pair = `${prev}->${k}`;
+      seqPairs[pair] = (seqPairs[pair] || 0) + 1;
+    }
+    prev = k;
+  }
+
+  // bTable との照合: bTable の op フィールドで直接名前を得られる場合がある
+  const knownMap = {};
+  if (bInstructions) {
+    for (const inst of bInstructions.slice(0, 500)) {
+      if (inst.opName && inst.op !== undefined) {
+        knownMap[String(inst.op)] = inst.opName;
+      }
+    }
+  }
+
+  // 実行頻度パターンからヒューリスティック推論
+  const sortedFreq = Object.entries(freq)
+    .sort((a, b) => b[1] - a[1]);
+
+  // Weredevs は opcode をシャッフルするため実行頻度で推定
+  // MOVE/LOADK/CALL/RETURN は頻度が高い傾向
+  const heuristicNames = ['MOVE', 'LOADK', 'CALL', 'RETURN', 'GETTABLE', 'SETTABLE',
+                          'ADD', 'SUB', 'JMP', 'EQ', 'LT', 'LE', 'GETGLOBAL'];
+  const assigned = new Set(Object.values(knownMap));
+  const opcodeMap = { ...knownMap };
+
+  for (let i = 0; i < Math.min(sortedFreq.length, heuristicNames.length); i++) {
+    const [opKey] = sortedFreq[i];
+    if (opKey in opcodeMap) continue;
+    let name = heuristicNames[i];
+    // 既に別のopcodeに割り当て済みならスキップ
+    if (assigned.has(name)) continue;
+    opcodeMap[opKey] = name + '_heuristic';
+    assigned.add(name);
+  }
+
+  const confidence = Object.keys(knownMap).length > 0
+    ? Math.min(95, 50 + Object.keys(knownMap).length * 3)
+    : Math.min(40, sortedFreq.length * 2);
+
+  return {
+    opcodeMap,
+    execOrder: execOrder.slice(0, 1000),
+    frequency: sortedFreq.slice(0, 30),
+    seqPairs:  Object.entries(seqPairs).sort((a,b) => b[1]-a[1]).slice(0, 20),
+    source:    'vmhook_trace',
+    confidence,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  analyzeWeredevOpcodeBlock — 単一 opcode ブロックの意味解析
 // ────────────────────────────────────────────────────────────────────────
 function analyzeWeredevOpcodeBlock(block, ctx) {
-  const body     = block.body;
-  const regName  = (ctx && ctx.regVar)   || 'V';
-  const pcName   = (ctx && ctx.pcVar)    || 'pc';
-  const poolName = (ctx && ctx.poolVar)  || 'R';
-  const zName    = (ctx && ctx.zFunc)    || 'Z';
-  const ops = [];
-  const rE = _wdEscapeRegex;
+  const body = block.body || block.rawBody || '';
+  const ops  = [];
+  const regV = (ctx && ctx.regVar)  || 'V';
+  const pcV  = (ctx && ctx.pcVar)   || 'pc';
+  const zFn  = (ctx && ctx.zFunc)   || 'Z';
 
-  // MOVE/LOADK
-  const moveRe = new RegExp(
-    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*` +
-    `(?:${rE(regName)}\\s*\\[([^\\]]+)\\]|${rE(zName)}\\s*\\(([^)]+)\\)|${rE(poolName)}\\s*\\[([^\\]]+)\\])`, 'g');
-  let mm;
-  while ((mm = moveRe.exec(body)) !== null) {
-    const dest = mm[1].trim();
-    if (mm[2])      ops.push({ kind:'MOVE',  lua:`V[${dest}] = V[${mm[2].trim()}]` });
-    else if (mm[3]) ops.push({ kind:'LOADK', lua:`V[${dest}] = Z(${mm[3].trim()})` });
-    else if (mm[4]) ops.push({ kind:'LOADK', lua:`V[${dest}] = R[${mm[4].trim()}]` });
+  // PC インクリメント検出
+  if (new RegExp(`\\b${_escRe(pcV)}\\s*=\\s*${_escRe(pcV)}\\s*\\+`).test(body)) {
+    const m = body.match(new RegExp(`${_escRe(pcV)}\\s*=\\s*${_escRe(pcV)}\\s*\\+\\s*(\\d+)`));
+    ops.push({ kind: 'PC_INCR', amount: m ? parseInt(m[1]) : 1, lua: `${pcV} = ${pcV} + ${m ? m[1] : '1'}` });
   }
-  // 算術
-  const arithRe = new RegExp(
-    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*` +
-    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*([+\\-*/%^])\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
-  while ((mm = arithRe.exec(body)) !== null) {
-    const sym = mm[3];
-    const name = {'+':'ADD','-':'SUB','*':'MUL','/':'DIV','%':'MOD','^':'POW'}[sym]||'ARITH';
-    ops.push({ kind:name, lua:`V[${mm[1].trim()}] = V[${mm[2].trim()}] ${sym} V[${mm[4].trim()}]` });
+
+  // レジスタ代入 V[A] = ...
+  const regAssign = new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]\\s*=\\s*([^\\n;]+)`, 'g');
+  let rm;
+  while ((rm = regAssign.exec(body)) !== null) {
+    const reg = parseInt(rm[1]);
+    const rhs = rm[2].trim();
+    let kind = 'ASSIGN';
+    if (new RegExp(`${_escRe(zFn)}\\s*\\(`).test(rhs))     kind = 'LOADK';
+    else if (/^\-?[\d.]+$/.test(rhs))                       kind = 'LOADNUM';
+    else if (/^["']|^\[\[/.test(rhs))                       kind = 'LOADSTR';
+    else if (new RegExp(`${_escRe(regV)}\\s*\\[`).test(rhs)) kind = 'MOVE';
+    ops.push({ kind, reg, rhs, lua: `${regV}[${reg}] = ${rhs}` });
   }
-  // NEWTABLE
-  const ntRe = new RegExp(`${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*\\{\\s*\\}`, 'g');
-  while ((mm = ntRe.exec(body)) !== null) ops.push({ kind:'NEWTABLE', lua:`V[${mm[1].trim()}] = {}` });
-  // GETTABLE
-  const gtRe = new RegExp(
-    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\[([^\\]]+)\\]`, 'g');
-  while ((mm = gtRe.exec(body)) !== null)
-    ops.push({ kind:'GETTABLE', lua:`V[${mm[1].trim()}] = V[${mm[2].trim()}][${mm[3].trim()}]` });
-  // SETTABLE
-  const stRe = new RegExp(
-    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\[([^\\]]+)\\]\\s*=\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
-  while ((mm = stRe.exec(body)) !== null)
-    ops.push({ kind:'SETTABLE', lua:`V[${mm[1].trim()}][${mm[2].trim()}] = V[${mm[3].trim()}]` });
-  // CONCAT
-  const catRe = new RegExp(
-    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\.\\.\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
-  while ((mm = catRe.exec(body)) !== null)
-    ops.push({ kind:'CONCAT', lua:`V[${mm[1].trim()}] = V[${mm[2].trim()}] .. V[${mm[3].trim()}]` });
-  // UNM/NOT/LEN
-  const unRe = new RegExp(
-    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*([-#]|not\\s+)${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
-  while ((mm = unRe.exec(body)) !== null) {
-    const s = mm[2].trim();
-    const n = s==='-'?'UNM':s==='#'?'LEN':'NOT';
-    ops.push({ kind:n, lua:`V[${mm[1].trim()}] = ${s}V[${mm[3].trim()}]` });
+
+  // 関数呼び出し V[A](...)
+  const callPat = new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]\\s*\\(([^)]*)\\)`, 'g');
+  let cm;
+  while ((cm = callPat.exec(body)) !== null) {
+    const fnReg = parseInt(cm[1]);
+    const args  = cm[2].trim();
+    ops.push({ kind: 'CALL', fnReg, args, lua: `${regV}[${fnReg}](${args})` });
   }
-  // CALL
-  const callRe = new RegExp(`${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\(([^)]*)\\)`, 'g');
-  while ((mm = callRe.exec(body)) !== null)
-    ops.push({ kind:'CALL', lua:`V[${mm[1].trim()}](${mm[2].trim()})` });
-  // JMP
-  const jmpRe = new RegExp(`${rE(pcName)}\\s*=\\s*${rE(pcName)}\\s*([+\\-])\\s*(\\d+)`, 'g');
-  while ((mm = jmpRe.exec(body)) !== null) {
-    const delta = mm[1]==='+'?parseInt(mm[2]):-parseInt(mm[2]);
-    ops.push({ kind:'JMP', lua:`-- jump pc${delta>=0?'+':''}${delta}`, delta });
-  }
-  // COND_JMP
-  const condRe = new RegExp(`if\\s+(?:not\\s+)?${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
-  while ((mm = condRe.exec(body)) !== null)
-    ops.push({ kind:'COND_JMP', lua:`if V[${mm[1].trim()}] then ... end` });
+
   // RETURN
   if (/\breturn\b/.test(body) && !/function/.test(body)) {
-    const rm = body.match(/return\s+(.+)/s);
-    ops.push({ kind:'RETURN', lua: rm ? `return ${rm[1].trim().substring(0,120).replace(/\n/g,' ')}` : 'return' });
+    const retM = body.match(/return\s*([^\n]*)/);
+    ops.push({ kind: 'RETURN', lua: retM ? retM[0].trim() : 'return' });
   }
-  // GETGLOBAL
-  const ggRe = /(?:_ENV|_G)\s*\[([^\]]+)\]/g;
-  while ((mm = ggRe.exec(body)) !== null)
-    ops.push({ kind:'GETGLOBAL', lua:`-- GETGLOBAL _G[${mm[1].trim()}]` });
-  if (ops.length === 0)
-    ops.push({ kind:'RAW', lua:`-- [raw] ${body.substring(0,120).replace(/\n/g,' ')}` });
+
+  // テーブルアクセス V[A][key]
+  const tblGet = new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]\\s*=\\s*${_escRe(regV)}\\s*\\[(\\d+)\\]\\s*\\[([^\\]]+)\\]`, 'g');
+  let tg;
+  while ((tg = tblGet.exec(body)) !== null) {
+    ops.push({ kind: 'GETTABLE', A: parseInt(tg[1]), B: parseInt(tg[2]), C: tg[3].trim(), lua: `${regV}[${tg[1]}] = ${regV}[${tg[2]}][${tg[3]}]` });
+  }
+
+  // RAW フォールバック
+  if (ops.length === 0) {
+    ops.push({ kind: 'RAW', lua: body.trim().substring(0, 200) });
+  }
+
   return ops;
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  Step 6: コンテキスト変数名の自動検出
+//  extractWeredevOperands — opcode ブロック本体からA/B/Cを抽出
 // ────────────────────────────────────────────────────────────────────────
 function extractWeredevOperands(body, ctx) {
-  const rV   = (ctx && ctx.regVar)  || 'V';
-  const zFn  = (ctx && ctx.zFunc)   || 'Z';
-  const rE   = _wdEscapeRegex;
-  let m;
+  const regV = (ctx && ctx.regVar) || 'V';
+  const result = { A: null, B: null, C: null, _op: null };
+  if (!body) return result;
 
-  // ARITH: V[A] = V[B] OP V[C]  (MOVEより先に評価)
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]\\s*([+\\-*/%^])\\s*${rE(rV)}\\s*\\[(\\d+)\\]`));
-  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: parseInt(m[4]), _op: m[3] };
+  // A: 代入先レジスタ V[N] =
+  const aM = body.match(new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]\\s*=`));
+  if (aM) result.A = parseInt(aM[1]);
 
-  // CONCAT: V[A] = V[B] .. V[C]
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\.\\s*\\.\\s*${rE(rV)}\\s*\\[(\\d+)\\]`));
-  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: parseInt(m[3]) };
+  // B, C: 右辺のレジスタ参照
+  const rhsM = body.match(new RegExp(`=\\s*(?:.*?)${_escRe(regV)}\\s*\\[(\\d+)\\]`));
+  if (rhsM) result.B = parseInt(rhsM[1]);
+  const allRegs = [...body.matchAll(new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]`, 'g'))];
+  if (allRegs.length >= 3) result.C = parseInt(allRegs[2][1]);
+  else if (allRegs.length >= 2 && result.A !== null && parseInt(allRegs[1][1]) !== result.A)
+    result.B = parseInt(allRegs[1][1]);
 
-  // GETTABLE: V[A] = V[B][V[C] or Z(x) or literal]
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\[(?:${rE(rV)}\\s*\\[(\\d+)\\]|${rE(zFn)}\\s*\\((\\d+)\\)|(\\d+))\\]`));
-  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: m[3]!=null?parseInt(m[3]):m[4]!=null?parseInt(m[4]):m[5]!=null?parseInt(m[5]):null };
+  // 算術演算子
+  const arithM = body.match(/([+\-*\/%^])/);
+  if (arithM) result._op = arithM[1];
 
-  // SETTABLE: V[A][key] = V[C]
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\[(?:${rE(rV)}\\s*\\[(\\d+)\\]|${rE(zFn)}\\s*\\((\\d+)\\))\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]`));
-  if (m) return { A: parseInt(m[1]), B: m[2]!=null?parseInt(m[2]):m[3]!=null?parseInt(m[3]):null, C: parseInt(m[4]) };
-
-  // UNM/NOT/LEN: V[A] = -/not/# V[B]
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*(?:-|not\\s+|#)${rE(rV)}\\s*\\[(\\d+)\\]`));
-  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: null };
-
-  // LOADK: V[A] = Z(B)
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(zFn)}\\s*\\((\\d+)\\)`));
-  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: null };
-
-  // NEWTABLE: V[A] = {}
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*\\{\\s*\\}`));
-  if (m) return { A: parseInt(m[1]), B: 0, C: 0 };
-
-  // RETURN: return V[A], ...
-  m = body.match(new RegExp(`return\\s+${rE(rV)}\\s*\\[(\\d+)\\]`));
-  if (m) {
-    const nret = (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]`, 'g')) || []).length;
-    return { A: parseInt(m[1]), B: nret + 1, C: null };
-  }
-  if (/\breturn\b/.test(body) && !/function/.test(body)) return { A: 0, B: 1, C: null };
-
-  // CALL: V[A](...)
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\(`));
-  if (m) return { A: parseInt(m[1]), B: null, C: null };
-
-  // MOVE: V[A] = V[B]  (最後 - 他パターンと誤マッチを防ぐ)
-  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\](?!\\s*[+\\-*/%^\\[\\.])`));
-  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: null };
-
-  return { A: null, B: null, C: null };
+  return result;
 }
 
-// ── 補助: instrLua内の K[N] をフラット定数プールの値で置換 ──────────────
+// ────────────────────────────────────────────────────────────────────────
+//  _buildFlatConstPool — 複数の constPool を統合フラット配列にする
+// ────────────────────────────────────────────────────────────────────────
 function _buildFlatConstPool(constPools, accessors) {
-  // アクセサごとに { funcName → [elem0, elem1, ...] (0-indexed, offset適用済み) }
   const flat = {};
-  for (const [fn, acc] of Object.entries(accessors)) {
-    const pool = constPools[acc.poolName];
+  for (const [accName, acc] of Object.entries(accessors || {})) {
+    const pool = constPools && constPools[acc.poolName];
     if (!pool) continue;
-    // Z(i) → pool.elements[i - offset - 1]  (1-indexed)
-    flat[fn] = { elements: pool.elements, offset: acc.offset };
+    flat[accName] = {
+      funcName: acc.funcName,
+      poolName: acc.poolName,
+      offset:   acc.offset,
+      elements: pool.elements,
+    };
+  }
+  // アクセサがない場合は全プールをそのまま追加
+  if (Object.keys(flat).length === 0 && constPools) {
+    for (const [name, pool] of Object.entries(constPools)) {
+      if (pool.isLikelyConstPool) {
+        flat[name] = { funcName: name, poolName: name, offset: 0, elements: pool.elements };
+      }
+    }
   }
   return flat;
 }
 
-// ── 補助: ブロック本体からLua5.1形式のA/B/Cオペランドを推定抽出 ─────────
+// ────────────────────────────────────────────────────────────────────────
+//  resolveWeredevZCalls — Z(N) → 定数値に置換
+// ────────────────────────────────────────────────────────────────────────
 function resolveWeredevZCalls(code, accessors, constPools) {
-  if (!accessors || Object.keys(accessors).length === 0) return { code, resolved: 0 };
-  let modified = code, resolved = 0;
-  for (const [funcName, accessor] of Object.entries(accessors)) {
-    const pool = constPools[accessor.poolName];
+  let result = code;
+  let resolved = 0;
+
+  for (const [funcName, acc] of Object.entries(accessors || {})) {
+    const pool = constPools && constPools[acc.poolName];
     if (!pool) continue;
-    const callRe = new RegExp(`\\b${_wdEscapeRegex(funcName)}\\s*\\(\\s*(\\d+)\\s*\\)`, 'g');
-    modified = modified.replace(callRe, (match, idxStr) => {
-      const idx = parseInt(idxStr);
-      // Z(i) = R[i - offset]  ここでoffsetはLuaの1-indexed基準
-      // JS配列は0-indexed なので: elements[R-index - 1]
-      // R-index = idx - offset  →  JS-index = R-index - 1 = idx - offset - 1
-      // ただしoffsetが既に「Luaインデックスの調整値」なので:
-      //   Z(i) = R[i - offset] なら R-index = i - offset, JS-index = i - offset - 1
-      const jsIdx = idx - accessor.offset - 1;
-      const elem = pool.elements[jsIdx];
+
+    const fnEsc = _escRe(funcName);
+    const re = new RegExp(`\\b${fnEsc}\\s*\\(\\s*(-?\\d+)\\s*\\)`, 'g');
+    result = result.replace(re, (match, idxStr) => {
+      const idx     = parseInt(idxStr);
+      const realIdx = idx + acc.offset;   // offset 調整
+      const elem    = pool.elements[realIdx - 1] || pool.elements[realIdx];
       if (!elem) return match;
       resolved++;
       if (elem.type === 'string') {
-        const safe = elem.value.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');
+        const safe = elem.value.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n');
         return `"${safe}"`;
       }
       if (elem.type === 'number') return String(elem.value);
@@ -242,15 +424,66 @@ function resolveWeredevZCalls(code, accessors, constPools) {
       return match;
     });
   }
-  return { code: modified, resolved };
+
+  return { code: result, resolved };
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  コード後処理
+//  ヘルパー
 // ────────────────────────────────────────────────────────────────────────
+function _escRe(s) {
+  return (s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _extractLoopBody(code, startAfterDo) {
+  let depth = 1, i = startAfterDo;
+  const limit = Math.min(code.length, startAfterDo + 5000000);
+  while (i < limit) {
+    const sub     = code.slice(i);
+    const nextKw  = sub.search(/\b(do|then|repeat|function)\b/);
+    const nextEnd = sub.search(/\bend\b/);
+    if (nextEnd === -1) break;
+    if (nextKw !== -1 && nextKw < nextEnd) {
+      depth++; i += nextKw + 2;
+    } else {
+      depth--;
+      if (depth === 0) return code.substring(startAfterDo, i + nextEnd + 3);
+      i += nextEnd + 3;
+    }
+  }
+  return null;
+}
+
+function _splitThenElse(src, thenStart) {
+  let depth = 1, elsePos = -1;
+  const keywords = /\b(if|while|for|repeat|do|function)\b|\b(end|until)\b|\belse(?:if)?\b/g;
+  keywords.lastIndex = thenStart;
+  let km;
+  while ((km = keywords.exec(src)) !== null) {
+    const kw = km[0];
+    if (/^(if|while|for|function|do|repeat)$/.test(kw)) depth++;
+    else if (kw === 'end' || kw === 'until') {
+      depth--;
+      if (depth === 0) {
+        const endPos = km.index;
+        if (elsePos !== -1)
+          return { thenBody: src.substring(thenStart, elsePos), elseBody: src.substring(elsePos + 4, endPos) };
+        return { thenBody: src.substring(thenStart, endPos), elseBody: '' };
+      }
+    } else if ((kw === 'else' || kw === 'elseif') && depth === 1) {
+      elsePos = km.index;
+    }
+  }
+  return { thenBody: src.substring(thenStart), elseBody: '' };
+}
 
 module.exports = {
-  detectVmDispatchLoop, detectWeredevContext,
-  analyzeWeredevOpcodeBlock, extractWeredevOperands,
-  _buildFlatConstPool, resolveWeredevZCalls,
+  detectWeredevContext,
+  detectVmDispatchLoop,
+  dynamicOpcodeResolver,
+  analyzeWeredevOpcodeBlock,
+  extractWeredevOperands,
+  _buildFlatConstPool,
+  resolveWeredevZCalls,
+  MAX_DISPATCH_ITERATIONS,
 };
