@@ -1,38 +1,15 @@
 // vm/weredevs/index.js
 'use strict';
 
-// ════════════════════════════════════════════════════════════════════════
-//  Weredevs VM 解析パイプライン
+// ────────────────────────────────────────────────────────────────────────
+//  weredevs/index.js — 名前空間まとめ + 項目6の実装
 //
-//  実行順序:
-//    1. extractor        — bytecode テーブル・定数プール・アクセサ・dispatch ループ抽出
-//    2. interpreterParser — VM コンテキスト検出・dispatch ブロック解析
-//    3. opcodeMap        — opcode 番号付け・オペランド推定
-//    4. emulator.run()   — 命令をステップ実行して execution trace 生成
-//    5. decompiler       — trace → 疑似 Lua コード生成
-//
-//  VM table 名の検出は固定名ではなく regex ベース:
-//    /local\s+(\w+)\s*=\s*{/
-//  により難読化ごとに変わる名前に対応する。
-// ════════════════════════════════════════════════════════════════════════
+//  項目6: VM検出後は luaPrinter を呼ばず必ず decompiler.js に渡す
+//         → isWeredevObfuscated/vmDetector で検出後の全ルートを
+//           decompiler.js の関数に直結させる
+// ────────────────────────────────────────────────────────────────────────
 
-// ── モジュール読み込み ──────────────────────────────────────────────────
-const {
-  extractVmTableNames, extractVmTable,
-  extractWeredevConstPool, extractWeredevZAccessor,
-  extractWeredevDispatchLoop, _wdEscapeRegex,
-  extractIfJBlocks, _flattenIfJTree, _collectLeafStatements,
-  _splitIfThenElse, _findIfBlockEnd,
-  dumpBytecodeTables, vmBytecodeExtractor,
-  parseConstPoolBody, resolveConstPoolElement, detectIfConstPool,
-} = require('./extractor');
-
-const {
-  detectVmDispatchLoop, detectWeredevContext,
-  analyzeWeredevOpcodeBlock, extractWeredevOperands,
-  _buildFlatConstPool, resolveWeredevZCalls,
-} = require('./interpreterParser');
-
+// ── opcodeMap ────────────────────────────────────────────────────────────
 const {
   LUA51_OPCODES, OPCODE_CATEGORIES,
   vmTraceAnalyzer, buildOpcodeMapFromTrace, remapOpcodes,
@@ -40,180 +17,107 @@ const {
   _inferOpNameFromOperands, resolveInstrConstants,
 } = require('./opcodeMap');
 
+// ── extractor ────────────────────────────────────────────────────────────
 const {
-  WeredevVM, emulateWeredevVM,
-  buildConstantsFromPools, buildBytecodeFromBlocks, traceToVmTrace,
-} = require('./emulator');
+  extractFirstLocalName,
+  extractVmTableNames, extractVmTable,
+  extractWeredevConstPool,
+  extractWeredevZAccessor, _wdEscapeRegex,
+  extractWeredevDispatchLoop,
+  dumpBytecodeTables, vmBytecodeExtractor,
+} = require('./extractor');
 
+// ── interpreterParser ────────────────────────────────────────────────────
+const {
+  detectWeredevContext, detectVmDispatchLoop,
+  dynamicOpcodeResolver,
+  analyzeWeredevOpcodeBlock, extractWeredevOperands,
+  _buildFlatConstPool, resolveWeredevZCalls,
+  MAX_DISPATCH_ITERATIONS,
+} = require('./interpreterParser');
+
+// ── decompiler ───────────────────────────────────────────────────────────
 const {
   vmDecompiler, reconstructedLuaBuilder,
-  weredevAnalyze, cleanWeredevOutputCode, buildWeredevPseudoLua,
-  weredevFullDecompile, weredevFullDecompileHandler,
+  weredevAnalyze, weredevFullDecompile, weredevFullDecompileHandler,
+  dispatcherFlatten, executeTrace, convertToSwitchCase, simplifyStateMachine,
 } = require('./decompiler');
 
+// ── detector (isWeredevObfuscated) ───────────────────────────────────────
+const { isWeredevObfuscated } = require('../../core/detector');
+
 // ════════════════════════════════════════════════════════════════════════
-//  weredevPipeline — メイン5段パイプライン
+//  項目6: weredevDispatch — VM検出後のルーティング
 //
-//  @param {string} code      — 難読化済み Lua ソースコード
-//  @param {object} [options]
-//    maxSteps    {number}  — エミュレータ最大ステップ数 (default: 200000)
-//    maxTrace    {number}  — trace 最大保持件数         (default: 50000)
-//    skipEmulate {boolean} — emulate をスキップして静的解析のみ返す
+//  luaPrinter は一切呼ばず、必ず decompiler.js の関数を経由する。
+//
+//  入力:
+//    code          — 解析対象の Lua コード
+//    vmTraceEntries — vmhook ログ (存在すれば項目15: 実行順優先)
+//    bTableLog     — B テーブルログ
+//    strLogEntries  — m() strlog
+//    options       — { maxInstructions, forceStatic }
+//
+//  戻り値: decompiler.js の出力をそのまま返す
 // ════════════════════════════════════════════════════════════════════════
-function weredevPipeline(code, options) {
-  const opts        = options || {};
-  const skipEmulate = opts.skipEmulate || false;
-
-  const result = {
-    success: false, method: 'weredev_pipeline',
-    stages: {}, pseudoLua: '', resolvedCode: '', error: null,
-  };
-
-  if (!code || code.length === 0) {
-    result.error = 'コードが空です';
-    return result;
+function weredevDispatch(code, vmTraceEntries, bTableLog, strLogEntries, options) {
+  // VM検出
+  const detected = isWeredevObfuscated(code);
+  if (!detected) {
+    return { success: false, error: 'Weredev VMパターンが検出されませんでした', method: 'weredev_dispatch' };
   }
 
-  // ────────────────────────────────────────────────────────────────────
-  //  Stage 1: extractor
-  //  /local\s+(\w+)\s*=\s*{/ で VM table 名を動的検出（固定名廃止）し、
-  //  定数プール・アクセサ・dispatch ループを抽出する。
-  // ────────────────────────────────────────────────────────────────────
-  const tableNames    = extractVmTableNames(code);        // regex ベース
-  const constPools    = extractWeredevConstPool(code);
-  const accessors     = extractWeredevZAccessor(code, constPools);
-  const dispatchLoops = extractWeredevDispatchLoop(code);
-
-  result.stages.extractor = {
-    tableNames,
-    constPoolCount:    Object.keys(constPools).length,
-    accessorCount:     Object.keys(accessors).length,
-    dispatchLoopCount: dispatchLoops.length,
-  };
-
-  // ────────────────────────────────────────────────────────────────────
-  //  Stage 2: interpreterParser
-  //  VM コンテキスト変数名を特定し、dispatch ブロックを解析する。
-  // ────────────────────────────────────────────────────────────────────
-  const ctx = detectWeredevContext(code);
-  const accList = Object.values(accessors);
-  if (accList.length > 0) { ctx.poolVar = accList[0].poolName; ctx.zFunc = accList[0].funcName; }
-
-  const bestLoop = dispatchLoops.length > 0
-    ? dispatchLoops.reduce((a, b) => b.blockCount > a.blockCount ? b : a)
-    : null;
-
-  const analyzedBlocks = bestLoop
-    ? bestLoop.dispatchBlocks.map(block => ({ ...block, _ops: analyzeWeredevOpcodeBlock(block, ctx) }))
-    : [];
-
-  result.stages.interpreterParser = {
-    ctx, loopVar: ctx.loopVar, analyzedBlockCount: analyzedBlocks.length,
-  };
-
-  // ────────────────────────────────────────────────────────────────────
-  //  Stage 3: opcodeMap
-  //  dispatch ブロックに opcode 番号を付与し A/B/C オペランドを推定する。
-  // ────────────────────────────────────────────────────────────────────
-  const numberedBlocks = analyzedBlocks.length > 0
-    ? assignWeredevOpcodes(analyzedBlocks) : [];
-
-  const enrichedBlocks = numberedBlocks.map(block => {
-    const operands   = extractWeredevOperands(block.body || '', ctx);
-    const detectedOp = _inferOpNameFromOperands(operands, block.body || '', ctx);
-    return { ...block, opName: detectedOp, A: operands.A, B: operands.B, C: operands.C };
-  });
-
-  result.stages.opcodeMap = {
-    numberedBlockCount: numberedBlocks.length,
-    opNames: enrichedBlocks.slice(0, 20).map(b => b.opName),
-  };
-
-  // ────────────────────────────────────────────────────────────────────
-  //  Stage 4: emulator.run()
-  //  enrichedBlocks + constPools から WeredevVM を実行し execution trace を生成。
-  //  skipEmulate が true の場合はスキップ。
-  // ────────────────────────────────────────────────────────────────────
-  let vmTrace = [], emulResult = null;
-
-  if (!skipEmulate && enrichedBlocks.length > 0) {
-    emulResult = emulateWeredevVM({
-      constPools, accessors, dispatchLoops, ctx,
-      numberedBlocks: enrichedBlocks,
-      options: { maxSteps: opts.maxSteps || 200_000, maxTrace: opts.maxTrace || 50_000 },
-    });
-    vmTrace = emulResult.vmTrace || [];
-  }
-
-  result.stages.emulator = emulResult ? {
-    success: emulResult.success, steps: emulResult.steps,
-    traceLen: vmTrace.length,    haltReason: emulResult.haltReason,
-    callCount: (emulResult.callLog || []).length,
-    jumpCount: (emulResult.jumpLog || []).length,
-    error: emulResult.error || null,
-  } : { skipped: true };
-
-  // ────────────────────────────────────────────────────────────────────
-  //  Stage 5: decompiler
-  //  vmTrace があれば vmDecompiler（動的）、なければ weredevFullDecompileHandler（静的）。
-  // ────────────────────────────────────────────────────────────────────
-  let decompResult;
-
-  if (vmTrace.length > 0) {
-    const bDump      = _buildBytecodeDump(tableNames, code);
-    const opcodeMapR = buildOpcodeMapFromTrace(vmTrace, []);
-    decompResult     = vmDecompiler(vmTrace, bDump, opcodeMapR.opcodeMap);
-    decompResult._via = 'emulator_trace';
-  } else {
-    decompResult      = weredevFullDecompileHandler(code);
-    decompResult._via = 'static_fallback';
-  }
-
-  result.stages.decompiler = {
-    success: decompResult.success, via: decompResult._via, method: decompResult.method,
-  };
-  result.success      = decompResult.success;
-  result.pseudoLua    = decompResult.pseudoCode || decompResult.result || '';
-  result.resolvedCode = decompResult.resolvedCode || '';
-  result.decompResult = decompResult;
-
-  return result;
-}
-
-// ── 内部ヘルパー ─────────────────────────────────────────────────────────
-function _buildBytecodeDump(tableNames, code) {
-  const dump = {};
-  for (const name of tableNames.slice(0, 10)) {
-    const tbl = extractVmTable(code, name);
-    if (tbl && tbl.nums && tbl.nums.length > 0) dump[name] = tbl.nums;
-  }
-  return dump;
+  // 項目6: luaPrinter を呼ばず decompiler.js の weredevAnalyze に直接委譲
+  return weredevAnalyze(code, vmTraceEntries || [], bTableLog || {}, strLogEntries || [], options || {});
 }
 
 // ════════════════════════════════════════════════════════════════════════
-//  exports — 全サブモジュールのシンボル + パイプライン関数
+//  全エクスポート
 // ════════════════════════════════════════════════════════════════════════
 module.exports = {
-  // パイプライン (新規)
-  weredevPipeline,
-  // extractor
-  extractVmTableNames, extractVmTable,
-  extractWeredevConstPool, extractWeredevZAccessor, extractWeredevDispatchLoop,
-  _wdEscapeRegex, extractIfJBlocks, _flattenIfJTree, _collectLeafStatements,
-  _splitIfThenElse, _findIfBlockEnd, dumpBytecodeTables, vmBytecodeExtractor,
-  parseConstPoolBody, resolveConstPoolElement, detectIfConstPool,
-  // interpreterParser
-  detectVmDispatchLoop, detectWeredevContext, analyzeWeredevOpcodeBlock,
-  extractWeredevOperands, _buildFlatConstPool, resolveWeredevZCalls,
-  // opcodeMap
-  LUA51_OPCODES, OPCODE_CATEGORIES, vmTraceAnalyzer, buildOpcodeMapFromTrace,
-  remapOpcodes, vmDecompileInstruction, assignWeredevOpcodes,
-  _inferOpNameFromOperands, resolveInstrConstants,
-  // emulator
-  WeredevVM, emulateWeredevVM, buildConstantsFromPools,
-  buildBytecodeFromBlocks, traceToVmTrace,
-  // decompiler
-  vmDecompiler, reconstructedLuaBuilder, weredevAnalyze,
-  cleanWeredevOutputCode, buildWeredevPseudoLua,
-  weredevFullDecompile, weredevFullDecompileHandler,
+  // ── opcodeMap ──────────────────────────────────────────────────────
+  LUA51_OPCODES,
+  OPCODE_CATEGORIES,
+  vmDecompileInstruction,
+  vmTraceAnalyzer,
+  buildOpcodeMapFromTrace,
+  remapOpcodes,
+  assignWeredevOpcodes,
+  _inferOpNameFromOperands,
+  resolveInstrConstants,
+
+  // ── extractor ──────────────────────────────────────────────────────
+  extractFirstLocalName,
+  extractVmTableNames,
+  extractVmTable,
+  extractWeredevConstPool,
+  extractWeredevZAccessor,
+  _wdEscapeRegex,
+  extractWeredevDispatchLoop,
+  dumpBytecodeTables,
+  vmBytecodeExtractor,
+
+  // ── interpreterParser ──────────────────────────────────────────────
+  detectWeredevContext,
+  detectVmDispatchLoop,
+  dynamicOpcodeResolver,
+  analyzeWeredevOpcodeBlock,
+  extractWeredevOperands,
+  _buildFlatConstPool,
+  resolveWeredevZCalls,
+  MAX_DISPATCH_ITERATIONS,
+
+  // ── decompiler ─────────────────────────────────────────────────────
+  vmDecompiler,
+  reconstructedLuaBuilder,
+  weredevAnalyze,
+  weredevFullDecompile,
+  weredevFullDecompileHandler,
+  dispatcherFlatten,          // 項目7
+  executeTrace,               // 項目8
+  convertToSwitchCase,        // 項目9
+  simplifyStateMachine,       // 項目13
+
+  // ── 項目6: VM検出後ルーター ────────────────────────────────────────
+  weredevDispatch,
 };
