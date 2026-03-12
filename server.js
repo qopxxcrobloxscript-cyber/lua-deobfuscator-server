@@ -524,11 +524,14 @@ async function dynamicDecode(code) {
     bytecodeCandidates = dumpResult.candidates;
   }
 
+  // ── wrapper 生成前に元コードへ直接適用: [[ → [=[ 、]] → ]=] ──────────
+  // preamble や footer を結合する前の codeToRun に対して変換することで、
+  // wrapper 自体の長括弧 [=[ ]=] と衝突しない文字列にする。
+  codeToRun = codeToRun.replace(/\[\[/g, '[=[').replace(/\]\]/g, ']=]');
+
   const vmInfo = vmDetector(codeToRun);
   const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
-
-  // [[ → [=[ 、]] → ]=] に一括変換して wrapper の [=[ ]=] と衝突させない
-  const safeFullCode = fullCode.replace(/\[\[/g, '[=[').replace(/\]\]/g, ']=]');
+  const safeFullCode = fullCode;
   const tempFile = path.join(tempDir, `dyndec_${makeTempId()}.lua`);
 
   const wrapper = `
