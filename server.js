@@ -583,7 +583,15 @@ end
 `;
 
   return new Promise(resolve => {
-    fs.writeFileSync(tempFile, wrapper, 'utf8');
+    // ── Lua へ渡す最終文字列に直接適用 ──────────────────────────────────
+    // 1. --[[ をコメント長括弧として安全化: --[[ → --[=[
+    // 2. 残った [[ を長括弧レベル1へ昇格:    [[ → [=[
+    // 3. 対応する ]] を閉じ長括弧レベル1へ: ]] → ]=]
+    const luaCode = wrapper
+      .replace(/--\[\[/g, '--[=[')
+      .replace(/\[\[/g,   '[=[')
+      .replace(/\]\]/g,   ']=]');
+    fs.writeFileSync(tempFile, luaCode, 'utf8');
     exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       safeUnlink(tempFile);
 
