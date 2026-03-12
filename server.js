@@ -704,12 +704,26 @@ end
 
 // ════════════════════════════════════════════════════════
 //  dispatchDynamic
-//  "return(function(" で始まるコードは VM ラッパー形式なので
+//  先頭のコメント（行コメント・長括弧コメント）をすべて除去した後の
+//  文字列が "return(function(" で始まる場合は VM ラッパー形式と判断し、
 //  tryDynamicExecution をスキップして dynamicDecode を直接実行する。
 //  それ以外は通常通り tryDynamicExecution に委譲する。
 // ════════════════════════════════════════════════════════
 async function dispatchDynamic(code) {
-  if (/^return\s*\(function\s*\(/.test(code.trimStart())) {
+  // 先頭コメントを除去してから判定
+  //   1. --[[ ... ]] 長括弧コメント（複数行）
+  //   2. -- 行コメント
+  // 上記を繰り返し除去して残った先頭文字列で Weredevs 判定を行う
+  let stripped = code;
+  let prev;
+  do {
+    prev = stripped;
+    stripped = stripped
+      .replace(/^\s*--\[\[[\s\S]*?\]\]\s*/,  '')   // 長括弧コメント
+      .replace(/^\s*--[^\n]*\n?/,             '');  // 行コメント
+  } while (stripped !== prev);
+
+  if (/^return\s*\(function\s*\(/.test(stripped)) {
     return dynamicDecode(code);
   }
   return tryDynamicExecution(code);
