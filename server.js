@@ -162,51 +162,6 @@ function safeUnlink(filePath) {
   try { fs.unlinkSync(filePath); } catch (_) {}
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  escapeLongStrings
-//
-//  Lua コードを [[...]] で包む wrapper に埋め込む前に、コード中の
-//  長括弧構文を安全なレベルへ昇格させる前処理。
-//
-//  アルゴリズム:
-//    1. コード全体をスキャンして既存の長括弧 [=*[ ... ]=*] を抽出し、
-//       使用されている最大 = レベルを求める。
-//    2. wrapper は [==[ ]==] (レベル2) を使うので、コード中に
-//       ]==] が現れると早期終了してしまう。
-//       そのため、コード中の ]==] は [===[...]==] (レベル3以上) へ昇格。
-//    3. 長括弧の外に裸の ]] が残っている場合は ] ] (スペース挿入) でエスケープ。
-//    4. 全体として wrapper の [==[ ]==] と衝突しない文字列を返す。
-// ────────────────────────────────────────────────────────────────────────
-function escapeLongStrings(code) {
-  // Step1: 既存の長括弧リテラルを一時トークンに退避し、最大=レベルを記録
-  const placeholders = [];
-  let maxLevel = 0;
-
-  // 長括弧 [=*[ ... ]=*] を貪欲にマッチ (ネストなし・Lua仕様)
-  const longBracketRe = /\[(=*)\[([\s\S]*?)\]\1\]/g;
-  const withPlaceholders = code.replace(longBracketRe, (match, eqs, _content) => {
-    const level = eqs.length;
-    if (level > maxLevel) maxLevel = level;
-    const idx = placeholders.length;
-    placeholders.push(match);
-    return `\x00LB${idx}\x00`;  // NUL文字はLuaコード中に出現しない
-  });
-
-  // Step2: wrapper が使う = レベルを決定
-  // wrapper は [==[ ]==] (レベル2) を使うため、コード中に ]==] が
-  // あると衝突する。レベル2以上を使っているなら wrapper 側を maxLevel+1 に
-  // 昇格させるが、ここでは wrapper を固定 [==[ ]==] としているので、
-  // コード中の残存 ]==] をさらに安全化する。
-  //
-  // 実用上の対処: 長括弧の外に残った ]] を ] ] に置換してパーサ誤認を防ぐ。
-  // これは既存の長括弧リテラルを退避してから行うので安全。
-  const escaped = withPlaceholders.replace(/\]\]/g, '] ]');
-
-  // Step3: 退避した長括弧リテラルを復元
-  const restored = escaped.replace(/\x00LB(\d+)\x00/g, (_, idx) => placeholders[parseInt(idx)]);
-
-  return restored;
-}
 
 function checkLuaAvailable() {
   try { execSync('lua -v 2>&1', { timeout: 3000 }); return 'lua'; } catch {}
@@ -572,15 +527,8 @@ async function dynamicDecode(code) {
   const vmInfo = vmDetector(codeToRun);
   const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
 
-  // ── [[...]] ネスト安全化: Lua 長括弧をすべて [==[...]==] 以上に昇格 ──────
-  // wrapper が [[...]] でコードを包むため、コード中に ]] があると
-  // Lua パーサがそこで文字列を早期終了してしまう。
-  // escapeLongStrings() は:
-  //   1. コード中の既存 長括弧リテラル ([=[...]=] 等) をそのまま保持
-  //   2. 裸の [[ / ]] (長括弧の外) を検出し、必要な = レベルを算出して昇格
-  //   3. wrapper 自体が [[ ]] を使うため、コード全体を
-  //      [==[...]==] へ昇格させて ]] の衝突を防ぐ
-  const safeFullCode = escapeLongStrings(fullCode);
+  // [[ → [=[ 、]] → ]=] に一括変換して wrapper の [=[ ]=] と衝突させない
+  const safeFullCode = fullCode.replace(/\[\[/g, '[=[').replace(/\]\]/g, ']=]');
   const tempFile = path.join(tempDir, `dyndec_${makeTempId()}.lua`);
 
   const wrapper = `
@@ -599,9 +547,9 @@ pcall(function()
   end
 end)
 
-local __obf_code = [==[
+local __obf_code = [=[
 ${safeFullCode}
-]==]
+]=]
 
 local __orig_ls_outer = loadstring or load
 local function __outer_hook(c, ...)
