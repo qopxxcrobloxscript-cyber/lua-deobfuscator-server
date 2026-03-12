@@ -365,7 +365,7 @@ app.post('/api/deobfuscate', async (req, res) => {
     case 'weredev_full_decompile': result = weredevFullDecompileHandler(code);         break;
     case 'base64_detect':          result = base64Detector(code, new CapturePool());  break;
     case 'vmify':                  result = deobfuscateVmify(code);                    break;
-    case 'dynamic':                result = await tryDynamicExecution(code);           break;
+    case 'dynamic':                result = await dispatchDynamic(code);              break;
     case 'auto':
     default:                       result = await autoDeobfuscate(code);              break;
   }
@@ -703,6 +703,19 @@ end
 }
 
 // ════════════════════════════════════════════════════════
+//  dispatchDynamic
+//  "return(function(" で始まるコードは VM ラッパー形式なので
+//  tryDynamicExecution をスキップして dynamicDecode を直接実行する。
+//  それ以外は通常通り tryDynamicExecution に委譲する。
+// ════════════════════════════════════════════════════════
+async function dispatchDynamic(code) {
+  if (/^return\s*\(function\s*\(/.test(code.trimStart())) {
+    return dynamicDecode(code);
+  }
+  return tryDynamicExecution(code);
+}
+
+// ════════════════════════════════════════════════════════
 //  tryDynamicExecution
 // ════════════════════════════════════════════════════════
 async function tryDynamicExecution(code) {
@@ -830,14 +843,14 @@ async function autoDeobfuscate(code) {
   const luaBin = checkLuaAvailable();
 
   if (luaBin) {
-    const dynRes = await tryDynamicExecution(current);
+    const dynRes = await dispatchDynamic(current);
     results.push({ step: '動的実行 (1回目)', ...dynRes });
 
     if (dynRes.success && dynRes.result) {
       current = dynRes.result;
       for (let round = 2; round <= 4; round++) {
         if (!/loadstring|load\s*\(|[A-Za-z0-9+/]{60,}={0,2}/.test(current)) break;
-        const dynRes2 = await tryDynamicExecution(current);
+        const dynRes2 = await dispatchDynamic(current);
         results.push({ step: `動的実行 (${round}回目)`, ...dynRes2 });
         if (dynRes2.success && dynRes2.result && dynRes2.result !== current) current = dynRes2.result;
         else break;
@@ -858,7 +871,7 @@ async function autoDeobfuscate(code) {
         if (res.success && res.result && res.result !== current) { current = res.result; staticChanged = true; }
       }
       if (staticChanged) {
-        const dynRes3 = await tryDynamicExecution(current);
+        const dynRes3 = await dispatchDynamic(current);
         results.push({ step: '動的実行 (静的解析後)', ...dynRes3 });
         if (dynRes3.success && dynRes3.result) current = dynRes3.result;
       }
