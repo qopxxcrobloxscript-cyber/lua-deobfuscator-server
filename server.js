@@ -710,17 +710,26 @@ end
 //  それ以外は通常通り tryDynamicExecution に委譲する。
 // ════════════════════════════════════════════════════════
 async function dispatchDynamic(code) {
+  if (!code || typeof code !== 'string') return tryDynamicExecution(code);
+
   // 先頭コメントを除去してから判定
-  //   1. --[[ ... ]] 長括弧コメント（複数行）
+  //   1. --[[ ... ]] 長括弧コメント（後続の空白・改行は保持）
   //   2. -- 行コメント
   // 上記を繰り返し除去して残った先頭文字列で Weredevs 判定を行う
   let stripped = code;
   let prev;
   do {
     prev = stripped;
-    stripped = stripped
-      .replace(/^\s*--\[\[[\s\S]*?\]\]\s*/,  '')   // 長括弧コメント
-      .replace(/^\s*--[^\n]*\n?/,             '');  // 行コメント
+    // 長括弧コメント: 後ろの空白・改行は削除しない
+    const lbMatch = stripped.match(/^--\[\[[\s\S]*?\]\]/);
+    if (lbMatch !== null) {
+      stripped = stripped.slice(lbMatch[0].length);
+    }
+    // 行コメント
+    const lcMatch = stripped.match(/^--[^\n]*\n?/);
+    if (lcMatch !== null) {
+      stripped = stripped.slice(lcMatch[0].length);
+    }
   } while (stripped !== prev);
 
   if (/^return\s*\(function\s*\(/.test(stripped)) {
