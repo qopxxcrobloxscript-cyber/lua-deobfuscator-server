@@ -132,16 +132,29 @@ function beginVmSession(label) {
 // ── セッション終了 ────────────────────────────────────────────────────────
 function endVmSession(sid, result) {
   if (sid && global.vmSessions[sid]) {
-    global.vmSessions[sid].meta.endedAt  = Date.now();
-    global.vmSessions[sid].meta.success  = result && result.success;
-    global.vmSessions[sid].meta.method   = result && result.method;
+    const meta       = global.vmSessions[sid].meta;
+    meta.endedAt     = Date.now();
+    meta.durationMs  = meta.endedAt - meta.startedAt;
+    meta.success     = result && result.success;
+    meta.method      = result && result.method;
   }
   _currentSessionId = null;
 }
 
 // ── pushVmLog: 旧来の高レベルログ (traceCount / method 単位) ────────────
 function pushVmLog(logEntry) {
-  global.vmLogs.push({ ...logEntry, _ts: Date.now(), _type: 'session_summary' });
+  // セッションが終了済みなら durationMs を自動付与
+  const sid  = logEntry._sid || _currentSessionId;
+  const sess = sid && global.vmSessions[sid];
+  const durationMs = sess && sess.meta.durationMs != null
+    ? sess.meta.durationMs
+    : undefined;
+  global.vmLogs.push({
+    ...logEntry,
+    _ts:        Date.now(),
+    _type:      'session_summary',
+    durationMs: logEntry.durationMs != null ? logEntry.durationMs : durationMs,
+  });
   if (global.vmLogs.length > VM_LOGS_MAX) {
     global.vmLogs = global.vmLogs.slice(-VM_LOGS_MAX);
   }
@@ -274,13 +287,14 @@ app.get('/vmhook-logs', (req, res) => {
 // ════════════════════════════════════════════════════════
 app.get('/vmhook-logs/sessions', (req, res) => {
   const sessions = Object.values(global.vmSessions).map(s => ({
-    id:       s.id,
-    label:    s.label,
-    logCount: s.meta.logCount,
-    startedAt: s.meta.startedAt,
-    endedAt:   s.meta.endedAt || null,
-    success:   s.meta.success,
-    method:    s.meta.method,
+    id:         s.id,
+    label:      s.label,
+    logCount:   s.meta.logCount,
+    startedAt:  s.meta.startedAt,
+    endedAt:    s.meta.endedAt   || null,
+    durationMs: s.meta.durationMs != null ? s.meta.durationMs : null,
+    success:    s.meta.success,
+    method:     s.meta.method,
   })).reverse();   // 新しい順
   res.json({ success: true, count: sessions.length, sessions });
 });
@@ -706,7 +720,15 @@ async function tryDynamicExecution(code) {
 
   const sid = beginVmSession('try_dynamic');
   const tempFile = path.join(tempDir, `obf_${makeTempId()}.lua`);
-  const safeCode = code.replace(/\]\]/g, '] ]');
+
+  // ── wrapper 組み込み前に元コードへ直接適用 ───────────────────────────
+  // 1. --[[ → --[=[ (Luaブロックコメントを安全化)
+  // 2. [[ → [=[ (長括弧開きをレベル1へ昇格)
+  // 3. ]] → ]=] (長括弧閉じをレベル1へ昇格)
+  const safeCode = code
+    .replace(/--\[\[/g, '--[=[')
+    .replace(/\[\[/g,   '[=[')
+    .replace(/\]\]/g,   ']=]');
 
   const wrapper = `
 -- ══ YAJU Deobfuscator - Dynamic Execution Wrapper ══
@@ -744,9 +766,9 @@ if rawset then
   pcall(function() rawset(_G, "load", __hook) end)
 end
 
-local __obf_code = [[
+local __obf_code = [=[
 ${safeCode}
-]]
+]=]
 
 local __ok, __err = pcall(function()
   local chunk, err = __original_loadstring(__obf_code)
@@ -1294,7 +1316,7 @@ async function fetchSessions(){
       <div class="session-item\${s.id===activeSid?' active':''}" onclick="selectSession('\${s.id}')">
         <div class="slabel">\${s.label||'unnamed'}\${s.success===false?'<span style="color:var(--red)"> ✗</span>':s.success===true?'<span style="color:var(--green)"> ✓</span>':''}</div>
         <div class="sid">\${s.id.slice(0,24)}</div>
-        <div class="smeta">\${s.logCount} opcodes · \${s.method||''}</div>
+        <div class="smeta">\${s.logCount} opcodes · \${s.method||''}\${s.durationMs!=null?' · '+s.durationMs+' ms':''}</div>
       </div>
     \`).join('');
   }catch(e){}
@@ -1343,7 +1365,7 @@ function renderTable(logs){
   tbody.innerHTML=logs.map((e,i)=>{
     if(e._type==='session_summary'){
       return \`<tr style="background:#21262d"><td colspan="9" style="color:var(--muted);font-size:11px;padding:4px 10px">
-        📋 Session summary — method:\${e.method||'?'} · traces:\${e.traceCount||0} · bTable:\${e.bTableCount||0} · str:\${e.strLogCount||0}
+        📋 Session summary — method:\${e.method||'?'} · traces:\${e.traceCount||0} · bTable:\${e.bTableCount||0} · str:\${e.strLogCount||0}\${e.durationMs!=null?' · <span style="color:var(--yellow)">'+e.durationMs+' ms</span>':''}
       </td></tr>\`;
     }
     const cat=getCat(e.opName);
