@@ -704,22 +704,33 @@ end
 
 // ────────────────────────────────────────────────────────────────────────
 //  isWeredevWrapper
-//  先頭の --[[ ]] 長括弧コメント・-- 行コメントをすべて除去した後の
-//  文字列が "return(function(" で始まるかを判定する純粋関数。
+//  以下のいずれかに一致した場合に Weredevs と判定する純粋関数。
+//    1. コード中に "wearedevs.net" が含まれる
+//    2. 先頭コメント除去後の文字列が return\s*(\s*function\s*( で始まる
+//       （空白・改行に依存しない正規表現）
 //  dispatchDynamic と autoDeobfuscate の両方から参照する。
 // ────────────────────────────────────────────────────────────────────────
 function isWeredevWrapper(code) {
   if (!code || typeof code !== 'string') return false;
+
+  // 条件1: wearedevs.net を含む
+  if (code.includes('wearedevs.net')) return true;
+
+  // 条件2: 先頭コメント（長括弧コメント・行コメント）を除去した後に
+  //        return(function( 形式で始まるか（空白・改行は任意）
   let stripped = code;
   let prev;
   do {
     prev = stripped;
     const lbMatch = stripped.match(/^--\[\[[\s\S]*?\]\]/);
     if (lbMatch !== null) stripped = stripped.slice(lbMatch[0].length);
-    const lcMatch = stripped.match(/^--[^\n]*\n?/);
-    if (lcMatch !== null) stripped = stripped.slice(lcMatch[0].length);
+    // 長括弧コメント除去後の先頭空白・改行をスキップしてから行コメントを検出
+    const trimmed = stripped.trimStart();
+    const lcMatch = trimmed.match(/^--[^\n]*\n?/);
+    if (lcMatch !== null) stripped = trimmed.slice(lcMatch[0].length);
   } while (stripped !== prev);
-  return /^return\s*\(function\s*\(/.test(stripped);
+
+  return /^return\s*\(\s*function\s*\(/.test(stripped.trimStart());
 }
 
 // ════════════════════════════════════════════════════════
@@ -860,8 +871,8 @@ async function autoDeobfuscate(code) {
   const luaBin = checkLuaAvailable();
 
   if (luaBin) {
-    // Weredevs VM ラッパー形式の場合は tryDynamicExecution をスキップして
-    // dynamicDecode を直接実行する
+    // Weredevs VM ラッパー形式の場合は dynamicDecode を優先実行し、
+    // それ以外は tryDynamicExecution を実行する
     const dynRes = isWeredevWrapper(current)
       ? await dynamicDecode(current)
       : await tryDynamicExecution(current);
