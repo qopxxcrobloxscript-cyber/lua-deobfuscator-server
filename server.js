@@ -702,39 +702,33 @@ end
   });
 }
 
-// ════════════════════════════════════════════════════════
-//  dispatchDynamic
-//  先頭のコメント（行コメント・長括弧コメント）をすべて除去した後の
-//  文字列が "return(function(" で始まる場合は VM ラッパー形式と判断し、
-//  tryDynamicExecution をスキップして dynamicDecode を直接実行する。
-//  それ以外は通常通り tryDynamicExecution に委譲する。
-// ════════════════════════════════════════════════════════
-async function dispatchDynamic(code) {
-  if (!code || typeof code !== 'string') return tryDynamicExecution(code);
-
-  // 先頭コメントを除去してから判定
-  //   1. --[[ ... ]] 長括弧コメント（後続の空白・改行は保持）
-  //   2. -- 行コメント
-  // 上記を繰り返し除去して残った先頭文字列で Weredevs 判定を行う
+// ────────────────────────────────────────────────────────────────────────
+//  isWeredevWrapper
+//  先頭の --[[ ]] 長括弧コメント・-- 行コメントをすべて除去した後の
+//  文字列が "return(function(" で始まるかを判定する純粋関数。
+//  dispatchDynamic と autoDeobfuscate の両方から参照する。
+// ────────────────────────────────────────────────────────────────────────
+function isWeredevWrapper(code) {
+  if (!code || typeof code !== 'string') return false;
   let stripped = code;
   let prev;
   do {
     prev = stripped;
-    // 長括弧コメント: 後ろの空白・改行は削除しない
     const lbMatch = stripped.match(/^--\[\[[\s\S]*?\]\]/);
-    if (lbMatch !== null) {
-      stripped = stripped.slice(lbMatch[0].length);
-    }
-    // 行コメント
+    if (lbMatch !== null) stripped = stripped.slice(lbMatch[0].length);
     const lcMatch = stripped.match(/^--[^\n]*\n?/);
-    if (lcMatch !== null) {
-      stripped = stripped.slice(lcMatch[0].length);
-    }
+    if (lcMatch !== null) stripped = stripped.slice(lcMatch[0].length);
   } while (stripped !== prev);
+  return /^return\s*\(function\s*\(/.test(stripped);
+}
 
-  if (/^return\s*\(function\s*\(/.test(stripped)) {
-    return dynamicDecode(code);
-  }
+// ════════════════════════════════════════════════════════
+//  dispatchDynamic
+//  isWeredevWrapper() が true の場合は tryDynamicExecution をスキップして
+//  dynamicDecode を直接実行する。それ以外は tryDynamicExecution に委譲する。
+// ════════════════════════════════════════════════════════
+async function dispatchDynamic(code) {
+  if (isWeredevWrapper(code)) return dynamicDecode(code);
   return tryDynamicExecution(code);
 }
 
@@ -866,14 +860,20 @@ async function autoDeobfuscate(code) {
   const luaBin = checkLuaAvailable();
 
   if (luaBin) {
-    const dynRes = await dispatchDynamic(current);
+    // Weredevs VM ラッパー形式の場合は tryDynamicExecution をスキップして
+    // dynamicDecode を直接実行する
+    const dynRes = isWeredevWrapper(current)
+      ? await dynamicDecode(current)
+      : await tryDynamicExecution(current);
     results.push({ step: '動的実行 (1回目)', ...dynRes });
 
     if (dynRes.success && dynRes.result) {
       current = dynRes.result;
       for (let round = 2; round <= 4; round++) {
         if (!/loadstring|load\s*\(|[A-Za-z0-9+/]{60,}={0,2}/.test(current)) break;
-        const dynRes2 = await dispatchDynamic(current);
+        const dynRes2 = isWeredevWrapper(current)
+          ? await dynamicDecode(current)
+          : await tryDynamicExecution(current);
         results.push({ step: `動的実行 (${round}回目)`, ...dynRes2 });
         if (dynRes2.success && dynRes2.result && dynRes2.result !== current) current = dynRes2.result;
         else break;
@@ -894,7 +894,9 @@ async function autoDeobfuscate(code) {
         if (res.success && res.result && res.result !== current) { current = res.result; staticChanged = true; }
       }
       if (staticChanged) {
-        const dynRes3 = await dispatchDynamic(current);
+        const dynRes3 = isWeredevWrapper(current)
+          ? await dynamicDecode(current)
+          : await tryDynamicExecution(current);
         results.push({ step: '動的実行 (静的解析後)', ...dynRes3 });
         if (dynRes3.success && dynRes3.result) current = dynRes3.result;
       }
