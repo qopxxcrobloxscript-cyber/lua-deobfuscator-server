@@ -956,53 +956,230 @@ function buildInlineLogHtml() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VMhook Log Viewer</title>
 <style>
-  :root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--text:#c9d1d9;--muted:#8b949e;}
+  /* ── design tokens ─────────────────────────────────────── */
+  :root{
+    --bg:#0d1117;--surface:#161b22;--border:#30363d;
+    --accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;
+    --text:#c9d1d9;--muted:#8b949e;
+  }
+
+  /* ── reset ─────────────────────────────────────────────── */
   *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;display:flex;flex-direction:column;height:100vh;overflow:hidden;}
-  header{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;}
-  header h1{font-size:15px;font-weight:600;color:var(--accent);}
-  .badge{background:#21262d;border:1px solid var(--border);border-radius:12px;padding:2px 10px;font-size:11px;color:var(--muted);}
+
+  /* ── base ──────────────────────────────────────────────── */
+  body{
+    background:var(--bg);color:var(--text);
+    font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;
+    display:flex;flex-direction:column;height:100vh;overflow:hidden;
+  }
+
+  /* ── header ────────────────────────────────────────────── */
+  header{
+    background:var(--surface);border-bottom:1px solid var(--border);
+    padding:8px 14px;
+    display:flex;align-items:center;gap:10px;
+    flex-wrap:wrap;          /* ← モバイルで折り返す */
+    flex-shrink:0;
+  }
+  header h1{font-size:14px;font-weight:600;color:var(--accent);white-space:nowrap;}
+  .badge{
+    background:#21262d;border:1px solid var(--border);
+    border-radius:12px;padding:2px 8px;font-size:10px;color:var(--muted);
+    white-space:nowrap;
+  }
   .badge.live{border-color:var(--green);color:var(--green);}
-  .controls{margin-left:auto;display:flex;gap:8px;align-items:center;}
-  button{background:#21262d;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;}
+
+  /* ── header controls ───────────────────────────────────── */
+  .controls{
+    margin-left:auto;
+    display:flex;gap:6px;align-items:center;
+    flex-wrap:wrap;          /* ← ボタン群を折り返す */
+  }
+  button{
+    background:#21262d;border:1px solid var(--border);
+    color:var(--text);border-radius:6px;
+    padding:4px 10px;cursor:pointer;font-size:11px;
+    white-space:nowrap;
+  }
   button:hover{background:#30363d;}
   button.danger{border-color:var(--red);color:var(--red);}
-  select,input[type=text]{background:#21262d;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 8px;font-size:12px;}
-  .toolbar{background:var(--surface);border-bottom:1px solid var(--border);padding:6px 16px;display:flex;gap:10px;align-items:center;flex-shrink:0;flex-wrap:wrap;}
-  .toolbar label{color:var(--muted);font-size:11px;}
-  main{display:flex;flex:1;overflow:hidden;}
-  #sessions-panel{width:220px;border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;background:var(--surface);}
-  #sessions-panel h2{font-size:11px;color:var(--muted);padding:8px 12px;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.5px;}
-  .session-item{padding:8px 12px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s;}
+  select,input[type=text]{
+    background:#21262d;border:1px solid var(--border);
+    color:var(--text);border-radius:6px;
+    padding:3px 7px;font-size:11px;
+  }
+
+  /* ── toolbar ───────────────────────────────────────────── */
+  .toolbar{
+    background:var(--surface);border-bottom:1px solid var(--border);
+    padding:5px 14px;
+    display:flex;gap:8px;align-items:center;
+    flex-wrap:wrap;          /* ← 小画面で折り返す */
+    flex-shrink:0;
+  }
+  .toolbar label{color:var(--muted);font-size:10px;white-space:nowrap;}
+  .toolbar input[type=text]{width:110px;}
+  .toolbar .refresh-label{margin-left:auto;font-size:10px;color:var(--muted);white-space:nowrap;}
+
+  /* ── main layout ───────────────────────────────────────── */
+  main{display:flex;flex:1;overflow:hidden;min-height:0;}
+
+  /* sessions サイドパネル (デスクトップ: 左固定幅) */
+  #sessions-panel{
+    width:200px;border-right:1px solid var(--border);
+    overflow-y:auto;flex-shrink:0;background:var(--surface);
+  }
+  #sessions-panel h2{
+    font-size:10px;color:var(--muted);
+    padding:7px 10px;border-bottom:1px solid var(--border);
+    text-transform:uppercase;letter-spacing:.5px;
+  }
+  .session-item{
+    padding:7px 10px;border-bottom:1px solid var(--border);
+    cursor:pointer;transition:background .1s;
+  }
   .session-item:hover{background:#21262d;}
   .session-item.active{background:#1f2937;border-left:2px solid var(--accent);}
-  .session-item .sid{font-size:10px;color:var(--muted);font-family:monospace;}
-  .session-item .slabel{font-size:12px;font-weight:500;}
-  .session-item .smeta{font-size:10px;color:var(--muted);margin-top:2px;}
-  #log-panel{flex:1;display:flex;flex-direction:column;overflow:hidden;}
-  #stats-bar{background:#21262d;border-bottom:1px solid var(--border);padding:4px 16px;font-size:11px;color:var(--muted);display:flex;gap:16px;flex-shrink:0;}
+  .session-item .sid{font-size:9px;color:var(--muted);font-family:monospace;}
+  .session-item .slabel{font-size:11px;font-weight:500;}
+  .session-item .smeta{font-size:9px;color:var(--muted);margin-top:2px;}
+
+  /* log パネル */
+  #log-panel{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0;}
+
+  /* stats bar */
+  #stats-bar{
+    background:#21262d;border-bottom:1px solid var(--border);
+    padding:3px 12px;font-size:10px;color:var(--muted);
+    display:flex;gap:12px;flex-wrap:wrap;flex-shrink:0;
+  }
   #stats-bar span{color:var(--text);}
-  #log-table-wrap{flex:1;overflow:auto;}
-  table{width:100%;border-collapse:collapse;font-family:'Cascadia Code',monospace;font-size:12px;}
-  thead th{background:var(--surface);border-bottom:1px solid var(--border);padding:5px 10px;text-align:left;color:var(--muted);font-size:11px;position:sticky;top:0;z-index:1;white-space:nowrap;}
+
+  /* ── テーブルラッパー: overflow-x:auto で横スクロール対応 ── */
+  #log-table-wrap{
+    flex:1;
+    overflow-x:auto;   /* ← 横スクロール */
+    overflow-y:auto;
+    -webkit-overflow-scrolling:touch;
+  }
+
+  table{
+    width:100%;border-collapse:collapse;
+    font-family:'Cascadia Code',monospace;font-size:11px;
+    min-width:640px;  /* ← 最小幅を確保して横スクロール発動 */
+  }
+  thead th{
+    background:var(--surface);border-bottom:1px solid var(--border);
+    padding:4px 8px;text-align:left;color:var(--muted);
+    font-size:10px;position:sticky;top:0;z-index:1;white-space:nowrap;
+  }
   tbody tr{border-bottom:1px solid #21262d;}
   tbody tr:hover{background:#161b22;}
-  td{padding:3px 10px;vertical-align:top;white-space:nowrap;}
-  td.regs{white-space:pre-wrap;font-size:11px;color:var(--muted);max-width:340px;overflow:hidden;text-overflow:ellipsis;}
-  .op-badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;}
-  .cat-MOVE{background:#1f3a5f;color:#79c0ff;}
-  .cat-CALL{background:#3a1f5f;color:#d2a8ff;}
-  .cat-ARITH{background:#1a3a2a;color:#56d364;}
-  .cat-CONST{background:#3a2a1a;color:#e3b341;}
-  .cat-JUMP{background:#3a1a1a;color:#ff7b72;}
-  .cat-LOAD,.cat-STORE{background:#1a2f3a;color:#58a6ff;}
+  td{padding:2px 8px;vertical-align:top;white-space:nowrap;}
+  td.regs{
+    white-space:pre-wrap;font-size:10px;color:var(--muted);
+    max-width:260px;overflow:hidden;text-overflow:ellipsis;
+  }
+
+  /* opcode バッジ */
+  .op-badge{
+    display:inline-block;padding:1px 5px;
+    border-radius:4px;font-size:10px;font-weight:600;
+  }
+  .cat-MOVE  {background:#1f3a5f;color:#79c0ff;}
+  .cat-CALL  {background:#3a1f5f;color:#d2a8ff;}
+  .cat-ARITH {background:#1a3a2a;color:#56d364;}
+  .cat-CONST {background:#3a2a1a;color:#e3b341;}
+  .cat-JUMP  {background:#3a1a1a;color:#ff7b72;}
+  .cat-LOAD,
+  .cat-STORE {background:#1a2f3a;color:#58a6ff;}
   .cat-RETURN{background:#2a1a3a;color:#a5a0ff;}
-  .cat-LOOP{background:#1a3a3a;color:#39d353;}
+  .cat-LOOP  {background:#1a3a3a;color:#39d353;}
   .cat-UNKNOWN{background:#21262d;color:var(--muted);}
   .pc-num{color:var(--muted);}
   .reg-val{color:#56d364;}
-  #empty-msg{text-align:center;padding:60px;color:var(--muted);}
-  #empty-msg p{margin-top:8px;font-size:12px;}
+
+  /* empty state */
+  #empty-msg{text-align:center;padding:48px 20px;color:var(--muted);}
+  #empty-msg .icon{font-size:28px;}
+  #empty-msg p{margin-top:8px;font-size:11px;line-height:1.6;}
+  #empty-msg code{
+    background:#21262d;border-radius:4px;
+    padding:1px 5px;font-size:10px;color:var(--accent);
+  }
+
+  /* ════════════════════════════════════════════════════════
+     @media (max-width: 768px)  — 縦1カラム レスポンシブ
+  ═════════════════════════════════════════════════════════ */
+  @media (max-width: 768px) {
+    /* フォント・パディング縮小 */
+    body{font-size:11px;}
+
+    /* header: 2行に折り返す, h1小さく */
+    header{padding:6px 10px;gap:6px;}
+    header h1{font-size:12px;}
+    .badge{font-size:9px;padding:1px 6px;}
+    .controls{margin-left:0;width:100%;justify-content:flex-start;}
+    button{padding:3px 8px;font-size:10px;}
+
+    /* toolbar: 全アイテムを折り返す */
+    .toolbar{padding:4px 10px;gap:6px;}
+    .toolbar input[type=text]{width:90px;}
+    .toolbar .refresh-label{margin-left:0;width:100%;}
+
+    /* main: 縦1カラム化 */
+    main{flex-direction:column;}
+
+    /* sessions-panel: 上部に横長で表示 */
+    #sessions-panel{
+      width:100%;
+      height:auto;
+      max-height:140px;      /* 折りたたみ高さ上限 */
+      border-right:none;
+      border-bottom:1px solid var(--border);
+      overflow-x:auto;
+      overflow-y:auto;
+      display:flex;
+      flex-direction:row;    /* セッションカードを横並び */
+      flex-wrap:nowrap;
+      -webkit-overflow-scrolling:touch;
+    }
+    #sessions-panel h2{
+      writing-mode:vertical-rl;
+      text-orientation:mixed;
+      padding:8px 4px;
+      white-space:nowrap;
+      border-bottom:none;
+      border-right:1px solid var(--border);
+      flex-shrink:0;
+    }
+    #sessions-list{
+      display:flex;flex-direction:row;flex-wrap:nowrap;
+    }
+    .session-item{
+      min-width:130px;max-width:160px;
+      border-bottom:none;border-right:1px solid var(--border);
+      padding:6px 8px;
+    }
+    .session-item .sid{font-size:8px;}
+    .session-item .slabel{font-size:10px;}
+    .session-item .smeta{font-size:8px;}
+
+    /* stats bar: 折り返し */
+    #stats-bar{padding:3px 10px;gap:8px;font-size:9px;}
+
+    /* テーブル: overflow-x scrollは継承 (640px min-width維持) */
+    table{font-size:10px;}
+    thead th{padding:3px 6px;font-size:9px;}
+    td{padding:2px 6px;}
+    td.regs{max-width:180px;font-size:9px;}
+    .op-badge{font-size:9px;padding:1px 4px;}
+
+    /* empty msg */
+    #empty-msg{padding:32px 16px;}
+    #empty-msg .icon{font-size:22px;}
+    #empty-msg p{font-size:10px;}
+  }
 </style>
 </head>
 <body>
@@ -1019,7 +1196,7 @@ function buildInlineLogHtml() {
 </header>
 <div class="toolbar">
   <label>Filter opcode:</label>
-  <input type="text" id="filter-op" placeholder="CALL, MOVE, ..." style="width:140px" oninput="applyFilter()">
+  <input type="text" id="filter-op" placeholder="CALL, MOVE, ..." oninput="applyFilter()">
   <label>Type:</label>
   <select id="filter-type" onchange="applyFilter()">
     <option value="all">All</option>
@@ -1033,12 +1210,12 @@ function buildInlineLogHtml() {
     <option value="1000">1000</option>
     <option value="5000">5000</option>
   </select>
-  <label style="margin-left:auto;font-size:11px;color:var(--muted)">Auto-refresh: <span id="next-tick">3s</span></label>
+  <span class="refresh-label">Auto-refresh: <span id="next-tick">3s</span></span>
 </div>
 <main>
   <div id="sessions-panel">
     <h2>Sessions</h2>
-    <div id="sessions-list"><div style="padding:12px;color:var(--muted);font-size:11px;">No sessions yet</div></div>
+    <div id="sessions-list"><div style="padding:10px;color:var(--muted);font-size:10px;">No sessions yet</div></div>
   </div>
   <div id="log-panel">
     <div id="stats-bar">
@@ -1046,18 +1223,18 @@ function buildInlineLogHtml() {
       <div>Shown: <span id="s-shown">0</span></div>
       <div>Sessions: <span id="s-sess">0</span></div>
       <div>Last PC: <span id="s-pc">—</span></div>
-      <div>Last opcode: <span id="s-op">—</span></div>
+      <div>Last op: <span id="s-op">—</span></div>
     </div>
     <div id="log-table-wrap">
       <div id="empty-msg">
-        <div style="font-size:32px">📭</div>
+        <div class="icon">📭</div>
         <p>VMhook ログがまだありません。</p>
-        <p>解読 API (<code>/api/deobfuscate</code>) を実行すると opcode ログがここに表示されます。</p>
+        <p>解読 API <code>/api/deobfuscate</code> を実行すると<br>opcode ログがここに表示されます。</p>
       </div>
       <table id="log-table" style="display:none">
         <thead>
           <tr>
-            <th>#</th><th>PC</th><th>Opcode</th><th>opName</th>
+            <th>#</th><th>PC</th><th>Op</th><th>opName</th>
             <th>A</th><th>B</th><th>C</th>
             <th>Registers (before)</th><th>Time</th>
           </tr>
