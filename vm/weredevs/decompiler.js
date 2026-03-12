@@ -107,75 +107,87 @@ function executeTrace(vmTraceEntries, opcodeMap, constPool) {
     // ── opcode 実行直前に global.recordOpcodeLog() を呼び出す ──────────
     // server.js が global.recordOpcodeLog を登録していれば記録される。
     // 未登録でも安全に無視する。
-    if (typeof global.recordOpcodeLog === 'function') {
-      global.recordOpcodeLog({
-        pc,
-        opcode:    op,
-        opName,
-        A,
-        B,
-        C,
-        registers: { ...regs },   // 実行直前のレジスタスナップショット
-      });
+    try {
+      // ── opcode 実行直前に global.recordOpcodeLog() を呼び出す ──
+      if (typeof global.recordOpcodeLog === 'function') {
+        global.recordOpcodeLog({
+          pc,
+          opcode:    op,
+          opName,
+          A,
+          B,
+          C,
+          registers: { ...regs },   // 実行直前のレジスタスナップショット
+        });
+      }
+
+      let logLine = `[${pc}] ${opName}`;
+
+      switch (opName) {
+        case 'MOVE':
+          regs[A] = regs[B] !== undefined ? regs[B] : `v${B}`;
+          logLine += ` v${A} = v${B}  -- ${JSON.stringify(regs[A]).substring(0,40)}`;
+          break;
+        case 'LOADK':
+          regs[A] = resolveConst(B);
+          logLine += ` v${A} = ${regs[A]}`;
+          break;
+        case 'LOADBOOL':
+          regs[A] = B ? true : false;
+          logLine += ` v${A} = ${regs[A]}`;
+          break;
+        case 'LOADNIL':
+          for (let r = A; r <= B; r++) regs[r] = null;
+          logLine += ` v${A}..v${B} = nil`;
+          break;
+        case 'GETGLOBAL':
+          regs[A] = `_G[${resolveConst(B)}]`;
+          logLine += ` v${A} = _G[${resolveConst(B)}]`;
+          break;
+        case 'SETGLOBAL':
+          logLine += ` _G[${resolveConst(B)}] = v${A} (${JSON.stringify(regs[A]).substring(0,30)})`;
+          break;
+        case 'GETTABLE':
+          regs[A] = `${regs[B] || `v${B}`}[${resolveConst(C)}]`;
+          logLine += ` v${A} = ${regs[A]}`;
+          break;
+        case 'SETTABLE':
+          logLine += ` v${A}[${resolveConst(B)}] = ${regs[C] || `v${C}`}`;
+          break;
+        case 'NEWTABLE':
+          regs[A] = {};
+          logLine += ` v${A} = {}`;
+          break;
+        case 'ADD':  regs[A] = `(${resolveConst(B)}) + (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
+        case 'SUB':  regs[A] = `(${resolveConst(B)}) - (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
+        case 'MUL':  regs[A] = `(${resolveConst(B)}) * (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
+        case 'DIV':  regs[A] = `(${resolveConst(B)}) / (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
+        case 'CALL':
+          stack.push({ fn: regs[A] || `v${A}`, args: A, nargs: (B||1)-1, nret: (C||1)-1, pc });
+          logLine += ` ${regs[A] || `v${A}`}(${Array.from({length:(B||1)-1}, (_,j) => regs[A+1+j] || `v${A+1+j}`).join(', ')})`;
+          break;
+        case 'RETURN':
+          logLine += ` return ${A ? Array.from({length:Math.max(1,(B||1)-1)}, (_,j) => regs[(A||0)+j] || `v${(A||0)+j}`).join(', ') : ''}`;
+          break;
+        case 'JMP':
+          logLine += ` goto ${pc + 1 + (B||0)}`;
+          break;
+        default:
+          logLine += ` A=${A} B=${B} C=${C}`;
+      }
+
+      pseudoLog.push(logLine);
+      regHistory.push({ pc, op: opName, snapshot: { ...regs } });
+
+    } catch (err) {
+      // opcode 処理中に発生したエラーを記録して次の命令へ継続
+      console.log(
+        `[executeTrace] error at pc=${pc} opcode=${op} opName=${opName}:`,
+        err.message
+      );
+      // エラーが起きた命令もログには残す（デバッグ用）
+      pseudoLog.push(`[${pc}] ${opName} -- ERROR: ${err.message}`);
     }
-
-    let logLine = `[${pc}] ${opName}`;
-
-    switch (opName) {
-      case 'MOVE':
-        regs[A] = regs[B] !== undefined ? regs[B] : `v${B}`;
-        logLine += ` v${A} = v${B}  -- ${JSON.stringify(regs[A]).substring(0,40)}`;
-        break;
-      case 'LOADK':
-        regs[A] = resolveConst(B);
-        logLine += ` v${A} = ${regs[A]}`;
-        break;
-      case 'LOADBOOL':
-        regs[A] = B ? true : false;
-        logLine += ` v${A} = ${regs[A]}`;
-        break;
-      case 'LOADNIL':
-        for (let r = A; r <= B; r++) regs[r] = null;
-        logLine += ` v${A}..v${B} = nil`;
-        break;
-      case 'GETGLOBAL':
-        regs[A] = `_G[${resolveConst(B)}]`;
-        logLine += ` v${A} = _G[${resolveConst(B)}]`;
-        break;
-      case 'SETGLOBAL':
-        logLine += ` _G[${resolveConst(B)}] = v${A} (${JSON.stringify(regs[A]).substring(0,30)})`;
-        break;
-      case 'GETTABLE':
-        regs[A] = `${regs[B] || `v${B}`}[${resolveConst(C)}]`;
-        logLine += ` v${A} = ${regs[A]}`;
-        break;
-      case 'SETTABLE':
-        logLine += ` v${A}[${resolveConst(B)}] = ${regs[C] || `v${C}`}`;
-        break;
-      case 'NEWTABLE':
-        regs[A] = {};
-        logLine += ` v${A} = {}`;
-        break;
-      case 'ADD':  regs[A] = `(${resolveConst(B)}) + (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
-      case 'SUB':  regs[A] = `(${resolveConst(B)}) - (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
-      case 'MUL':  regs[A] = `(${resolveConst(B)}) * (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
-      case 'DIV':  regs[A] = `(${resolveConst(B)}) / (${resolveConst(C)})`; logLine += ` v${A} = ${regs[A]}`; break;
-      case 'CALL':
-        stack.push({ fn: regs[A] || `v${A}`, args: A, nargs: (B||1)-1, nret: (C||1)-1, pc });
-        logLine += ` ${regs[A] || `v${A}`}(${Array.from({length:(B||1)-1}, (_,j) => regs[A+1+j] || `v${A+1+j}`).join(', ')})`;
-        break;
-      case 'RETURN':
-        logLine += ` return ${A ? Array.from({length:Math.max(1,(B||1)-1)}, (_,j) => regs[(A||0)+j] || `v${(A||0)+j}`).join(', ') : ''}`;
-        break;
-      case 'JMP':
-        logLine += ` goto ${pc + 1 + (B||0)}`;
-        break;
-      default:
-        logLine += ` A=${A} B=${B} C=${C}`;
-    }
-
-    pseudoLog.push(logLine);
-    regHistory.push({ pc, op: opName, snapshot: { ...regs } });
   }
 
   const truncated = vmTraceEntries.length > maxIter;
