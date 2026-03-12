@@ -104,6 +104,21 @@ function executeTrace(vmTraceEntries, opcodeMap, constPool) {
     const pc     = e.pc !== undefined ? e.pc : (e.ip || i);
     const opName = resolve(op);
 
+    // ── opcode 実行直前に global.recordOpcodeLog() を呼び出す ──────────
+    // server.js が global.recordOpcodeLog を登録していれば記録される。
+    // 未登録でも安全に無視する。
+    if (typeof global.recordOpcodeLog === 'function') {
+      global.recordOpcodeLog({
+        pc,
+        opcode:    op,
+        opName,
+        A,
+        B,
+        C,
+        registers: { ...regs },   // 実行直前のレジスタスナップショット
+      });
+    }
+
     let logLine = `[${pc}] ${opName}`;
 
     switch (opName) {
