@@ -69,19 +69,79 @@ const tempDir = path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
 // ════════════════════════════════════════════════════════
-//  VMhook ログ グローバルストア
-//  dynamicDecode 実行時に push → GET /vmhook-logs で参照
+//  VMhook ログ グローバルストア  (別 Render サービス不要・同一プロセス完結)
+//
+//  構造:
+//    global.vmLogs      — セッション横断の全 opcode ログ配列
+//    global.vmSessions  — { sessionId → { logs[], meta{} } }
+//    global.recordOpcodeLog(entry) — decompiler.js から呼ばれるフック
 // ════════════════════════════════════════════════════════
-global.vmLogs = [];
-const VM_LOGS_MAX = 500; // メモリ溢れ防止: 最大保持件数
+global.vmLogs     = [];          // フラットなログ全体 (最新 VM_LOGS_MAX 件)
+global.vmSessions = {};          // セッション別ログ
 
-// ヘルパー: logEntry を global.vmLogs に安全に追記
+const VM_LOGS_MAX      = 5000;   // フラット配列の上限
+const VM_SESSION_MAX   = 50;     // セッション保持数の上限
+const VM_SESSION_LOG_MAX = 2000; // 1セッションあたりのログ上限
+
+// ── 現在アクティブなセッション ID (executeTrace 呼び出し単位で切り替わる) ──
+let _currentSessionId = null;
+
+// ── グローバルフック: decompiler.js の executeTrace ループ内から呼ばれる ──
+// opcode 実行直前に { pc, opcode, opName, A, B, C, registers } が渡される
+global.recordOpcodeLog = function recordOpcodeLog(entry) {
+  const record = { ...entry, _ts: Date.now(), _sid: _currentSessionId };
+
+  // フラット配列に追記
+  global.vmLogs.push(record);
+  if (global.vmLogs.length > VM_LOGS_MAX) {
+    global.vmLogs = global.vmLogs.slice(-VM_LOGS_MAX);
+  }
+
+  // セッション別配列に追記
+  if (_currentSessionId && global.vmSessions[_currentSessionId]) {
+    const sess = global.vmSessions[_currentSessionId];
+    sess.logs.push(record);
+    if (sess.logs.length > VM_SESSION_LOG_MAX) {
+      sess.logs = sess.logs.slice(-VM_SESSION_LOG_MAX);
+    }
+    sess.meta.lastPc     = entry.pc;
+    sess.meta.logCount   = sess.logs.length;
+    sess.meta.updatedAt  = record._ts;
+  }
+};
+
+// ── セッション開始 (dynamicDecode / tryDynamicExecution の冒頭で呼ぶ) ──
+function beginVmSession(label) {
+  const sid = `${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+  _currentSessionId = sid;
+  global.vmSessions[sid] = {
+    id:   sid,
+    label: label || 'unnamed',
+    logs:  [],
+    meta:  { startedAt: Date.now(), logCount: 0, lastPc: null, updatedAt: null },
+  };
+  // 古いセッションを削除
+  const keys = Object.keys(global.vmSessions);
+  if (keys.length > VM_SESSION_MAX) {
+    const oldest = keys.slice(0, keys.length - VM_SESSION_MAX);
+    oldest.forEach(k => delete global.vmSessions[k]);
+  }
+  return sid;
+}
+
+// ── セッション終了 ────────────────────────────────────────────────────────
+function endVmSession(sid, result) {
+  if (sid && global.vmSessions[sid]) {
+    global.vmSessions[sid].meta.endedAt  = Date.now();
+    global.vmSessions[sid].meta.success  = result && result.success;
+    global.vmSessions[sid].meta.method   = result && result.method;
+  }
+  _currentSessionId = null;
+}
+
+// ── pushVmLog: 旧来の高レベルログ (traceCount / method 単位) ────────────
 function pushVmLog(logEntry) {
-  global.vmLogs.push({
-    ...logEntry,
-    _ts: Date.now(),
-  });
-  // 上限超えたら古いものを捨てる
+  global.vmLogs.push({ ...logEntry, _ts: Date.now(), _type: 'session_summary' });
   if (global.vmLogs.length > VM_LOGS_MAX) {
     global.vmLogs = global.vmLogs.slice(-VM_LOGS_MAX);
   }
@@ -169,34 +229,98 @@ app.get('/api/status', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════
-//  GET /vmhook-logs  — VMhook 実行ログ取得
+//  GET /vmhook-logs  — VMhook opcode ログ一覧
 //
 //  クエリパラメータ:
-//    limit  : 取得件数上限 (デフォルト 100, 最大 500)
-//    since  : このタイムスタンプ (ms) 以降のエントリのみ返す
-//    method : "dynamic_decode" などでフィルタ
-//    clear  : "1" を渡すと取得後に global.vmLogs をリセット
+//    limit   : 取得件数上限 (デフォルト 200, 最大 5000)
+//    since   : _ts がこの値(ms)以降のエントリのみ
+//    opcode  : opName でフィルタ (例: "CALL")
+//    sid     : セッション ID でフィルタ
+//    clear   : "1" → 取得後に global.vmLogs をリセット
+//    type    : "opcode" | "summary" | "all" (デフォルト: all)
 // ════════════════════════════════════════════════════════
 app.get('/vmhook-logs', (req, res) => {
-  const limit  = Math.min(parseInt(req.query.limit  || '100'), VM_LOGS_MAX);
+  const limit  = Math.min(parseInt(req.query.limit  || '200'), VM_LOGS_MAX);
   const since  = parseInt(req.query.since  || '0');
-  const method = req.query.method || null;
-  const clear  = req.query.clear === '1';
+  const opcode = req.query.opcode || null;
+  const sid    = req.query.sid    || null;
+  const type   = req.query.type   || 'all';
+  const clear  = req.query.clear  === '1';
 
-  let logs = global.vmLogs;
+  let logs = [...global.vmLogs];
 
-  if (since > 0)  logs = logs.filter(e => e._ts >= since);
-  if (method)     logs = logs.filter(e => e.method === method);
+  if (since  > 0)           logs = logs.filter(e => e._ts >= since);
+  if (opcode)               logs = logs.filter(e => e.opName === opcode || String(e.opcode) === opcode);
+  if (sid)                  logs = logs.filter(e => e._sid  === sid);
+  if (type === 'opcode')    logs = logs.filter(e => e._type !== 'session_summary');
+  if (type === 'summary')   logs = logs.filter(e => e._type === 'session_summary');
   logs = logs.slice(-limit);
 
-  if (clear) global.vmLogs = [];
+  const totalBefore = global.vmLogs.length;
+  if (clear) { global.vmLogs = []; global.vmSessions = {}; }
 
   res.json({
-    success: true,
-    count:   logs.length,
-    total:   global.vmLogs.length,
+    success:  true,
+    count:    logs.length,
+    total:    totalBefore,
+    sessions: Object.keys(global.vmSessions).length,
     logs,
   });
+});
+
+// ════════════════════════════════════════════════════════
+//  GET /vmhook-logs/sessions  — セッション一覧
+// ════════════════════════════════════════════════════════
+app.get('/vmhook-logs/sessions', (req, res) => {
+  const sessions = Object.values(global.vmSessions).map(s => ({
+    id:       s.id,
+    label:    s.label,
+    logCount: s.meta.logCount,
+    startedAt: s.meta.startedAt,
+    endedAt:   s.meta.endedAt || null,
+    success:   s.meta.success,
+    method:    s.meta.method,
+  })).reverse();   // 新しい順
+  res.json({ success: true, count: sessions.length, sessions });
+});
+
+// ════════════════════════════════════════════════════════
+//  GET /vmhook-logs/session/:sid  — セッション別詳細ログ
+//
+//  クエリパラメータ:
+//    limit  : ログ件数上限 (デフォルト 500)
+//    offset : 先頭スキップ数
+// ════════════════════════════════════════════════════════
+app.get('/vmhook-logs/session/:sid', (req, res) => {
+  const sess = global.vmSessions[req.params.sid];
+  if (!sess) return res.status(404).json({ success: false, error: 'セッションが見つかりません' });
+
+  const limit  = Math.min(parseInt(req.query.limit  || '500'), VM_SESSION_LOG_MAX);
+  const offset = parseInt(req.query.offset || '0');
+  const logs   = sess.logs.slice(offset, offset + limit);
+
+  res.json({
+    success:  true,
+    id:       sess.id,
+    label:    sess.label,
+    meta:     sess.meta,
+    count:    logs.length,
+    total:    sess.logs.length,
+    logs,
+  });
+});
+
+// ════════════════════════════════════════════════════════
+//  GET /log  — VMhook ログビューア (log.html を同一サーバーで配信)
+// ════════════════════════════════════════════════════════
+app.get('/log', (req, res) => {
+  const logHtmlPath = path.join(__dirname, 'public', 'log.html');
+  if (fs.existsSync(logHtmlPath)) {
+    return res.sendFile(logHtmlPath);
+  }
+  // public/log.html が存在しない場合はインライン HTML を返す
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(buildInlineLogHtml());
 });
 
 // ════════════════════════════════════════════════════════
@@ -377,6 +501,9 @@ async function dynamicDecode(code) {
   if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic_decode' };
   if (filtered.removed.length > 0) console.log('[DynDec] 危険関数除去:', filtered.removed.join(', '));
 
+  // セッション開始
+  const sid = beginVmSession('dynamic_decode');
+
   const preamble = safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
 
   let codeToRun = filtered.code;
@@ -522,21 +649,23 @@ end
       }
 
       if (decoded.best && decoded.best.length >= 10) {
-        return resolve({
-          success: true, result: decoded.best,
-          allDecoded: decoded.all.map(d => d.code),
-          decodedCount: decoded.all.length,
-          method: 'dynamic_decode',
-          vmAnalysis: (vmTrace.length > 0 || wereDevDetected) ? vmAnalysis : undefined,
-        });
+        const finalResult = { success: true, result: decoded.best, allDecoded: decoded.all.map(d => d.code), decodedCount: decoded.all.length, method: 'dynamic_decode', vmAnalysis: (vmTrace.length > 0 || wereDevDetected) ? vmAnalysis : undefined, _sid: sid };
+        endVmSession(sid, finalResult);
+        return resolve(finalResult);
       }
       if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
         const pseudoCode = vmAnalysis.reconstruction.pseudoCode || '';
-        if (pseudoCode.length >= 10)
-          return resolve({ success: true, result: pseudoCode, method: 'dynamic_decode_vm', vmAnalysis, WereDevVMDetected: true });
+        if (pseudoCode.length >= 10) {
+          const finalResult = { success: true, result: pseudoCode, method: 'dynamic_decode_vm', vmAnalysis, WereDevVMDetected: true, _sid: sid };
+          endVmSession(sid, finalResult);
+          return resolve(finalResult);
+        }
       }
-      if (wereDevDetected && vmAnalysis.weredevDecompiled && vmAnalysis.weredevDecompiled.length >= 50)
-        return resolve({ success: true, result: vmAnalysis.weredevDecompiled, method: 'weredev_decompile', vmAnalysis, WereDevVMDetected: true });
+      if (wereDevDetected && vmAnalysis.weredevDecompiled && vmAnalysis.weredevDecompiled.length >= 50) {
+        const finalResult = { success: true, result: vmAnalysis.weredevDecompiled, method: 'weredev_decompile', vmAnalysis, WereDevVMDetected: true, _sid: sid };
+        endVmSession(sid, finalResult);
+        return resolve(finalResult);
+      }
 
       let errMsg = '';
       if (stdout && stdout.indexOf('__EXEC_ERROR__:') !== -1) {
@@ -547,12 +676,9 @@ end
         errMsg = stderr.substring(0, 300);
       }
 
-      resolve({
-        success: false,
-        error: errMsg || 'loadstringが呼ばれませんでした',
-        method: 'dynamic_decode',
-        vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
-      });
+      const failResult = { success: false, error: errMsg || 'loadstringが呼ばれませんでした', method: 'dynamic_decode', vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined, _sid: sid };
+      endVmSession(sid, failResult);
+      resolve(failResult);
     });
   });
 }
@@ -564,6 +690,7 @@ async function tryDynamicExecution(code) {
   const luaBin = checkLuaAvailable();
   if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic' };
 
+  const sid = beginVmSession('try_dynamic');
   const tempFile = path.join(tempDir, `obf_${makeTempId()}.lua`);
   const safeCode = code.replace(/\]\]/g, '] ]');
 
@@ -643,27 +770,32 @@ end
         const captured = stdout.substring(start, end).trim();
         if (captured && captured.length > 5) {
           const diffRatio = Math.abs(captured.length - code.length) / Math.max(code.length, 1);
-          if (diffRatio <= 0.05 && captured === code.trim())
-            return resolve({ success: false, error: 'capturedが元コードと同一のため停止', method: 'dynamic' });
+          if (diffRatio <= 0.05 && captured === code.trim()) {
+            const r = { success: false, error: 'capturedが元コードと同一のため停止', method: 'dynamic', _sid: sid };
+            endVmSession(sid, r); return resolve(r);
+          }
           const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
           const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
-          // ── VMhook ログ記録 ─────────────────────────────────────────
-          pushVmLog({ method: 'dynamic', success: true, layers, capturedLength: captured.length });
-          return resolve({ success: true, result: captured, layers, method: 'dynamic' });
+          pushVmLog({ method: 'dynamic', success: true, layers, capturedLength: captured.length, _sid: sid });
+          const r = { success: true, result: captured, layers, method: 'dynamic', _sid: sid };
+          endVmSession(sid, r); return resolve(r);
         }
       }
       if (stdout.includes('__ERROR__:')) {
         const errMsg = (stdout.split('__ERROR__:')[1] || '').substring(0, 300);
-        pushVmLog({ method: 'dynamic', success: false, error: errMsg });
-        return resolve({ success: false, error: 'Luaエラー: ' + errMsg, method: 'dynamic' });
+        pushVmLog({ method: 'dynamic', success: false, error: errMsg, _sid: sid });
+        const r = { success: false, error: 'Luaエラー: ' + errMsg, method: 'dynamic', _sid: sid };
+        endVmSession(sid, r); return resolve(r);
       }
       if (error && stderr) {
-        pushVmLog({ method: 'dynamic', success: false, error: stderr.substring(0, 300) });
-        return resolve({ success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic' });
+        pushVmLog({ method: 'dynamic', success: false, error: stderr.substring(0, 300), _sid: sid });
+        const r = { success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic', _sid: sid };
+        endVmSession(sid, r); return resolve(r);
       }
 
-      pushVmLog({ method: 'dynamic', success: false, error: 'no_capture' });
-      resolve({ success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic' });
+      pushVmLog({ method: 'dynamic', success: false, error: 'no_capture', _sid: sid });
+      const r = { success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic', _sid: sid };
+      endVmSession(sid, r); resolve(r);
     });
   });
 }
@@ -813,6 +945,268 @@ function obfuscateWithCustomVM(code, options = {}) {
 }
 
 // ════════════════════════════════════════════════════════
+//  buildInlineLogHtml — public/log.html が無い場合のフォールバック
+//  同一オリジンの /vmhook-logs を fetch してリアルタイム表示する
+// ════════════════════════════════════════════════════════
+function buildInlineLogHtml() {
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VMhook Log Viewer</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--text:#c9d1d9;--muted:#8b949e;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;display:flex;flex-direction:column;height:100vh;overflow:hidden;}
+  header{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;}
+  header h1{font-size:15px;font-weight:600;color:var(--accent);}
+  .badge{background:#21262d;border:1px solid var(--border);border-radius:12px;padding:2px 10px;font-size:11px;color:var(--muted);}
+  .badge.live{border-color:var(--green);color:var(--green);}
+  .controls{margin-left:auto;display:flex;gap:8px;align-items:center;}
+  button{background:#21262d;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;}
+  button:hover{background:#30363d;}
+  button.danger{border-color:var(--red);color:var(--red);}
+  select,input[type=text]{background:#21262d;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 8px;font-size:12px;}
+  .toolbar{background:var(--surface);border-bottom:1px solid var(--border);padding:6px 16px;display:flex;gap:10px;align-items:center;flex-shrink:0;flex-wrap:wrap;}
+  .toolbar label{color:var(--muted);font-size:11px;}
+  main{display:flex;flex:1;overflow:hidden;}
+  #sessions-panel{width:220px;border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;background:var(--surface);}
+  #sessions-panel h2{font-size:11px;color:var(--muted);padding:8px 12px;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.5px;}
+  .session-item{padding:8px 12px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s;}
+  .session-item:hover{background:#21262d;}
+  .session-item.active{background:#1f2937;border-left:2px solid var(--accent);}
+  .session-item .sid{font-size:10px;color:var(--muted);font-family:monospace;}
+  .session-item .slabel{font-size:12px;font-weight:500;}
+  .session-item .smeta{font-size:10px;color:var(--muted);margin-top:2px;}
+  #log-panel{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+  #stats-bar{background:#21262d;border-bottom:1px solid var(--border);padding:4px 16px;font-size:11px;color:var(--muted);display:flex;gap:16px;flex-shrink:0;}
+  #stats-bar span{color:var(--text);}
+  #log-table-wrap{flex:1;overflow:auto;}
+  table{width:100%;border-collapse:collapse;font-family:'Cascadia Code',monospace;font-size:12px;}
+  thead th{background:var(--surface);border-bottom:1px solid var(--border);padding:5px 10px;text-align:left;color:var(--muted);font-size:11px;position:sticky;top:0;z-index:1;white-space:nowrap;}
+  tbody tr{border-bottom:1px solid #21262d;}
+  tbody tr:hover{background:#161b22;}
+  td{padding:3px 10px;vertical-align:top;white-space:nowrap;}
+  td.regs{white-space:pre-wrap;font-size:11px;color:var(--muted);max-width:340px;overflow:hidden;text-overflow:ellipsis;}
+  .op-badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;}
+  .cat-MOVE{background:#1f3a5f;color:#79c0ff;}
+  .cat-CALL{background:#3a1f5f;color:#d2a8ff;}
+  .cat-ARITH{background:#1a3a2a;color:#56d364;}
+  .cat-CONST{background:#3a2a1a;color:#e3b341;}
+  .cat-JUMP{background:#3a1a1a;color:#ff7b72;}
+  .cat-LOAD,.cat-STORE{background:#1a2f3a;color:#58a6ff;}
+  .cat-RETURN{background:#2a1a3a;color:#a5a0ff;}
+  .cat-LOOP{background:#1a3a3a;color:#39d353;}
+  .cat-UNKNOWN{background:#21262d;color:var(--muted);}
+  .pc-num{color:var(--muted);}
+  .reg-val{color:#56d364;}
+  #empty-msg{text-align:center;padding:60px;color:var(--muted);}
+  #empty-msg p{margin-top:8px;font-size:12px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ VMhook Log Viewer</h1>
+  <span class="badge live" id="live-badge">● LIVE</span>
+  <span class="badge" id="total-badge">0 entries</span>
+  <span class="badge" id="sess-badge">0 sessions</span>
+  <div class="controls">
+    <button onclick="clearLogs()" class="danger">🗑 Clear</button>
+    <button onclick="togglePause()" id="pause-btn">⏸ Pause</button>
+    <button onclick="exportJson()">⬇ Export JSON</button>
+  </div>
+</header>
+<div class="toolbar">
+  <label>Filter opcode:</label>
+  <input type="text" id="filter-op" placeholder="CALL, MOVE, ..." style="width:140px" oninput="applyFilter()">
+  <label>Type:</label>
+  <select id="filter-type" onchange="applyFilter()">
+    <option value="all">All</option>
+    <option value="opcode">Opcode only</option>
+    <option value="summary">Session summary</option>
+  </select>
+  <label>Limit:</label>
+  <select id="filter-limit" onchange="fetchLogs()">
+    <option value="200">200</option>
+    <option value="500">500</option>
+    <option value="1000">1000</option>
+    <option value="5000">5000</option>
+  </select>
+  <label style="margin-left:auto;font-size:11px;color:var(--muted)">Auto-refresh: <span id="next-tick">3s</span></label>
+</div>
+<main>
+  <div id="sessions-panel">
+    <h2>Sessions</h2>
+    <div id="sessions-list"><div style="padding:12px;color:var(--muted);font-size:11px;">No sessions yet</div></div>
+  </div>
+  <div id="log-panel">
+    <div id="stats-bar">
+      <div>Total: <span id="s-total">0</span></div>
+      <div>Shown: <span id="s-shown">0</span></div>
+      <div>Sessions: <span id="s-sess">0</span></div>
+      <div>Last PC: <span id="s-pc">—</span></div>
+      <div>Last opcode: <span id="s-op">—</span></div>
+    </div>
+    <div id="log-table-wrap">
+      <div id="empty-msg">
+        <div style="font-size:32px">📭</div>
+        <p>VMhook ログがまだありません。</p>
+        <p>解読 API (<code>/api/deobfuscate</code>) を実行すると opcode ログがここに表示されます。</p>
+      </div>
+      <table id="log-table" style="display:none">
+        <thead>
+          <tr>
+            <th>#</th><th>PC</th><th>Opcode</th><th>opName</th>
+            <th>A</th><th>B</th><th>C</th>
+            <th>Registers (before)</th><th>Time</th>
+          </tr>
+        </thead>
+        <tbody id="log-body"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+const OPCODE_CATS = {
+  MOVE:'MOVE',LOADK:'CONST',LOADBOOL:'CONST',LOADNIL:'CONST',
+  GETUPVAL:'LOAD',GETGLOBAL:'LOAD',GETTABLE:'LOAD',
+  SETGLOBAL:'STORE',SETUPVAL:'STORE',SETTABLE:'STORE',
+  NEWTABLE:'TABLE',SELF:'TABLE',
+  ADD:'ARITH',SUB:'ARITH',MUL:'ARITH',DIV:'ARITH',MOD:'ARITH',POW:'ARITH',
+  UNM:'ARITH',NOT:'ARITH',LEN:'ARITH',CONCAT:'ARITH',
+  JMP:'JUMP',EQ:'JUMP',LT:'JUMP',LE:'JUMP',TEST:'JUMP',TESTSET:'JUMP',
+  CALL:'CALL',TAILCALL:'CALL',RETURN:'RETURN',
+  FORLOOP:'LOOP',FORPREP:'LOOP',TFORLOOP:'LOOP',
+  SETLIST:'TABLE',CLOSE:'CLOSE',CLOSURE:'CLOSURE',VARARG:'VARARG',
+};
+function getCat(name){return OPCODE_CATS[(name||'').replace(/_inferred|_heuristic/g,'')]||'UNKNOWN';}
+
+let allLogs = [];
+let paused  = false;
+let activeSid = null;
+let countdown = 3;
+
+function fmtTime(ts){if(!ts)return'—';const d=new Date(ts);return d.toTimeString().slice(0,8)+'.'+String(d.getMilliseconds()).padStart(3,'0');}
+function fmtRegs(regs){if(!regs||typeof regs!=='object')return'{}';const entries=Object.entries(regs).slice(0,8);if(entries.length===0)return'{}';return entries.map(([k,v])=>'v'+k+'='+JSON.stringify(v).slice(0,20)).join('  ');}
+
+async function fetchSessions(){
+  try{
+    const r=await fetch('/vmhook-logs/sessions');
+    const d=await r.json();
+    if(!d.success)return;
+    document.getElementById('sess-badge').textContent=d.count+' sessions';
+    document.getElementById('s-sess').textContent=d.count;
+    const list=document.getElementById('sessions-list');
+    if(d.sessions.length===0){list.innerHTML='<div style="padding:12px;color:var(--muted);font-size:11px;">No sessions yet</div>';return;}
+    list.innerHTML=d.sessions.slice(0,20).map(s=>\`
+      <div class="session-item\${s.id===activeSid?' active':''}" onclick="selectSession('\${s.id}')">
+        <div class="slabel">\${s.label||'unnamed'}\${s.success===false?'<span style="color:var(--red)"> ✗</span>':s.success===true?'<span style="color:var(--green)"> ✓</span>':''}</div>
+        <div class="sid">\${s.id.slice(0,24)}</div>
+        <div class="smeta">\${s.logCount} opcodes · \${s.method||''}</div>
+      </div>
+    \`).join('');
+  }catch(e){}
+}
+
+async function selectSession(sid){
+  activeSid=sid;
+  await fetchSessions();
+  await fetchLogs();
+}
+
+async function fetchLogs(){
+  if(paused)return;
+  try{
+    const limit=document.getElementById('filter-limit').value;
+    const type =document.getElementById('filter-type').value;
+    const filterOp=(document.getElementById('filter-op').value||'').trim();
+    let url=\`/vmhook-logs?limit=\${limit}&type=\${type}\`;
+    if(activeSid) url+=\`&sid=\${activeSid}\`;
+    if(filterOp)  url+=\`&opcode=\${encodeURIComponent(filterOp)}\`;
+    const r=await fetch(url);
+    const d=await r.json();
+    if(!d.success)return;
+    allLogs=d.logs;
+    document.getElementById('total-badge').textContent=d.total+' entries';
+    document.getElementById('s-total').textContent=d.total;
+    document.getElementById('s-shown').textContent=d.count;
+    const last=d.logs[d.logs.length-1];
+    if(last){
+      document.getElementById('s-pc').textContent=last.pc!==undefined?last.pc:'—';
+      document.getElementById('s-op').textContent=last.opName||last.opcode||'—';
+    }
+    renderTable(d.logs);
+    await fetchSessions();
+  }catch(e){console.warn('fetch error',e);}
+}
+
+function applyFilter(){fetchLogs();}
+
+function renderTable(logs){
+  const empty=document.getElementById('empty-msg');
+  const table=document.getElementById('log-table');
+  const tbody=document.getElementById('log-body');
+  if(logs.length===0){empty.style.display='block';table.style.display='none';return;}
+  empty.style.display='none';table.style.display='table';
+  tbody.innerHTML=logs.map((e,i)=>{
+    if(e._type==='session_summary'){
+      return \`<tr style="background:#21262d"><td colspan="9" style="color:var(--muted);font-size:11px;padding:4px 10px">
+        📋 Session summary — method:\${e.method||'?'} · traces:\${e.traceCount||0} · bTable:\${e.bTableCount||0} · str:\${e.strLogCount||0}
+      </td></tr>\`;
+    }
+    const cat=getCat(e.opName);
+    const regsStr=fmtRegs(e.registers);
+    return \`<tr>
+      <td class="pc-num" style="color:var(--muted)">\${i+1}</td>
+      <td class="pc-num">\${e.pc!==undefined?e.pc:'—'}</td>
+      <td><span class="op-badge cat-\${cat}">\${e.opcode!==undefined?e.opcode:'?'}</span></td>
+      <td style="color:var(--accent);font-weight:500">\${e.opName||'?'}</td>
+      <td>\${e.A!==undefined&&e.A!==null?e.A:'—'}</td>
+      <td>\${e.B!==undefined&&e.B!==null?e.B:'—'}</td>
+      <td>\${e.C!==undefined&&e.C!==null?e.C:'—'}</td>
+      <td class="regs reg-val">\${regsStr}</td>
+      <td class="pc-num">\${fmtTime(e._ts)}</td>
+    </tr>\`;
+  }).join('');
+}
+
+async function clearLogs(){
+  if(!confirm('全ログをクリアしますか？'))return;
+  await fetch('/vmhook-logs?clear=1');
+  allLogs=[];activeSid=null;
+  await fetchLogs();
+}
+
+function togglePause(){
+  paused=!paused;
+  document.getElementById('pause-btn').textContent=paused?'▶ Resume':'⏸ Pause';
+  document.getElementById('live-badge').textContent=paused?'⏸ PAUSED':'● LIVE';
+  document.getElementById('live-badge').style.borderColor=paused?'var(--yellow)':'var(--green)';
+  document.getElementById('live-badge').style.color=paused?'var(--yellow)':'var(--green)';
+}
+
+function exportJson(){
+  const blob=new Blob([JSON.stringify(allLogs,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='vmhook-logs-'+Date.now()+'.json';a.click();
+}
+
+// ── countdown tick ────────────────────────────────────────
+setInterval(()=>{
+  if(paused){document.getElementById('next-tick').textContent='paused';return;}
+  countdown--;
+  document.getElementById('next-tick').textContent=countdown+'s';
+  if(countdown<=0){countdown=3;fetchLogs();}
+},1000);
+
+fetchLogs();
+</script>
+</body>
+</html>`;
+}
+
+// ════════════════════════════════════════════════════════
 //  定期クリーンアップ + サーバー起動
 // ════════════════════════════════════════════════════════
 setInterval(() => {
@@ -833,4 +1227,6 @@ app.listen(PORT, () => {
   console.log(`   Lua:        ${checkLuaAvailable()        || 'NOT FOUND'}`);
   console.log(`   Prometheus: ${checkPrometheusAvailable() ? 'OK' : 'NOT FOUND (optional)'}`);
   console.log(`   Decompiler: ${fs.existsSync(DECOMPILER_LUA) ? 'OK' : 'NOT FOUND — moonsecv3decompiler.lua をルートに配置してください'}`);
+  console.log(`   VMhook Log: http://localhost:${PORT}/log`);
+  console.log(`   VMhook API: http://localhost:${PORT}/vmhook-logs`);
 });
