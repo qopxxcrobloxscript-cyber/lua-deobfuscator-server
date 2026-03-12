@@ -538,10 +538,8 @@ async function dynamicDecode(code) {
     bytecodeCandidates = dumpResult.candidates;
   }
 
-  // ── wrapper 生成前に元コードへ直接適用: [[ → [=[ 、]] → ]=] ──────────
-  // preamble や footer を結合する前の codeToRun に対して変換することで、
-  // wrapper 自体の長括弧 [=[ ]=] と衝突しない文字列にする。
-  codeToRun = codeToRun.replace(/\[\[/g, '[=[').replace(/\]\]/g, ']=]');
+  // ── 先頭の --[[ ... ]] ヘッダーコメントを削除 ────────────────────────
+  codeToRun = codeToRun.replace(/^--\[\[[\s\S]*?\]\]\s*/, '');
 
   const vmInfo = vmDetector(codeToRun);
   const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
@@ -597,14 +595,7 @@ end
 `;
 
   return new Promise(resolve => {
-    // ── Lua へ渡す最終文字列に直接適用 ──────────────────────────────────
-    // 1. --[[ をコメント長括弧として安全化: --[[ → --[=[
-    // 2. 残った [[ を長括弧レベル1へ昇格:    [[ → [=[
-    // 3. 対応する ]] を閉じ長括弧レベル1へ: ]] → ]=]
-    const luaCode = wrapper
-      .replace(/--\[\[/g, '--[=[')
-      .replace(/\[\[/g,   '[=[')
-      .replace(/\]\]/g,   ']=]');
+    const luaCode = wrapper;
     fs.writeFileSync(tempFile, luaCode, 'utf8');
     exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       safeUnlink(tempFile);
@@ -721,14 +712,8 @@ async function tryDynamicExecution(code) {
   const sid = beginVmSession('try_dynamic');
   const tempFile = path.join(tempDir, `obf_${makeTempId()}.lua`);
 
-  // ── wrapper 組み込み前に元コードへ直接適用 ───────────────────────────
-  // 1. --[[ → --[=[ (Luaブロックコメントを安全化)
-  // 2. [[ → [=[ (長括弧開きをレベル1へ昇格)
-  // 3. ]] → ]=] (長括弧閉じをレベル1へ昇格)
-  const safeCode = code
-    .replace(/--\[\[/g, '--[=[')
-    .replace(/\[\[/g,   '[=[')
-    .replace(/\]\]/g,   ']=]');
+  // ── 先頭の --[[ ... ]] ヘッダーコメントを削除 ────────────────────────
+  const safeCode = code.replace(/^--\[\[[\s\S]*?\]\]\s*/, '');
 
   const wrapper = `
 -- ══ YAJU Deobfuscator - Dynamic Execution Wrapper ══
