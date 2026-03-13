@@ -583,8 +583,8 @@ async function dynamicDecode(code) {
 
   // ── wrapper ───────────────────────────────────────────────────────────
   // Weredevsモード: getfenv ブロックを含まない（VM初期化を保護）
+  //                 + Roblox仮想環境をグローバルに注入
   // 通常モード    : getfenv ブロックを含む
-  const weredevEnvBlock = ``;
   const normalEnvBlock  = `
 pcall(function()
   if getfenv then
@@ -594,8 +594,222 @@ pcall(function()
 end)
 `;
 
+  // ── Roblox仮想環境ブロック (engine.lua のメタテーブルロジックを移植) ──────
+  // engine.lua の runner:wrap / runner:rbx_api / runner:vec3 に相当する
+  // グローバルスタブを標準 Lua 5.1 環境に注入する。
+  // Weredevs VM は getfenv/setfenv でグローバル環境を参照するため、
+  // _G に直接書き込むことで確実にアクセスさせる。
+  const rbxEnvBlock = `
+-- ══ Roblox仮想環境 (engine.lua 移植) ══
+
+-- ── 汎用スタブオブジェクト生成 ────────────────────────────────────────
+-- engine.lua の runner:wrap に相当。
+-- 存在しないキーへのアクセスを再帰的にスタブで返し、
+-- 呼び出しもノーオプで受け入れる。
+local function __rbx_wrap(name, props)
+  local raw = props or {}
+  local mt  = {}
+  mt.__index = function(t, k)
+    if raw[k] ~= nil then return raw[k] end
+    -- 新しいスタブを生成して返す（engine.lua の self:wrap(k, {}) 相当）
+    local child = __rbx_wrap(name .. "." .. tostring(k), {})
+    raw[k] = child
+    return child
+  end
+  mt.__newindex = function(t, k, v)
+    rawset(raw, k, v)
+  end
+  mt.__call = function(t, ...)
+    return __rbx_wrap(name .. "()", {})
+  end
+  mt.__tostring = function()
+    return "<RBX:" .. name .. ">"
+  end
+  mt.__concat = function(a, b)
+    return tostring(a) .. tostring(b)
+  end
+  mt.__len = function() return 0 end
+  mt.__eq  = function() return false end
+  mt.__lt  = function() return false end
+  mt.__le  = function() return false end
+  mt.__add = function(a,b) return 0 end
+  mt.__sub = function(a,b) return 0 end
+  mt.__mul = function(a,b) return 0 end
+  mt.__div = function(a,b) return 0 end
+  mt.__mod = function(a,b) return 0 end
+  mt.__unm = function(a)   return 0 end
+  return setmetatable({}, mt)
+end
+
+-- ── Vector3 (engine.lua の runner:vec3 相当) ──────────────────────────
+local __Vector3 = {}
+__Vector3.new = function(x, y, z)
+  x = tonumber(x) or 0
+  y = tonumber(y) or 0
+  z = tonumber(z) or 0
+  local v = {
+    X = x, Y = y, Z = z,
+    x = x, y = y, z = z,
+    Magnitude = math.sqrt(x*x + y*y + z*z),
+  }
+  local vmt = {}
+  vmt.__add      = function(a,b) return __Vector3.new((a.X or 0)+(b.X or 0),(a.Y or 0)+(b.Y or 0),(a.Z or 0)+(b.Z or 0)) end
+  vmt.__sub      = function(a,b) return __Vector3.new((a.X or 0)-(b.X or 0),(a.Y or 0)-(b.Y or 0),(a.Z or 0)-(b.Z or 0)) end
+  vmt.__mul      = function(a,b) if type(b)=="number" then return __Vector3.new((a.X or 0)*b,(a.Y or 0)*b,(a.Z or 0)*b) else return __Vector3.new((a.X or 0)*(b.X or 0),(a.Y or 0)*(b.Y or 0),(a.Z or 0)*(b.Z or 0)) end end
+  vmt.__tostring = function() return "("..tostring(x)..","..tostring(y)..","..tostring(z)..")" end
+  vmt.__index    = function(t,k) return rawget(v,k) end
+  return setmetatable(v, vmt)
+end
+__Vector3.zero = __Vector3.new(0,0,0)
+__Vector3.one  = __Vector3.new(1,1,1)
+
+-- ── CFrame ──────────────────────────────────────────────────────────
+local __CFrame = {}
+__CFrame.new = function(...)
+  local cf = { Position = __Vector3.new(0,0,0) }
+  setmetatable(cf, { __tostring=function() return "CFrame()" end, __mul=function(a,b) return b end })
+  return cf
+end
+__CFrame.identity = __CFrame.new()
+
+-- ── Color3 / BrickColor ──────────────────────────────────────────────
+local __Color3 = {}
+__Color3.new     = function(r,g,b) return {R=r or 0,G=g or 0,B=b or 0,r=r or 0,g=g or 0,b=b or 0} end
+__Color3.fromRGB = function(r,g,b) return __Color3.new((r or 0)/255,(g or 0)/255,(b or 0)/255) end
+
+local __BrickColor = {}
+__BrickColor.new = function(n) return {Name=tostring(n), Number=0, Color=__Color3.new(0,0,0)} end
+
+-- ── UDim2 / UDim ─────────────────────────────────────────────────────
+local __UDim2 = {}
+__UDim2.new = function(xs,xo,ys,yo) return {X={Scale=xs or 0,Offset=xo or 0},Y={Scale=ys or 0,Offset=yo or 0}} end
+local __UDim = {}
+__UDim.new  = function(s,o) return {Scale=s or 0,Offset=o or 0} end
+
+-- ── Enum スタブ ───────────────────────────────────────────────────────
+local __Enum = __rbx_wrap("Enum", {})
+
+-- ── Instance.new (engine.lua の api.Instances.new 相当) ───────────────
+local __Instance = {}
+__Instance.new = function(cls, parent)
+  local inst = __rbx_wrap(tostring(cls), {
+    Name       = tostring(cls),
+    ClassName  = tostring(cls),
+    Parent     = parent,
+    Archivable = true,
+  })
+  -- よく使われるプロパティを事前定義
+  local defaults = {
+    Part      = {Size=__Vector3.new(1,1,1), Position=__Vector3.new(0,0,0), CFrame=__CFrame.new(), Anchored=false, CanCollide=true},
+    Script    = {Source="", Disabled=false},
+    Humanoid  = {Health=100, MaxHealth=100, WalkSpeed=16, JumpPower=50},
+    Frame     = {Size=__UDim2.new(0,100,0,100), Position=__UDim2.new(0,0,0,0), BackgroundColor3=__Color3.new(1,1,1)},
+  }
+  if defaults[cls] then
+    for k,v in pairs(defaults[cls]) do inst[k]=v end
+  end
+  inst.Destroy       = function() end
+  inst.Remove        = function() end
+  inst.Clone         = function() return __Instance.new(cls) end
+  inst.FindFirstChild= function(n) return nil end
+  inst.WaitForChild  = function(n,t) return __rbx_wrap(n,{}) end
+  inst.GetChildren   = function() return {} end
+  inst.GetDescendants= function() return {} end
+  inst.IsA           = function(s, c) return tostring(cls)==c end
+  inst.GetService    = function(s, n) return __rbx_wrap(n,{}) end
+  inst.ConnectEvent  = function() return {Disconnect=function()end} end
+  return inst
+end
+
+-- ── game オブジェクト (engine.lua の runner:rbx_api 相当) ─────────────
+local __game = __rbx_wrap("game", {
+  Workspace         = __rbx_wrap("Workspace", {}),
+  Players           = __rbx_wrap("Players", {LocalPlayer=__rbx_wrap("LocalPlayer",{Name="Player",UserId=1,Character=__rbx_wrap("Character",{})})}),
+  Lighting          = __rbx_wrap("Lighting", {}),
+  ReplicatedStorage = __rbx_wrap("ReplicatedStorage", {}),
+  ServerStorage     = __rbx_wrap("ServerStorage", {}),
+  StarterGui        = __rbx_wrap("StarterGui", {}),
+  StarterPack       = __rbx_wrap("StarterPack", {}),
+  Teams             = __rbx_wrap("Teams", {}),
+  HttpService       = __rbx_wrap("HttpService", {JSONEncode=function(s,t) return "{}" end, JSONDecode=function(s,d) return {} end}),
+})
+__game.GetService  = function(self, n) return __rbx_wrap(n, {}) end
+__game.WaitForChild= function(self, n) return __rbx_wrap(n, {}) end
+
+-- ── task / wait スタブ ────────────────────────────────────────────────
+local __task = {
+  wait     = function(t) return t or 0 end,
+  spawn    = function(f, ...) if type(f)=="function" then pcall(f,...) end end,
+  delay    = function(t,f,...) end,
+  defer    = function(f,...) end,
+  cancel   = function() end,
+}
+
+-- ── RunService スタブ ─────────────────────────────────────────────────
+local __RunService = __rbx_wrap("RunService", {
+  IsServer  = function() return false end,
+  IsClient  = function() return true  end,
+  IsStudio  = function() return false end,
+  RenderStepped = __rbx_wrap("RenderStepped",{Connect=function(s,f) return {Disconnect=function()end} end}),
+  Heartbeat     = __rbx_wrap("Heartbeat",    {Connect=function(s,f) return {Disconnect=function()end} end}),
+  Stepped       = __rbx_wrap("Stepped",      {Connect=function(s,f) return {Disconnect=function()end} end}),
+})
+
+-- ── _G に全スタブを注入 ───────────────────────────────────────────────
+-- engine.lua の setmetatable(env, {__index=...}) 相当をグローバルへ直接適用する。
+-- Weredevs VM は getfenv() でグローバル環境を取得して参照するため、
+-- _G への直接書き込みが最も確実な方法。
+rawset(_G, "game",          __game)
+rawset(_G, "workspace",     __game.Workspace)
+rawset(_G, "Workspace",     __game.Workspace)
+rawset(_G, "script",        __rbx_wrap("script", {Name="Script", Parent=__game.Workspace}))
+rawset(_G, "Vector3",       __Vector3)
+rawset(_G, "CFrame",        __CFrame)
+rawset(_G, "Color3",        __Color3)
+rawset(_G, "BrickColor",    __BrickColor)
+rawset(_G, "UDim2",         __UDim2)
+rawset(_G, "UDim",          __UDim)
+rawset(_G, "Enum",          __Enum)
+rawset(_G, "Instance",      __Instance)
+rawset(_G, "task",          __task)
+rawset(_G, "wait",          function(t) return t or 0 end)
+rawset(_G, "delay",         function(t,f) end)
+rawset(_G, "spawn",         function(f,...) if type(f)=="function" then pcall(f,...) end end)
+rawset(_G, "RunService",    __RunService)
+rawset(_G, "tick",          os.clock)
+rawset(_G, "time",          os.clock)
+rawset(_G, "os",            os)
+rawset(_G, "warn",          function(...) end)
+rawset(_G, "error",         error)
+rawset(_G, "assert",        assert)
+rawset(_G, "pcall",         pcall)
+rawset(_G, "xpcall",        xpcall)
+rawset(_G, "select",        select)
+rawset(_G, "ipairs",        ipairs)
+rawset(_G, "pairs",         pairs)
+rawset(_G, "next",          next)
+rawset(_G, "type",          type)
+rawset(_G, "tostring",      tostring)
+rawset(_G, "tonumber",      tonumber)
+rawset(_G, "rawget",        rawget)
+rawset(_G, "rawset",        rawset)
+rawset(_G, "rawequal",      rawequal)
+rawset(_G, "rawlen",        rawlen or function(t) return #t end)
+rawset(_G, "unpack",        unpack or table.unpack)
+rawset(_G, "setmetatable",  setmetatable)
+rawset(_G, "getmetatable",  getmetatable)
+rawset(_G, "collectgarbage",function(...) return 0 end)
+rawset(_G, "string",        string)
+rawset(_G, "table",         table)
+rawset(_G, "math",          math)
+rawset(_G, "io",            io)
+rawset(_G, "coroutine",     coroutine)
+rawset(_G, "print",         print)
+-- ══ Roblox仮想環境 END ══
+`;
+
   const wrapper = `
--- ══ YAJU dynamicDecode v3 Wrapper ══
+-- ══ YAJU dynamicDecode v4 Wrapper ══
 pcall(function()
   if debug then
     debug.sethook=function() end; debug.getinfo=nil
@@ -603,7 +817,7 @@ pcall(function()
     debug.getupvalue=nil; debug.setupvalue=nil
   end
 end)
-${weredevMode ? weredevEnvBlock : normalEnvBlock}
+${weredevMode ? rbxEnvBlock : normalEnvBlock}
 local __obf_code = [=[
 ${safeFullCode}
 ]=]
