@@ -644,6 +644,7 @@ end
     fs.writeFileSync(tempFile, luaCode, 'utf8');
     exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       safeUnlink(tempFile);
+      try {
 
       const decoded      = parseDecodedOutputs(stdout);
       const vmTrace      = parseVmLogs(stdout);
@@ -743,6 +744,12 @@ end
       const failResult = { success: false, error: errMsg || 'loadstringが呼ばれませんでした', method: 'dynamic_decode', vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined, _sid: sid };
       endVmSession(sid, failResult);
       resolve(failResult);
+
+      } catch (cbErr) {
+        const r = { success: false, error: 'dynamicDecode 内部エラー: ' + (cbErr && cbErr.message || String(cbErr)), method: 'dynamic_decode', _sid: sid };
+        try { endVmSession(sid, r); } catch (_) {}
+        resolve(r);
+      }
     });
   });
 }
