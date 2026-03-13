@@ -178,18 +178,36 @@ function detectIfConstPool(elements) {
 //  最初のLocalStatementの変数名を動的取得して固定名依存を排除
 // ────────────────────────────────────────────────────────────────────────
 function buildConstPoolArray(constPools, code) {
-  // 最初のLocalStatementの変数名を動的取得
-  const firstLocalName = extractFirstLocalName(code);
+  // ────────────────────────────────────────────────────────────────────────
+  //  定数プール配列を構築する。
+  //
+  //  【変更点】
+  //  旧実装は extractFirstLocalName() で取得した「先頭の local 変数名」を
+  //  優先していたため、変数名がランダムに変わる難読化コードで誤検出する
+  //  リスクがあった。
+  //
+  //  新実装は名前に一切依存せず、以下の優先順で候補を選ぶ:
+  //    1. isLikelyConstPool=true のうち最大要素数のテーブル
+  //    2. (fallback) 要素数が最大のテーブル
+  // ────────────────────────────────────────────────────────────────────────
+  if (!constPools || Object.keys(constPools).length === 0) return [];
 
-  // constPoolsの中からR配列候補を特定
-  // 優先: 1) 最初のlocal変数名と一致  2) isLikelyConstPool=true で最大のもの
   let poolName = null;
-  if (firstLocalName && constPools[firstLocalName]) {
-    poolName = firstLocalName;
-  } else {
+
+  // 優先1: isLikelyConstPool=true で最大要素数
+  let maxLikely = 0;
+  for (const [name, pool] of Object.entries(constPools)) {
+    if (pool.isLikelyConstPool && pool.count > maxLikely) {
+      maxLikely = pool.count;
+      poolName = name;
+    }
+  }
+
+  // fallback: 単純に最大要素数
+  if (!poolName) {
     let maxCount = 0;
     for (const [name, pool] of Object.entries(constPools)) {
-      if (pool.isLikelyConstPool && pool.count > maxCount) {
+      if (pool.count > maxCount) {
         maxCount = pool.count;
         poolName = name;
       }
@@ -198,10 +216,8 @@ function buildConstPoolArray(constPools, code) {
 
   if (!poolName || !constPools[poolName]) return [];
 
-  // R配列を構築
+  // 定数プール配列を構築し、全文字列要素に weredevsDecode を適用する
   const R = constPools[poolName].elements.map(e => e ? e.value : null);
-
-  // R配列の全文字列要素にweredevsDecodeパイプラインを適用
   for (let i = 0; i < R.length; i++) {
     if (typeof R[i] === 'string') {
       R[i] = weredevsDecode(R[i]);
@@ -387,12 +403,29 @@ function extractWeredevDispatchLoop(code) {
 }
 
 function dumpBytecodeTables(code) {
+  // ────────────────────────────────────────────────────────────────────────
+  //  local <任意の変数名> = { ... } を検出する。
+  //  変数名は毎回ランダムなため固定名には依存しない。
+  //  テーブル本体はブレースカウントで正確に閉じ括弧を探す（ネスト対応）。
+  // ────────────────────────────────────────────────────────────────────────
   const candidates = [];
-  const tblPat = /local\s+(\w+)\s*=\s*\{([\s\d,]+)\}/g;
+  const headerRe = /local\s+(\w+)\s*=\s*\{/g;
   let m;
-  while ((m = tblPat.exec(code)) !== null) {
-    const nums = m[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (nums.length >= 50) candidates.push({ name: m[1], count: nums.length });
+  while ((m = headerRe.exec(code)) !== null) {
+    const varName  = m[1];
+    const openPos  = m.index + m[0].length - 1; // '{' の位置
+    let depth = 0, closePos = -1;
+    const limit = Math.min(code.length, openPos + 500000);
+    for (let i = openPos; i < limit; i++) {
+      if (code[i] === '{') depth++;
+      else if (code[i] === '}') { depth--; if (depth === 0) { closePos = i; break; } }
+    }
+    if (closePos === -1) continue;
+
+    const body = code.substring(openPos + 1, closePos);
+    // 数値要素のみをカウント（文字列・ネストテーブルは除外）
+    const nums = body.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    if (nums.length >= 50) candidates.push({ name: varName, count: nums.length });
   }
   if (candidates.length === 0) return { code, injected: false, candidates: [] };
   let inject = '\n-- ══ YAJU Bytecode Dump ══\n';
@@ -403,21 +436,35 @@ function dumpBytecodeTables(code) {
 }
 
 function vmBytecodeExtractor(code) {
+  // ────────────────────────────────────────────────────────────────────────
+  //  local <任意の変数名> = { ... } を検出する（固定名依存なし）。
+  //  dumpBytecodeTables と同じくブレースカウントでテーブル本体を抽出。
+  // ────────────────────────────────────────────────────────────────────────
   const tables = [];
-  const tblPattern = /local\s+(\w+)\s*=\s*\{((?:\s*\d+\s*,){10,}[^}]*)\}/g;
+  const headerRe = /local\s+(\w+)\s*=\s*\{/g;
   let m;
-  while ((m = tblPattern.exec(code)) !== null) {
-    const name = m[1];
-    const nums = m[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+  while ((m = headerRe.exec(code)) !== null) {
+    const varName = m[1];
+    const openPos = m.index + m[0].length - 1;
+    let depth = 0, closePos = -1;
+    const limit = Math.min(code.length, openPos + 500000);
+    for (let i = openPos; i < limit; i++) {
+      if (code[i] === '{') depth++;
+      else if (code[i] === '}') { depth--; if (depth === 0) { closePos = i; break; } }
+    }
+    if (closePos === -1) continue;
+
+    const body = code.substring(openPos + 1, closePos);
+    const nums  = body.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
     if (nums.length >= 10) {
       const max = Math.max(...nums);
-      tables.push({ name, count: nums.length, sample: nums.slice(0,16), isLikelyBytecode: max < 65536 });
+      tables.push({ name: varName, count: nums.length, sample: nums.slice(0, 16), isLikelyBytecode: max < 65536 });
     }
   }
   if (tables.length === 0) return { success: false, error: 'バイトコードテーブルなし', method: 'vm_extract' };
   return {
     success: true, tables, method: 'vm_extract',
-    hints: tables.map(t=>`${t.name}[${t.count}]: [${t.sample.join(',')}...]${t.isLikelyBytecode?' (bytecode候補)':''}`),
+    hints: tables.map(t => `${t.name}[${t.count}]: [${t.sample.join(',')}...]${t.isLikelyBytecode ? ' (bytecode候補)' : ''}`),
   };
 }
 
