@@ -76,6 +76,7 @@ function extractVmTable(code, vmTableName) {
 }
 
 function extractWeredevConstPool(code) {
+  try {
   // 定数プール抽出前にLua escapeをコード全体へ展開
   code = decodeLuaEscapes(code);
   const pools = {};
@@ -102,6 +103,9 @@ function extractWeredevConstPool(code) {
     };
   }
   return pools;
+  } catch (err) {
+    return {};
+  }
 }
 
 function parseConstPoolBody(body) {
@@ -363,6 +367,7 @@ function _findIfBlockEnd(src, ifStart) {
 }
 
 function extractWeredevDispatchLoop(code) {
+  try {
   const loops = [];
   const whileRe = /while\s+([A-Za-z_]\w*)\s+do\b/g;
   let m;
@@ -400,6 +405,9 @@ function extractWeredevDispatchLoop(code) {
     }
   }
   return loops;
+  } catch (err) {
+    return [];
+  }
 }
 
 function dumpBytecodeTables(code) {
