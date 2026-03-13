@@ -19,31 +19,34 @@ function detectWeredevContext(code) {
     stackVar:  null,
     instrVar:  null,
   };
+  if (!code || typeof code !== 'string') return ctx;
+  try {
+    // while VAR do → loopVar
+    const whileM = code.match(/while\s+([A-Za-z_]\w*)\s+do\b/);
+    if (whileM && whileM[1] !== 'true' && whileM[1] !== '1') ctx.loopVar = whileM[1];
 
-  // while VAR do → loopVar
-  const whileM = code.match(/while\s+([A-Za-z_]\w*)\s+do\b/);
-  if (whileM && whileM[1] !== 'true' && whileM[1] !== '1') ctx.loopVar = whileM[1];
+    // local V[...] = ... → regVar
+    const regM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*\{\s*\}/);
+    if (regM) ctx.regVar = regM[1];
 
-  // local V[...] = ... → regVar
-  const regM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*\{\s*\}/);
-  if (regM) ctx.regVar = regM[1];
+    // local pc = 1 → pcVar
+    const pcM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*1\b/);
+    if (pcM) ctx.pcVar = pcM[1];
 
-  // local pc = 1 → pcVar
-  const pcM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*1\b/);
-  if (pcM) ctx.pcVar = pcM[1];
+    // local Z = function(i) return POOL[i ...] end → zFunc/poolVar
+    const zM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*function\s*\(\s*\w+\s*\)\s*return\s+([A-Za-z_]\w*)\s*\[/);
+    if (zM) { ctx.zFunc = zM[1]; ctx.poolVar = zM[2]; }
 
-  // local Z = function(i) return POOL[i ...] end → zFunc/poolVar
-  const zM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*function\s*\(\s*\w+\s*\)\s*return\s+([A-Za-z_]\w*)\s*\[/);
-  if (zM) { ctx.zFunc = zM[1]; ctx.poolVar = zM[2]; }
+    // local stk = {} → stackVar
+    const stkM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*\{\}[^\n]*stack/i);
+    if (stkM) ctx.stackVar = stkM[1];
 
-  // local stk = {} → stackVar
-  const stkM = code.match(/local\s+([A-Za-z_]\w*)\s*=\s*\{\}[^\n]*stack/i);
-  if (stkM) ctx.stackVar = stkM[1];
-
-  // local inst / local l = B[pc] → instrVar
-  const instrM = code.match(/local\s+(inst|[A-Za-z_]\w*)\s*=\s*\w+\s*\[\s*\w+\s*\]/);
-  if (instrM) ctx.instrVar = instrM[1];
-
+    // local inst / local l = B[pc] → instrVar
+    const instrM = code.match(/local\s+(inst|[A-Za-z_]\w*)\s*=\s*\w+\s*\[\s*\w+\s*\]/);
+    if (instrM) ctx.instrVar = instrM[1];
+  } catch (err) {
+    // パターンマッチ失敗時はデフォルト値のまま返す
+  }
   return ctx;
 }
 
@@ -286,6 +289,7 @@ function _buildFromTrace(entries, bInstructions) {
 //  analyzeWeredevOpcodeBlock — 単一 opcode ブロックの意味解析
 // ────────────────────────────────────────────────────────────────────────
 function analyzeWeredevOpcodeBlock(block, ctx) {
+  try {
   const body = block.body || block.rawBody || '';
   const ops  = [];
   const regV = (ctx && ctx.regVar)  || 'V';
@@ -305,9 +309,9 @@ function analyzeWeredevOpcodeBlock(block, ctx) {
     const reg = parseInt(rm[1]);
     const rhs = rm[2].trim();
     let kind = 'ASSIGN';
-    if (new RegExp(`${_escRe(zFn)}\\s*\\(`).test(rhs))     kind = 'LOADK';
-    else if (/^\-?[\d.]+$/.test(rhs))                       kind = 'LOADNUM';
-    else if (/^["']|^\[\[/.test(rhs))                       kind = 'LOADSTR';
+    if (new RegExp(`${_escRe(zFn)}\\s*\\(`).test(rhs))      kind = 'LOADK';
+    else if (/^\-?[\d.]+$/.test(rhs))                        kind = 'LOADNUM';
+    else if (/^["']|^\[\[/.test(rhs))                        kind = 'LOADSTR';
     else if (new RegExp(`${_escRe(regV)}\\s*\\[`).test(rhs)) kind = 'MOVE';
     ops.push({ kind, reg, rhs, lua: `${regV}[${reg}] = ${rhs}` });
   }
@@ -340,6 +344,9 @@ function analyzeWeredevOpcodeBlock(block, ctx) {
   }
 
   return ops;
+  } catch (err) {
+    return [{ kind: 'RAW', lua: '-- analyzeWeredevOpcodeBlock error: ' + (err && err.message || String(err)) }];
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -349,23 +356,25 @@ function extractWeredevOperands(body, ctx) {
   const regV = (ctx && ctx.regVar) || 'V';
   const result = { A: null, B: null, C: null, _op: null };
   if (!body) return result;
+  try {
+    // A: 代入先レジスタ V[N] =
+    const aM = body.match(new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]\\s*=`));
+    if (aM) result.A = parseInt(aM[1]);
 
-  // A: 代入先レジスタ V[N] =
-  const aM = body.match(new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]\\s*=`));
-  if (aM) result.A = parseInt(aM[1]);
+    // B, C: 右辺のレジスタ参照
+    const rhsM = body.match(new RegExp(`=\\s*(?:.*?)${_escRe(regV)}\\s*\\[(\\d+)\\]`));
+    if (rhsM) result.B = parseInt(rhsM[1]);
+    const allRegs = [...body.matchAll(new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]`, 'g'))];
+    if (allRegs.length >= 3) result.C = parseInt(allRegs[2][1]);
+    else if (allRegs.length >= 2 && result.A !== null && parseInt(allRegs[1][1]) !== result.A)
+      result.B = parseInt(allRegs[1][1]);
 
-  // B, C: 右辺のレジスタ参照
-  const rhsM = body.match(new RegExp(`=\\s*(?:.*?)${_escRe(regV)}\\s*\\[(\\d+)\\]`));
-  if (rhsM) result.B = parseInt(rhsM[1]);
-  const allRegs = [...body.matchAll(new RegExp(`${_escRe(regV)}\\s*\\[(\\d+)\\]`, 'g'))];
-  if (allRegs.length >= 3) result.C = parseInt(allRegs[2][1]);
-  else if (allRegs.length >= 2 && result.A !== null && parseInt(allRegs[1][1]) !== result.A)
-    result.B = parseInt(allRegs[1][1]);
-
-  // 算術演算子
-  const arithM = body.match(/([+\-*\/%^])/);
-  if (arithM) result._op = arithM[1];
-
+    // 算術演算子
+    const arithM = body.match(/([+\-*\/%^])/);
+    if (arithM) result._op = arithM[1];
+  } catch (err) {
+    // パターンマッチ失敗時はデフォルト値を返す
+  }
   return result;
 }
 
