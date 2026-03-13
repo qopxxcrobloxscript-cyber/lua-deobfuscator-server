@@ -592,7 +592,10 @@ end
 local __ok, __err = pcall(function()
   local chunk, err = __orig_ls_outer(__obf_code)
   if not chunk then error("parse error: " .. tostring(err)) end
-  chunk()
+  local r = chunk()
+  if type(r) == "function" then
+    r()
+  end
 end)
 
 if not __ok then
