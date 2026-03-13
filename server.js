@@ -532,13 +532,23 @@ async function dynamicDecode(code) {
 
   const vmInfoPre = vmDetector(codeToRun);
 
-  if (vmInfoPre.isVm || vmInfoPre.isWereDev || vmInfoPre.isMoonSec || vmInfoPre.isLuraph) {
+  // Weredevs モードでは while true do の有無に関係なく必ず injectVmHook を実行する。
+  // それ以外の VM 系は従来通り while true do / repeat until がある場合のみ注入する。
+  const isWeredev = isWeredevWrapper(codeToRun);
+  if (isWeredev) {
+    const hookResult = injectVmHook(codeToRun, vmInfoPre);
+    codeToRun = hookResult.code;
+    vmHookInjected = hookResult.injected;
+  } else if (vmInfoPre.isVm || vmInfoPre.isWereDev || vmInfoPre.isMoonSec || vmInfoPre.isLuraph) {
     const hasVmLoop = /while\s+true\s+do|repeat\s+until/.test(codeToRun);
     if (hasVmLoop) {
       const hookResult = injectVmHook(codeToRun, vmInfoPre);
       codeToRun = hookResult.code;
       vmHookInjected = hookResult.injected;
     }
+  }
+
+  if (vmInfoPre.isVm || vmInfoPre.isWereDev || vmInfoPre.isMoonSec || vmInfoPre.isLuraph || isWeredev) {
     const dumpResult = dumpBytecodeTables(codeToRun);
     codeToRun = dumpResult.code;
     bytecodeCandidates = dumpResult.candidates;
