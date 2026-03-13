@@ -718,25 +718,10 @@ end
 // ────────────────────────────────────────────────────────────────────────
 function isWeredevWrapper(code) {
   if (!code || typeof code !== 'string') return false;
-
   // 条件1: wearedevs.net を含む
   if (code.includes('wearedevs.net')) return true;
-
-  // 条件2: 先頭コメント（長括弧コメント・行コメント）を除去した後に
-  //        return(function( 形式で始まるか（空白・改行は任意）
-  let stripped = code;
-  let prev;
-  do {
-    prev = stripped;
-    const lbMatch = stripped.match(/^--\[\[[\s\S]*?\]\]/);
-    if (lbMatch !== null) stripped = stripped.slice(lbMatch[0].length);
-    // 長括弧コメント除去後の先頭空白・改行をスキップしてから行コメントを検出
-    const trimmed = stripped.trimStart();
-    const lcMatch = trimmed.match(/^--[^\n]*\n?/);
-    if (lcMatch !== null) stripped = trimmed.slice(lcMatch[0].length);
-  } while (stripped !== prev);
-
-  return /^return\s*\(\s*function\s*\(/.test(stripped.trimStart());
+  // 条件2: コード中に return(function( 形式が存在する（位置・コメント問わず）
+  return /return\s*\(\s*function/.test(code);
 }
 
 // ════════════════════════════════════════════════════════
