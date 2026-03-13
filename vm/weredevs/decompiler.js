@@ -416,6 +416,7 @@ function reconstructedLuaBuilder(vmTrace, bytecodeDump, opcodeMap) {
 //  項目15: vmhookログがあればopcode実行順優先
 // ════════════════════════════════════════════════════════════════════════
 function weredevAnalyze(code, vmTraceEntries, bTableLog, strLogEntries, options) {
+  try {
   const MAX_INSTRUCTIONS = (options && options.maxInstructions) || MAX_DISPATCH_ITERATIONS;
   const result = {
     isWeredev:      false,
@@ -504,12 +505,21 @@ function weredevAnalyze(code, vmTraceEntries, bTableLog, strLogEntries, options)
   }
 
   return result;
+  } catch (err) {
+    return {
+      isWeredev: false, dispatchLoop: null, tableNames: [], tables: {},
+      opcodeMap: {}, remapped: {}, decompiled: [], stringsFound: [],
+      method: 'weredev_analyze',
+      error: 'weredevAnalyze 例外: ' + (err && err.message || String(err)),
+    };
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════
 //  weredevFullDecompile — フル解析パイプライン
 // ════════════════════════════════════════════════════════════════════════
 function weredevFullDecompile(code) {
+  try {
   const result = {
     success:false, method:'weredev_full_decompile',
     context:{}, constPools:{}, accessors:{}, dispatchLoops:[],
@@ -609,6 +619,14 @@ function weredevFullDecompile(code) {
     result.stats.totalConstants > 0 || result.stats.resolvedZCalls > 0;
 
   return result;
+  } catch (err) {
+    return {
+      success: false, method: 'weredev_full_decompile',
+      context: {}, constPools: {}, accessors: {}, dispatchLoops: [],
+      opcodeBlocks: [], resolvedCode: '', pseudoLua: '', stats: {},
+      error: 'weredevFullDecompile 例外: ' + (err && err.message || String(err)),
+    };
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────
