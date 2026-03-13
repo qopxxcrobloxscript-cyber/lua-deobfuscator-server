@@ -518,24 +518,43 @@ async function dynamicDecode(code) {
   const luaBin = checkLuaAvailable();
   if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic_decode' };
 
-  const filtered = sandboxFilter(code);
-  if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic_decode' };
-  if (filtered.removed.length > 0) console.log('[DynDec] 危険関数除去:', filtered.removed.join(', '));
+  // ── Weredevs判定 ──────────────────────────────────────────────────────
+  // sandboxFilter / safeEnvPreamble の適用可否をここで決める。
+  // Weredevs VM は getfenv/setfenv を初期化に使うため、
+  // safeEnvPreamble を適用するとVMが壊れる。
+  const weredevMode = isWeredevWrapper(code);
+
+  // ── sandboxFilter ──────────────────────────────────────────────────────
+  // Weredevsモード: スキップ（getfenv/setfenv/loadstringを削除しない）
+  // 通常モード    : 適用（危険な関数を除去）
+  let codeToRun;
+  if (weredevMode) {
+    codeToRun = code;
+  } else {
+    const filtered = sandboxFilter(code);
+    if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic_decode' };
+    if (filtered.removed.length > 0) console.log('[DynDec] 危険関数除去:', filtered.removed.join(', '));
+    codeToRun = filtered.code;
+  }
 
   // セッション開始
   const sid = beginVmSession('dynamic_decode');
 
-  const preamble = safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
+  // ── preamble ──────────────────────────────────────────────────────────
+  // Weredevsモード: hookLoadstringCode + vmHookBootstrap のみ
+  //                 （safeEnvPreamble は getfenv/setfenv を変更するためスキップ）
+  // 通常モード    : safeEnvPreamble + hookLoadstringCode + vmHookBootstrap
+  const preamble = weredevMode
+    ? hookLoadstringCode + '\n' + vmHookBootstrap
+    : safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
 
-  let codeToRun = filtered.code;
   let vmHookInjected = false, bytecodeCandidates = [];
 
   const vmInfoPre = vmDetector(codeToRun);
 
   // Weredevs モードでは while true do の有無に関係なく必ず injectVmHook を実行する。
   // それ以外の VM 系は従来通り while true do / repeat until がある場合のみ注入する。
-  const isWeredev = isWeredevWrapper(codeToRun);
-  if (isWeredev) {
+  if (weredevMode) {
     const hookResult = injectVmHook(codeToRun, vmInfoPre);
     codeToRun = hookResult.code;
     vmHookInjected = hookResult.injected;
@@ -548,7 +567,7 @@ async function dynamicDecode(code) {
     }
   }
 
-  if (vmInfoPre.isVm || vmInfoPre.isWereDev || vmInfoPre.isMoonSec || vmInfoPre.isLuraph || isWeredev) {
+  if (vmInfoPre.isVm || vmInfoPre.isWereDev || vmInfoPre.isMoonSec || vmInfoPre.isLuraph || weredevMode) {
     const dumpResult = dumpBytecodeTables(codeToRun);
     codeToRun = dumpResult.code;
     bytecodeCandidates = dumpResult.candidates;
@@ -562,6 +581,19 @@ async function dynamicDecode(code) {
   const safeFullCode = fullCode;
   const tempFile = path.join(tempDir, `dyndec_${makeTempId()}.lua`);
 
+  // ── wrapper ───────────────────────────────────────────────────────────
+  // Weredevsモード: getfenv ブロックを含まない（VM初期化を保護）
+  // 通常モード    : getfenv ブロックを含む
+  const weredevEnvBlock = ``;
+  const normalEnvBlock  = `
+pcall(function()
+  if getfenv then
+    local env=getfenv()
+    env.saveinstance=nil; env.dumpstring=nil; env.save_instance=nil
+  end
+end)
+`;
+
   const wrapper = `
 -- ══ YAJU dynamicDecode v3 Wrapper ══
 pcall(function()
@@ -571,13 +603,7 @@ pcall(function()
     debug.getupvalue=nil; debug.setupvalue=nil
   end
 end)
-pcall(function()
-  if getfenv then
-    local env=getfenv()
-    env.saveinstance=nil; env.dumpstring=nil; env.save_instance=nil
-  end
-end)
-
+${weredevMode ? weredevEnvBlock : normalEnvBlock}
 local __obf_code = [=[
 ${safeFullCode}
 ]=]
