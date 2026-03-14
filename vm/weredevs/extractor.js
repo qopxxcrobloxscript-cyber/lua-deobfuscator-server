@@ -2,7 +2,7 @@
 'use strict';
 
 const { decodeLuaEscapes }  = require('../../core/stringDecoder');
-const { weredevsDecode }    = require('../../utils/stringPipeline');
+const { weredevsDecode, buildVTable } = require('../../utils/stringPipeline');
 
 // ────────────────────────────────────────────────────────────────────────
 //  最初の LocalStatement の変数名を動的取得
@@ -77,6 +77,8 @@ function extractVmTable(code, vmTableName) {
 
 function extractWeredevConstPool(code) {
   try {
+  // Vテーブルを先に抽出
+  const vtable = buildVTable(code);
   // 定数プール抽出前にLua escapeをコード全体へ展開
   code = decodeLuaEscapes(code);
   const pools = {};
@@ -95,6 +97,13 @@ function extractWeredevConstPool(code) {
     const body = code.substring(startPos + 1, end);
     const elements = parseConstPoolBody(body);
     if (elements.length < 1) continue;
+    // 各要素にVテーブルデコードを適用
+    for (const el of elements) {
+      if (el && el.type === 'string' && vtable) {
+        const decoded = weredevsDecode(el.value, vtable);
+        if (decoded !== el.value) el.value = decoded;
+      }
+    }
     pools[varName] = {
       name: varName, elements,
       count: elements.length,
@@ -220,11 +229,14 @@ function buildConstPoolArray(constPools, code) {
 
   if (!poolName || !constPools[poolName]) return [];
 
+  // Vテーブルを抽出（Weredevs独自Base64マッピング）
+  const vtable = buildVTable(code || '');
+
   // 定数プール配列を構築し、全文字列要素に weredevsDecode を適用する
   const R = constPools[poolName].elements.map(e => e ? e.value : null);
   for (let i = 0; i < R.length; i++) {
     if (typeof R[i] === 'string') {
-      R[i] = weredevsDecode(R[i]);
+      R[i] = weredevsDecode(R[i], vtable);
     }
   }
 
