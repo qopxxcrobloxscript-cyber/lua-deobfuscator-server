@@ -346,34 +346,44 @@ app.post('/api/deobfuscate', async (req, res) => {
   if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
 
   let result;
-  switch (method) {
-    case 'xor':                    result = xorDecoder(code);                          break;
-    case 'split_strings':          result = deobfuscateSplitStrings(code);             break;
-    case 'encrypt_strings':        result = deobfuscateEncryptStrings(code);           break;
-    case 'constant_array':         result = constantArrayResolver(code);               break;
-    case 'eval_expressions':       result = evaluateExpressions(code);                 break;
-    case 'advanced_static':        result = advancedStaticDeobfuscate(code);           break;
-    case 'char_decoder':           result = charDecoder(code);                         break;
-    case 'xor_decoder':            result = xorDecoder(code);                          break;
-    case 'math_eval':              result = mathEvaluator(code);                       break;
-    case 'constant_call':          result = constantCallEvaluator(code);               break;
-    case 'str_transform':          result = stringTransformDecoder(code);              break;
-    case 'dead_branch':            result = deadBranchRemover(code);                   break;
-    case 'junk_clean':             result = junkAssignmentCleaner(code);               break;
-    case 'vm_detect':              result = { ...vmDetector(code), success: vmDetector(code).isVm }; break;
-    case 'vm_extract':             result = vmBytecodeExtractor(code);                 break;
-    case 'weredev_full_decompile': result = weredevFullDecompileHandler(code);         break;
-    case 'base64_detect':          result = base64Detector(code, new CapturePool());  break;
-    case 'vmify':                  result = deobfuscateVmify(code);                    break;
-    case 'dynamic': {
-      // mode 決定: Weredevs検出 → 'weredevs' / それ以外 → 'dynamic'
-      const dynMode = isWeredevWrapper(code) ? 'weredevs' : 'dynamic';
-      if (dynMode === 'weredevs') result = await dynamicDecode(code);
-      else                        result = await tryDynamicExecution(code);
-      break;
+  try {
+    switch (method) {
+      case 'xor':                    result = xorDecoder(code);                          break;
+      case 'split_strings':          result = deobfuscateSplitStrings(code);             break;
+      case 'encrypt_strings':        result = deobfuscateEncryptStrings(code);           break;
+      case 'constant_array':         result = constantArrayResolver(code);               break;
+      case 'eval_expressions':       result = evaluateExpressions(code);                 break;
+      case 'advanced_static':        result = advancedStaticDeobfuscate(code);           break;
+      case 'char_decoder':           result = charDecoder(code);                         break;
+      case 'xor_decoder':            result = xorDecoder(code);                          break;
+      case 'math_eval':              result = mathEvaluator(code);                       break;
+      case 'constant_call':          result = constantCallEvaluator(code);               break;
+      case 'str_transform':          result = stringTransformDecoder(code);              break;
+      case 'dead_branch':            result = deadBranchRemover(code);                   break;
+      case 'junk_clean':             result = junkAssignmentCleaner(code);               break;
+      case 'vm_detect':              result = { ...vmDetector(code), success: vmDetector(code).isVm }; break;
+      case 'vm_extract':             result = vmBytecodeExtractor(code);                 break;
+      case 'weredev_full_decompile': result = weredevFullDecompileHandler(code);         break;
+      case 'base64_detect':          result = base64Detector(code, new CapturePool());  break;
+      case 'vmify':                  result = deobfuscateVmify(code);                    break;
+      case 'dynamic': {
+        // mode 決定: Weredevs検出 → 'weredevs' / それ以外 → 'dynamic'
+        const dynMode = isWeredevWrapper(code) ? 'weredevs' : 'dynamic';
+        if (dynMode === 'weredevs') result = await dynamicDecode(code);
+        else                        result = await tryDynamicExecution(code);
+        break;
+      }
+      case 'auto':
+      default:                       result = await autoDeobfuscate(code);              break;
     }
-    case 'auto':
-    default:                       result = await autoDeobfuscate(code);              break;
+  } catch (err) {
+    // 未捕捉例外をサーバークラッシュさせずJSONで返す
+    console.error('[/api/deobfuscate] 未捕捉エラー:', err);
+    result = {
+      success: false,
+      error: '内部エラー: ' + (err && err.message ? err.message : String(err)),
+      method: method || 'unknown',
+    };
   }
 
   res.json(result);
@@ -1109,6 +1119,7 @@ end
 async function autoDeobfuscate(code) {
   const results = [];
   let current = code;
+  try {
   const luaBin = checkLuaAvailable();
 
   if (luaBin) {
@@ -1176,6 +1187,15 @@ async function autoDeobfuscate(code) {
   }
 
   return { success: results.some(r => r.success), steps: results, finalCode: current };
+  } catch (err) {
+    console.error('[autoDeobfuscate] 未捕捉エラー:', err);
+    return {
+      success: false,
+      error: 'autoDeobfuscate 内部エラー: ' + (err && err.message ? err.message : String(err)),
+      steps: results,
+      finalCode: current,
+    };
+  }
 }
 
 // ════════════════════════════════════════════════════════
