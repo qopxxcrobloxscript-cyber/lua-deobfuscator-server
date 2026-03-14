@@ -898,9 +898,13 @@ end
     const luaCode = wrapper;
     fs.writeFileSync(tempFile, luaCode, 'utf8');
     console.log('[DynDec] Lua実行開始 bin=' + luaBin + ' file=' + tempFile);
+    console.log('[DynDec] wrapper先頭200:', luaCode.substring(0, 200));
+    console.log('[DynDec] wrapper末尾200:', luaCode.substring(luaCode.length - 200));
     exec(`${luaBin} ${tempFile}`, { timeout: 30000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
-      safeUnlink(tempFile);
+      // デバッグ中はファイルを残す
+      // safeUnlink(tempFile);
       console.log('[DynDec] Lua終了 error=' + (error && error.message) + ' stdout_len=' + (stdout && stdout.length) + ' stderr=' + (stderr && stderr.substring(0, 200)));
+      console.log('[DynDec] stdout全文:', JSON.stringify(stdout && stdout.substring(0, 500)));
       try {
 
       const decoded      = parseDecodedOutputs(stdout);
