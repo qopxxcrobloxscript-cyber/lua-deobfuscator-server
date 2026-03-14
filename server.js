@@ -843,11 +843,29 @@ local function __outer_hook(c, ...)
   end
   return __orig_ls_outer(c, ...)
 end
+-- _G に直接書き込む
 loadstring = __outer_hook
 load       = __outer_hook
 if rawset then
   pcall(function() rawset(_G, "loadstring", __outer_hook) end)
   pcall(function() rawset(_G, "load",       __outer_hook) end)
+end
+-- getfenv() 経由でも差し替える (Weredevs は getfenv で環境を取得するため必須)
+if getfenv then
+  pcall(function()
+    local _genv = getfenv(0)
+    if _genv then
+      _genv.loadstring = __outer_hook
+      _genv.load       = __outer_hook
+    end
+  end)
+  pcall(function()
+    local _genv = getfenv(1)
+    if _genv then
+      _genv.loadstring = __outer_hook
+      _genv.load       = __outer_hook
+    end
+  end)
 end
 
 local __ok, __err = pcall(function()
@@ -855,6 +873,18 @@ local __ok, __err = pcall(function()
   if not chunk then error("parse error: " .. tostring(err)) end
   local r = chunk()
   if type(r) == "function" then
+    -- Weredevs形式: return(function(...) ... end)(args)
+    -- chunk()の戻り値がfunctionの場合、それ自体がVMなので実行する
+    -- 実行前にもう一度loadstringフックを確実に差し替える
+    if getfenv then
+      pcall(function()
+        local _env = getfenv(r)
+        if _env then
+          _env.loadstring = __outer_hook
+          _env.load       = __outer_hook
+        end
+      end)
+    end
     r()
   end
 end)
@@ -867,8 +897,10 @@ end
   return new Promise(resolve => {
     const luaCode = wrapper;
     fs.writeFileSync(tempFile, luaCode, 'utf8');
-    exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+    console.log('[DynDec] Lua実行開始 bin=' + luaBin + ' file=' + tempFile);
+    exec(`${luaBin} ${tempFile}`, { timeout: 30000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       safeUnlink(tempFile);
+      console.log('[DynDec] Lua終了 error=' + (error && error.message) + ' stdout_len=' + (stdout && stdout.length) + ' stderr=' + (stderr && stderr.substring(0, 200)));
       try {
 
       const decoded      = parseDecodedOutputs(stdout);
