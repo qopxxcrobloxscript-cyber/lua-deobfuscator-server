@@ -351,6 +351,16 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
           <div class="method-card-title">🖥️ VMIFY</div>
           <div class="method-card-desc">VM難読化を静的解析</div>
         </label>
+        <label class="method-card" data-val="weredev_full_decompile">
+          <input type="radio" name="deobfMethod" value="weredev_full_decompile">
+          <div class="method-card-title">🐺 WEREDEVS</div>
+          <div class="method-card-desc">Weredevs定数プール復元</div>
+        </label>
+        <label class="method-card" data-val="dynamic">
+          <input type="radio" name="deobfMethod" value="dynamic">
+          <div class="method-card-title">⚙️ DYNAMIC</div>
+          <div class="method-card-desc">Lua実行+関数呼出しログ</div>
+        </label>
       </div>
     </div>
 
@@ -1017,7 +1027,7 @@ async function startDeobfuscation(){
       const successCount=data.steps.filter(s=>s.success).length;
       setDeobfStatus(`✓ 解読完了 (${successCount}/${data.steps.length} ステップ成功)`,successCount>0?'success':'error');
     }else if(data.success){
-      byId('deobfOutput').value=addHeader(data.result||data.finalCode||'');
+      byId('deobfOutput').value=addHeader(data.result||data.finalCode||data.pseudoLua||'');
       renderStepResults([data]); setDeobfStatus("✓ 解読完了！","success");
     }else{
       byId('deobfOutput').value='エラー:\n'+(data.error||'不明なエラー');
