@@ -2,7 +2,7 @@
 'use strict';
 
 // ────────────────────────────────────────────────────────────────────────
-//  Step 1: Lua数値エスケープ展開  \072 → "H"
+//  Lua数値エスケープ展開  \072 → "H"
 // ────────────────────────────────────────────────────────────────────────
 function decodeLuaEscapes(str) {
   return str.replace(/\\(\d{1,3})/g, (_, num) => {
@@ -11,9 +11,6 @@ function decodeLuaEscapes(str) {
   });
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  Step 2: Base64デコード
-// ────────────────────────────────────────────────────────────────────────
 function tryBase64Decode(str) {
   const s = str.trim();
   if (!/^[A-Za-z0-9+/]{4,}={0,2}$/.test(s)) return null;
@@ -23,25 +20,19 @@ function tryBase64Decode(str) {
     if (decoded.includes('\uFFFD')) return null;
     if (visibilityRate(decoded) >= 0.6) return decoded;
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  Step 3: XORデコード
-// ────────────────────────────────────────────────────────────────────────
 function tryXorDecode(str) {
   if (str.length < 4) return null;
-  let bestKey = -1, bestResult = null, bestRate = 0;
+  let bestResult = null, bestRate = 0;
   for (let key = 1; key <= 0xFF; key++) {
     const decoded = xorString(str, key);
     const rate = visibilityRate(decoded);
-    if (rate > bestRate) { bestRate = rate; bestResult = decoded; bestKey = key; }
+    if (rate > bestRate) { bestRate = rate; bestResult = decoded; }
     if (rate >= 0.85) break;
   }
-  if (bestRate < 0.70) return null;
-  return bestResult;
+  return bestRate >= 0.70 ? bestResult : null;
 }
 
 function xorString(str, key) {
@@ -60,66 +51,138 @@ function visibilityRate(str) {
   return visible / str.length;
 }
 
+// ────────────────────────────────────────────────────────────────────────
+//  安全な数値演算式評価
+// ────────────────────────────────────────────────────────────────────────
+function evalNumExpr(expr) {
+  if (!expr) return null;
+  try {
+    const normalized = expr.trim().replace(/\+-/g, '-');
+    if (!/^[\d\s+\-*().]+$/.test(normalized)) return null;
+    const result = Function('"use strict"; return (' + normalized + ')')();
+    if (typeof result === 'number' && isFinite(result)) return Math.floor(result);
+  } catch {}
+  return null;
+}
+
 // ════════════════════════════════════════════════════════════════════════
-//  Weredevs 独自Base64 デコーダー
-//  ─ 今回の解析で判明した正確な実装 ─
+//  Weredevs 構造動的解析
 //
-//  Weredevsは標準Base64ではなく独自のgテーブル（文字→0〜63の値）で
-//  エンコードされている。コード内の `local g={...}` がそのマッピング。
+//  Weredevsは難読化のたびにテーブル名・関数名がランダムに変わる。
+//  そのため名前ではなく「構造的な特徴」でそれぞれを検出する。
 //
-//  デコードアルゴリズム（コードから完全再現）:
-//    h=0, a=0
-//    各文字 c について:
-//      w = g[c] が存在する場合:
-//        h += w * 64^(3-a)
-//        a++
-//        a==4 になったら:
-//          b1=floor(h/65536), b2=floor((h%65536)/256), b3=h%256
-//          output chr(b1)+chr(b2)+chr(b3), h=0, a=0
-//      c=='=' の場合:
-//        output chr(floor(h/65536))
-//        次が'='でなければ output chr(floor((h%65536)/256))
-//        break
+//  構造の特徴:
+//    [定数プール]   local <名前> = {"\NNN\NNN...", ...}
+//                  → 要素が全て数値エスケープ文字列で構成された大きなテーブル
+//    [シャッフル]   for <v1>,<v2> in ipairs({{lo,hi},...}) do while ...
+//                  → プール要素を範囲リバースでシャッフルする
+//    [gマップ]      local <名前>={<文字>=<数値演算>,...} local <q>=string.sub ...
+//                  → 直後に string.sub が来る、値が全て 0〜63 のテーブル
+//    [アクセサ関数] local function <名前>(<arg>) return <プール>[<arg>-(<式>)] end
+//                  → プール名をインデックス補正してアクセスする関数
 // ════════════════════════════════════════════════════════════════════════
 
 /**
- * コードソースから Weredevs の gテーブルマッピングを動的に抽出する。
+ * Weredevs難読化コードの構造を動的解析してメタ情報を返す。
+ * テーブル名・関数名には依存しない。
  *
- * 対象: `do local E=math.floor local W=F local g={...} ...` ブロック内の
- *        `local g={e=..., Y=..., ["\\056"]=..., ...}` テーブル。
- *
- * @param {string} sourceCode  難読化されたLuaコード全体
- * @returns {Object|null}      { char → number(0〜63) } または null
+ * @param {string} sourceCode
+ * @returns {{
+ *   poolName:       string|null,
+ *   gMapName:       string|null,
+ *   accessorName:   string|null,
+ *   accessorOffset: number,
+ *   shufflePairs:   [number, number][],
+ * }}
  */
-function extractWeredevsGMap(sourceCode) {
-  if (!sourceCode || typeof sourceCode !== 'string') return null;
+function detectWeredevsStructure(sourceCode) {
+  const result = {
+    poolName:       null,
+    gMapName:       null,
+    accessorName:   null,
+    accessorOffset: 0,
+    shufflePairs:   [],
+  };
+  if (!sourceCode || typeof sourceCode !== 'string') return result;
 
-  // gテーブルブロックを抽出
-  // "local g={...}local q=string.sub" のパターンを探す
-  const gMatch = sourceCode.match(/local\s+g\s*=\s*\{([^}]+)\}local\s+q\s*=\s*string\.sub/s);
-  if (!gMatch) return null;
-
-  const gRaw = gMatch[1];
-  const gMap = {};
-
-  function evalExpr(expr) {
-    if (!expr) return null;
-    // "+-" → "-" に正規化
-    const normalized = expr.trim().replace(/\+-/g, '-');
-    try {
-      // 安全な数値演算のみ評価
-      if (!/^[\d\s+\-*().]+$/.test(normalized)) return null;
-      const result = Function('"use strict"; return (' + normalized + ')')();
-      if (typeof result === 'number' && isFinite(result)) return Math.floor(result);
-    } catch {}
-    return null;
+  // ── 定数プールを検出 ──────────────────────────────────────────────
+  // 特徴: 要素が全て \NNN\NNN... 形式の数値エスケープ文字列で構成
+  //       かつ要素数が多い（Weredevsは通常200〜500要素）
+  const poolRe = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{\s*(?:"(?:\\[0-9]{1,3})+"[,;]?\s*){20,}/g;
+  let poolM;
+  let bestPoolName = null, bestPoolCount = 0;
+  while ((poolM = poolRe.exec(sourceCode)) !== null) {
+    // 要素数をカウント
+    const startIdx = poolM.index + poolM[0].length - poolM[0].match(/\{[^}]*$/)[0].length;
+    const snippet  = sourceCode.substring(startIdx, Math.min(sourceCode.length, startIdx + 100));
+    const count    = (poolM[0].match(/"(?:\\[0-9]{1,3})+"/g) || []).length;
+    if (count > bestPoolCount) {
+      bestPoolCount = count;
+      bestPoolName  = poolM[1];
+    }
   }
+  result.poolName = bestPoolName;
+
+  // ── シャッフル仕様を検出 ──────────────────────────────────────────
+  // 特徴: for <v1>,<v2> in ipairs({{<数値>,<数値>},...}) do while <v2>[1]<<v2>[2]
+  const shuffleRe = /for\s+[A-Za-z_]\w*\s*,\s*[A-Za-z_]\w*\s+in\s+ipairs\s*\(\s*\{([\s\S]*?)\}\s*\)\s*do\s*while/;
+  const shuffleM  = shuffleRe.exec(sourceCode);
+  if (shuffleM) {
+    const pairRe = /\{([^}]+)\}/g;
+    let pm;
+    while ((pm = pairRe.exec(shuffleM[1])) !== null) {
+      const parts = pm[1].split(/[;,]/).map(p => evalNumExpr(p));
+      if (parts.length >= 2 && parts[0] !== null && parts[1] !== null) {
+        result.shufflePairs.push([parts[0], parts[1]]);
+      }
+    }
+  }
+
+  // ── gマップ（独自Base64マッピング）を検出 ────────────────────────
+  // 特徴: local <名前>={...} の直後に local <q>=string.sub が来る
+  //       かつテーブルの値が全て 0〜63 に収まる
+  const gBlockRe = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{([^}]+)\}\s*local\s+[A-Za-z_]\w*\s*=\s*string\.sub/g;
+  let gBlockM;
+  while ((gBlockM = gBlockRe.exec(sourceCode)) !== null) {
+    const gRaw     = gBlockM[2];
+    const gMap     = _parseGMapBody(gRaw);
+    const validCnt = Object.values(gMap).filter(v => v >= 0 && v <= 63).length;
+    if (validCnt >= 30) {
+      result.gMapName = gBlockM[1];
+      break;
+    }
+  }
+
+  // ── アクセサ関数を検出 ────────────────────────────────────────────
+  // 特徴: local function <名前>(<arg>) return <プール>[<arg> - (<式>)] end
+  const accessorRe = /local\s+function\s+([A-Za-z_]\w*)\s*\(\s*([A-Za-z_]\w*)\s*\)\s*return\s+([A-Za-z_]\w*)\s*\[\s*\2\s*-\s*\(([-\d+*(). ]+)\)\s*\]\s*end/g;
+  let accM;
+  while ((accM = accessorRe.exec(sourceCode)) !== null) {
+    // プール名が一致するか確認
+    const fnName   = accM[1];
+    const poolRef  = accM[3];
+    const offsetEx = accM[4];
+    if (result.poolName && poolRef !== result.poolName) continue;
+    const offset = evalNumExpr(offsetEx);
+    result.accessorName   = fnName;
+    result.accessorOffset = offset !== null ? offset : 0;
+    break;
+  }
+
+  return result;
+}
+
+/**
+ * gテーブルのbodyから { char → number } マッピングを解析する。
+ */
+function _parseGMapBody(gRaw) {
+  const gMap = {};
 
   // パターン1: 英字1文字キー  e=900270-900248
   const letterRe = /(?<!["\w.])([A-Za-z])\s*=\s*([-\d+*(). ]+?)(?=[,;\n}]|[A-Za-z]+=|\[)/g;
   let m;
   while ((m = letterRe.exec(gRaw)) !== null) {
-    const v = evalExpr(m[2]);
+    const v = evalNumExpr(m[2]);
     if (v !== null && v >= 0 && v <= 63) gMap[m[1]] = v;
   }
 
@@ -127,19 +190,68 @@ function extractWeredevsGMap(sourceCode) {
   const escRe = /\["\\+(\d{1,3})"\]\s*=\s*([-\d+*(). ]+?)(?=[,;\n}]|[A-Za-z]+=|\[)/g;
   while ((m = escRe.exec(gRaw)) !== null) {
     const c = String.fromCharCode(parseInt(m[1], 10));
-    const v = evalExpr(m[2]);
+    const v = evalNumExpr(m[2]);
     if (v !== null && v >= 0 && v <= 63) gMap[c] = v;
   }
 
-  return Object.keys(gMap).length >= 30 ? gMap : null;
+  return gMap;
 }
 
 /**
- * Weredevs 独自Base64 1文字列をデコードする。
+ * コードソースから Weredevs の gテーブルマッピングを動的に抽出する。
+ * テーブル名には依存しない。
  *
- * @param {string} encoded  gテーブルでエンコードされた文字列
- * @param {Object} gMap     extractWeredevsGMap() の返り値
- * @returns {string}        デコード済み文字列
+ * @param {string} sourceCode
+ * @returns {Object|null}  { char → number(0〜63) }
+ */
+function extractWeredevsGMap(sourceCode) {
+  if (!sourceCode || typeof sourceCode !== 'string') return null;
+
+  // 「直後に string.sub が来るテーブル」かつ「値が 0〜63」という特徴で検出
+  const gBlockRe = /local\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*\{([^}]+)\}\s*local\s+[A-Za-z_]\w*\s*=\s*string\.sub/g;
+  let gMatch;
+  let bestGMap = null, bestCount = 0;
+
+  while ((gMatch = gBlockRe.exec(sourceCode)) !== null) {
+    const gMap     = _parseGMapBody(gMatch[1]);
+    const validCnt = Object.values(gMap).filter(v => v >= 0 && v <= 63).length;
+    if (validCnt > bestCount) {
+      bestCount = validCnt;
+      bestGMap  = gMap;
+    }
+  }
+
+  return bestGMap && bestCount >= 30 ? bestGMap : null;
+}
+
+/**
+ * F[]のシャッフルを逆算して元の順序に戻す。
+ *
+ * @param {string[]}           arr     生要素配列（0-indexed）
+ * @param {[number,number][]}  pairs   detectWeredevsStructure()のshufflePairs（1-indexed）
+ * @returns {string[]}
+ */
+function unshuffleFArray(arr, pairs) {
+  if (!pairs || pairs.length === 0) return arr;
+  const result = [...arr];
+  // シャッフルは範囲リバース（自己逆変換）→ 逆順適用で元に戻る
+  for (let si = pairs.length - 1; si >= 0; si--) {
+    let lo = pairs[si][0] - 1; // 1-indexed → 0-indexed
+    let hi = pairs[si][1] - 1;
+    while (lo < hi) {
+      [result[lo], result[hi]] = [result[hi], result[lo]];
+      lo++; hi--;
+    }
+  }
+  return result;
+}
+
+/**
+ * Weredevs 独自Base64デコード（1文字列）。
+ *
+ * @param {string} encoded
+ * @param {Object} gMap    { char → number(0〜63) }
+ * @returns {string}
  */
 function weredevsCustomDecode(encoded, gMap) {
   if (!encoded || !gMap) return encoded || '';
@@ -171,156 +283,116 @@ function weredevsCustomDecode(encoded, gMap) {
       }
       break;
     }
-    // gマップにない文字（ゴミ文字）はスキップ
   }
   return result.join('');
 }
 
 /**
- * F[]テーブルのシャッフル処理を逆算して元の順序に戻す。
+ * Weredevs難読化コードから定数プールを完全デコードする。
+ * テーブル名・関数名には一切依存しない。
  *
- * Weredevsは `for E,W in ipairs({{lo1,hi1},{lo2,hi2},...})` で
- * F[]の範囲をリバースするシャッフルを行う。
- * この関数はそのシャッフル指定を解析し、配列を元に戻す。
- *
- * @param {string[]} arr          F[]の生要素配列（0-indexed）
- * @param {string}   sourceCode   難読化コード（シャッフル仕様を抽出するため）
- * @returns {string[]}            シャッフル前の元配列
- */
-function unshuffleFArray(arr, sourceCode) {
-  // for E,W in ipairs({{...},{...},...}) の部分を抽出
-  const swapMatch = sourceCode.match(
-    /for\s+E\s*,\s*W\s+in\s+ipairs\s*\(\s*\{([\s\S]*?)\}\s*\)\s*do\s*while/
-  );
-  if (!swapMatch) return arr;
-
-  const swapRaw = swapMatch[1];
-
-  function evalExpr(expr) {
-    try {
-      const normalized = expr.trim().replace(/\+-/g, '-');
-      if (!/^[\d\s+\-*().]+$/.test(normalized)) return null;
-      return Math.floor(Function('"use strict"; return (' + normalized + ')')());
-    } catch { return null; }
-  }
-
-  // 各 {lo, hi} ペアを抽出
-  const pairRe = /\{([^}]+)\}/g;
-  let m;
-  const swaps = [];
-  while ((m = pairRe.exec(swapRaw)) !== null) {
-    const parts = m[1].split(/[;,]/).map(p => evalExpr(p));
-    if (parts.length >= 2 && parts[0] !== null && parts[1] !== null) {
-      // 1-indexed → 0-indexed に変換
-      swaps.push([parts[0] - 1, parts[1] - 1]);
-    }
-  }
-
-  // シャッフルを逆順に適用（元に戻す）
-  // ※ Weredevsのシャッフルは各ペアで範囲をリバース（自己逆変換）なので
-  //   逆順適用 = 同じ操作を逆順で実行
-  const result = [...arr];
-  for (let si = swaps.length - 1; si >= 0; si--) {
-    let [lo, hi] = swaps[si];
-    while (lo < hi) {
-      [result[lo], result[hi]] = [result[hi], result[lo]];
-      lo++; hi--;
-    }
-  }
-  return result;
-}
-
-/**
- * Weredevs 難読化コードから F[]定数プールを完全デコードする。
- *
- * パイプライン:
- *   1. F[]の生要素を抽出
- *   2. シャッフル処理を逆算して元の順序に戻す
- *   3. 各要素: Luaエスケープ → Weredevs独自Base64デコード
- *
- * @param {string} sourceCode  難読化されたLuaコード
+ * @param {string} sourceCode
  * @returns {{
- *   success: boolean,
- *   pool: string[],           // 1-indexed（pool[1]がF[1]に対応）
- *   gMap: Object,
- *   count: number,
- *   method: string
+ *   success:        boolean,
+ *   pool:           string[],   // 1-indexed
+ *   gMap:           Object,
+ *   structure:      Object,
+ *   count:          number,
+ *   meaningfulCount:number,
+ *   method:         string,
  * }}
  */
 function decodeWeredevsFPool(sourceCode) {
   if (!sourceCode || typeof sourceCode !== 'string') {
-    return { success: false, error: 'コードが空', pool: [], gMap: {}, count: 0, method: 'weredevs_fpool' };
+    return { success: false, error: 'コードが空', pool: [], gMap: {}, structure: {}, count: 0, method: 'weredevs_fpool' };
   }
 
-  // Step 1: F[]テーブルを抽出
-  const fMatch = sourceCode.match(/local\s+F\s*=\s*\{([\s\S]*?)\}local\s+function\s+E/);
-  if (!fMatch) {
-    return { success: false, error: 'F[]テーブルが見つかりません', pool: [], gMap: {}, count: 0, method: 'weredevs_fpool' };
-  }
+  // Step 1: 構造を動的解析
+  const structure = detectWeredevsStructure(sourceCode);
 
-  // 文字列要素を抽出（"..." 形式）
-  const rawElements = [];
-  const elemRe = /"((?:\\.|[^"\\])*)"/g;
-  let em;
-  while ((em = elemRe.exec(fMatch[1])) !== null) {
-    rawElements.push(em[1]);
-  }
+  // Step 2: 定数プールの生要素を抽出
+  let rawElements = _extractPoolElements(sourceCode, structure.poolName);
 
   if (rawElements.length === 0) {
-    return { success: false, error: 'F[]に要素が見つかりません', pool: [], gMap: {}, count: 0, method: 'weredevs_fpool' };
+    return { success: false, error: '定数プールが見つかりません', pool: [], gMap: {}, structure, count: 0, method: 'weredevs_fpool' };
   }
 
-  // Step 2: シャッフルを逆算
-  const unshuffled = unshuffleFArray(rawElements, sourceCode);
+  // Step 3: シャッフルを逆算
+  const unshuffled = unshuffleFArray(rawElements, structure.shufflePairs);
 
-  // Step 3: gテーブルマッピングを抽出
+  // Step 4: gマップを動的抽出
   const gMap = extractWeredevsGMap(sourceCode);
   if (!gMap) {
-    return { success: false, error: 'gテーブルマッピングが抽出できません', pool: [], gMap: {}, count: 0, method: 'weredevs_fpool' };
+    return { success: false, error: 'gマップが見つかりません', pool: [], gMap: {}, structure, count: rawElements.length, method: 'weredevs_fpool' };
   }
 
-  // Step 4: 各要素をデコード（1-indexed poolとして返す）
-  const pool = [null]; // pool[0]は未使用、pool[1]がF[1]
+  // Step 5: 各要素をデコード（1-indexed）
+  const pool = [null];
   for (const raw of unshuffled) {
-    const step1 = decodeLuaEscapes(raw);   // \099\106... → Weredevs独自Base64文字列
-    const step2 = weredevsCustomDecode(step1, gMap);  // 独自Base64 → 実際の文字列
-    // 印字可能文字のみ残してクリーニング
-    const clean = step2.replace(/[^\x20-\x7e\n\t]/g, '');
-    pool.push(clean);
+    const step1 = decodeLuaEscapes(raw);
+    const step2 = weredevsCustomDecode(step1, gMap);
+    pool.push(step2.replace(/[^\x20-\x7e\n\t]/g, ''));
   }
 
-  const meaningful = pool.filter((s, i) => i > 0 && s && s.length >= 2);
+  const meaningful = pool.filter((s, i) => i > 0 && s && s.length >= 2 && /[a-zA-Z]/.test(s));
 
   return {
     success: true,
     pool,
     gMap,
+    structure,
     count: rawElements.length,
     meaningfulCount: meaningful.length,
     method: 'weredevs_fpool',
   };
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  weredevsDecode — 後方互換維持（旧 API）
-//  単一文字列のデコード。sourceCode が渡された場合は動的にgMapを抽出。
-//  渡されない場合は従来のVテーブル方式にフォールバック。
-// ────────────────────────────────────────────────────────────────────────
-
 /**
- * Weredevs文字列層の完全デコードパイプライン（後方互換版）
- *
- * @param {string}      str      デコード対象文字列
- * @param {Object|null} vtable   旧VテーブルまたはgMap（どちらも可）
- * @param {string|null} sourceCode  難読化コード全体（あればgMapを動的抽出）
+ * 定数プールの生要素（文字列）を抽出する。
+ * poolNameが判明している場合はその名前で抽出、
+ * 不明な場合は構造（数値エスケープの大きなテーブル）で検出。
  */
+function _extractPoolElements(sourceCode, poolName) {
+  let rawElements = [];
+
+  // poolNameが判明している場合
+  if (poolName) {
+    const pEsc   = poolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // local <poolName> = {...} local function の間を抽出
+    const fMatch = sourceCode.match(
+      new RegExp(`local\\s+${pEsc}\\s*=\\s*\\{([\\s\\S]*?)\\}\\s*local\\s+function`)
+    );
+    if (fMatch) {
+      const elemRe = /"((?:\\.|[^"\\])*)"/g;
+      let em;
+      while ((em = elemRe.exec(fMatch[1])) !== null) rawElements.push(em[1]);
+    }
+  }
+
+  // 見つからない場合: 数値エスケープ文字列だけで構成された大きなテーブルを探す
+  if (rawElements.length < 50) {
+    // local <名前> = {"\\NNN...", "\\NNN...", ...} で要素が50以上のテーブル
+    const bigPoolRe = /local\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*\{((?:\s*"(?:\\[0-9]{1,3})+"[,;]?\s*){50,})\}/g;
+    let bp;
+    while ((bp = bigPoolRe.exec(sourceCode)) !== null) {
+      const elems  = [];
+      const elemRe = /"((?:\\.|[^"\\])*)"/g;
+      let em;
+      while ((em = elemRe.exec(bp[1])) !== null) elems.push(em[1]);
+      if (elems.length > rawElements.length) rawElements = elems;
+    }
+  }
+
+  return rawElements;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  後方互換 API
+// ────────────────────────────────────────────────────────────────────────
 function weredevsDecode(str, vtable, sourceCode) {
   if (typeof str !== 'string') return str;
-
-  // 1. Lua数値エスケープを展開
   let result = decodeLuaEscapes(str);
 
-  // 2. sourceCodeがあればgMapを動的抽出して独自Base64デコード
   if (sourceCode && typeof sourceCode === 'string') {
     const gMap = extractWeredevsGMap(sourceCode);
     if (gMap) {
@@ -329,9 +401,8 @@ function weredevsDecode(str, vtable, sourceCode) {
     }
   }
 
-  // 3. vtableがgMap形式（値が0〜63の数値）なら独自Base64デコード
   if (vtable && typeof vtable === 'object') {
-    const vals = Object.values(vtable);
+    const vals   = Object.values(vtable);
     const isGMap = vals.length >= 30 && vals.every(v => typeof v === 'number' && v >= 0 && v <= 63);
     if (isGMap) {
       const decoded = weredevsCustomDecode(result, vtable);
@@ -339,27 +410,24 @@ function weredevsDecode(str, vtable, sourceCode) {
     }
   }
 
-  // 4. 旧Vテーブル方式（後方互換）
   if (vtable) {
     const vResult = weredevsVTableDecode(result, vtable);
     if (vResult !== null) return vResult;
   }
 
-  // 5. 標準Base64デコード
   const b64Result = tryBase64Decode(result);
   if (b64Result !== null) return b64Result;
 
-  // 6. XORデコード
   const xorResult = tryXorDecode(result);
   if (xorResult !== null) return xorResult;
 
   return result;
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  旧 weredevsVTableDecode（後方互換維持）
-// ────────────────────────────────────────────────────────────────────────
 function buildVTable(sourceCode) {
+  const gMap = extractWeredevsGMap(sourceCode);
+  if (gMap && Object.keys(gMap).length >= 30) return gMap;
+
   const vmatch = sourceCode.match(/local\s+(?:V|g)\s*=\s*\{([\s\S]{100,}?)\}(?:local\s+\w+\s*=\s*string\.sub|for\s+\w)/);
   if (!vmatch) return null;
   const vtext = vmatch[1];
@@ -409,7 +477,7 @@ function weredevsVTableDecode(str, vtable) {
       break;
     }
   }
-  const raw = g.join('').replace(/\x00+$/g, '');
+  const raw  = g.join('').replace(/\x00+$/g, '');
   const rate = visibilityRate(raw);
   if (rate >= 0.6) return raw.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
   if (raw.length >= 3) {
@@ -425,12 +493,14 @@ module.exports = {
   tryXorDecode,
   xorString,
   visibilityRate,
-  // 新API（今回追加）
+  evalNumExpr,
+  // Weredevs 動的解析（新API）
+  detectWeredevsStructure,
   extractWeredevsGMap,
   weredevsCustomDecode,
   unshuffleFArray,
   decodeWeredevsFPool,
-  // 旧API（後方互換維持）
+  // 後方互換
   weredevsDecode,
   buildVTable,
   weredevsVTableDecode,
