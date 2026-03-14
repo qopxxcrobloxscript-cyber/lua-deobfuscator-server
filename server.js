@@ -843,62 +843,46 @@ local function __outer_hook(c, ...)
   end
   return __orig_ls_outer(c, ...)
 end
--- _G に直接書き込む
+
+-- loadstring フックを chunk() 呼び出し前に全環境へ確実に仕込む
+-- Weredevs は chunk() 内で自己実行するため、呼び出し前のフックが必須
 loadstring = __outer_hook
 load       = __outer_hook
 if rawset then
   pcall(function() rawset(_G, "loadstring", __outer_hook) end)
   pcall(function() rawset(_G, "load",       __outer_hook) end)
 end
--- getfenv() 経由でも差し替える (Weredevs は getfenv で環境を取得するため必須)
 if getfenv then
   pcall(function()
-    local _genv = getfenv(0)
-    if _genv then
-      _genv.loadstring = __outer_hook
-      _genv.load       = __outer_hook
-    end
+    local _e = getfenv(0)
+    if _e then _e.loadstring = __outer_hook; _e.load = __outer_hook end
   end)
   pcall(function()
-    local _genv = getfenv(1)
-    if _genv then
-      _genv.loadstring = __outer_hook
-      _genv.load       = __outer_hook
-    end
+    local _e = getfenv(1)
+    if _e then _e.loadstring = __outer_hook; _e.load = __outer_hook end
   end)
 end
 
 local __ok, __err = pcall(function()
   local chunk, err = __orig_ls_outer(__obf_code)
   if not chunk then error("parse error: " .. tostring(err)) end
+  -- chunk() 呼び出し前にもう一度フック (chunk のfenv にも仕込む)
+  if getfenv then
+    pcall(function()
+      local _e = getfenv(chunk)
+      if _e then _e.loadstring = __outer_hook; _e.load = __outer_hook end
+    end)
+  end
   local r = chunk()
-  io.write("__DEBUG_TYPE__:" .. type(r) .. "\\n")
-  io.flush()
+  -- chunk() が function を返した場合 (二重ラッパー構造) は続けて実行
   if type(r) == "function" then
-    local _base = (getfenv and getfenv()) or _ENV or {}
-    local _mt_env = setmetatable({}, {
-      __index = function(t, k)
-        if k == "loadstring" or k == "load" then
-          io.write("__DEBUG_LS_ACCESSED__:" .. k .. "\\n")
-          io.flush()
-          return __outer_hook
-        end
-        return _base[k]
-      end,
-      __newindex = function(t, k, v) _base[k] = v end,
-    })
     if getfenv then
       pcall(function()
-        local _env = getfenv(r)
-        if _env then
-          _env.loadstring = __outer_hook
-          _env.load = __outer_hook
-          io.write("__DEBUG_FENV_SET__:ok\\n")
-          io.flush()
-        end
+        local _e = getfenv(r)
+        if _e then _e.loadstring = __outer_hook; _e.load = __outer_hook end
       end)
     end
-    r(_mt_env, unpack or table.unpack, newproxy, setmetatable, getmetatable, select)
+    r()
   end
 end)
 
