@@ -2,11 +2,17 @@
 'use strict';
 
 const { decodeLuaEscapes }  = require('../../core/stringDecoder');
-const { weredevsDecode, buildVTable } = require('../../utils/stringPipeline');
+const {
+  weredevsDecode,
+  buildVTable,
+  extractWeredevsGMap,
+  weredevsCustomDecode,
+  unshuffleFArray,
+  decodeWeredevsFPool,
+} = require('../../utils/stringPipeline');
 
 // ────────────────────────────────────────────────────────────────────────
 //  最初の LocalStatement の変数名を動的取得
-//  固定名 ("R", "Z" など) への依存を排除する
 // ────────────────────────────────────────────────────────────────────────
 function extractFirstLocalName(code) {
   const m = code.match(/^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)/m);
@@ -30,7 +36,6 @@ function extractVmTableNames(code) {
 
 function extractVmTable(code, vmTableName) {
   if (!vmTableName || !code) return null;
-  // R配列処理前にLua escapeを展開
   code = decodeLuaEscapes(code);
   const startRe = new RegExp('local\\s+' + vmTableName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*=\\s*\\{');
   const startM  = startRe.exec(code);
@@ -75,43 +80,103 @@ function extractVmTable(code, vmTableName) {
   };
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  extractWeredevConstPool — Weredevs定数プール完全デコード
+//
+//  【変更点】
+//  旧実装は buildVTable() + weredevsVTableDecode() を使っていたが、
+//  実際のWeredevsは:
+//    1. local F={"\NNN\NNN...",...} — 数値エスケープで格納
+//    2. for E,W in ipairs({{lo,hi},...}) — F[]をシャッフル
+//    3. do local g={e=22, Y=5, ...} — 独自Base64マッピング定義
+//    4. for F=1,#W,1 do ... デコードループ — F[]を上書き
+//  という構造になっている。
+//
+//  この関数は decodeWeredevsFPool() を使って正しくデコードする。
+// ════════════════════════════════════════════════════════════════════════
 function extractWeredevConstPool(code) {
   try {
-  // Vテーブルを先に抽出
-  const vtable = buildVTable(code);
-  // 定数プール抽出前にLua escapeをコード全体へ展開
-  code = decodeLuaEscapes(code);
-  const pools = {};
-  const tableRe = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{/g;
-  let m;
-  while ((m = tableRe.exec(code)) !== null) {
-    const varName = m[1];
-    const startPos = m.index + m[0].length - 1;
-    let depth = 0, end = -1;
-    const limit = Math.min(code.length, startPos + 2000000);
-    for (let i = startPos; i < limit; i++) {
-      if (code[i] === '{') depth++;
-      else if (code[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    // ── 新方式: decodeWeredevsFPool() で F[]を完全デコード ──────────────
+    const fPoolResult = decodeWeredevsFPool(code);
+    if (fPoolResult.success && fPoolResult.pool.length > 1) {
+      const pools = {};
+
+      // pool[1]〜pool[N] を "F" という名前の定数プールとして返す
+      // 各要素を { type, raw, value } 形式に変換
+      const elements = fPoolResult.pool.slice(1).map((s, i) => {
+        if (!s) return { type: 'nil', raw: '', value: null };
+        // 数値に変換できるか試みる
+        const num = Number(s);
+        if (!isNaN(num) && s.trim() !== '') return { type: 'number', raw: s, value: num };
+        return { type: 'string', raw: s, value: s };
+      });
+
+      // 意味のある文字列要素数を計算
+      const strCount = elements.filter(e => e && e.type === 'string' && e.value.length > 0).length;
+
+      pools['F'] = {
+        name: 'F',
+        elements,
+        count: elements.length,
+        startPos: 0,
+        endPos: 0,
+        isLikelyConstPool: strCount >= 10,
+        // 追加情報
+        _decoded: true,
+        _gMap: fPoolResult.gMap,
+        _meaningfulCount: fPoolResult.meaningfulCount,
+      };
+
+      return pools;
     }
-    if (end === -1) continue;
-    const body = code.substring(startPos + 1, end);
-    const elements = parseConstPoolBody(body);
-    if (elements.length < 1) continue;
-    // 各要素にVテーブルデコードを適用
-    for (const el of elements) {
-      if (el && el.type === 'string' && vtable) {
-        const decoded = weredevsDecode(el.value, vtable);
-        if (decoded !== el.value) el.value = decoded;
-      }
-    }
-    pools[varName] = {
-      name: varName, elements,
-      count: elements.length,
-      startPos: m.index, endPos: end + 1,
-      isLikelyConstPool: detectIfConstPool(elements),
-    };
+
+    // ── フォールバック: 旧方式（Vテーブル + weredevsVTableDecode） ──────
+    return _extractWeredevConstPoolLegacy(code);
+
+  } catch (err) {
+    console.error('[extractWeredevConstPool] error:', err.message);
+    try { return _extractWeredevConstPoolLegacy(code); } catch {}
+    return {};
   }
-  return pools;
+}
+
+/**
+ * 旧方式の定数プール抽出（後方互換フォールバック）
+ */
+function _extractWeredevConstPoolLegacy(code) {
+  try {
+    const vtable = buildVTable(code);
+    code = decodeLuaEscapes(code);
+    const pools = {};
+    const tableRe = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{/g;
+    let m;
+    while ((m = tableRe.exec(code)) !== null) {
+      const varName = m[1];
+      const startPos = m.index + m[0].length - 1;
+      let depth = 0, end = -1;
+      const limit = Math.min(code.length, startPos + 2000000);
+      for (let i = startPos; i < limit; i++) {
+        if (code[i] === '{') depth++;
+        else if (code[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end === -1) continue;
+      const body = code.substring(startPos + 1, end);
+      const elements = parseConstPoolBody(body);
+      if (elements.length < 1) continue;
+      for (const el of elements) {
+        if (el && el.type === 'string' && vtable) {
+          const decoded = weredevsDecode(el.value, vtable);
+          if (decoded !== el.value) el.value = decoded;
+        }
+      }
+      pools[varName] = {
+        name: varName, elements,
+        count: elements.length,
+        startPos: m.index, endPos: end + 1,
+        isLikelyConstPool: detectIfConstPool(elements),
+      };
+    }
+    return pools;
   } catch (err) {
     return {};
   }
@@ -159,7 +224,6 @@ function resolveConstPoolElement(tok) {
       .replace(/\\\\/g,'\\').replace(/\\"/g,'"').replace(/\\'/g,"'")
       .replace(/\\(\d{1,3})/g,(_,d)=>String.fromCharCode(parseInt(d)))
       .replace(/\\x([0-9a-fA-F]{2})/g,(_,h)=>String.fromCharCode(parseInt(h,16)));
-    // 文字列要素確定直後にLua数値エスケープを追加デコード
     value = decodeLuaEscapes(value);
     return { type: 'string', raw: tok, value };
   }
@@ -187,27 +251,17 @@ function detectIfConstPool(elements) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  R配列構築 + weredevsDecodeパイプラインを適用
-//  最初のLocalStatementの変数名を動的取得して固定名依存を排除
+//  buildConstPoolArray
 // ────────────────────────────────────────────────────────────────────────
 function buildConstPoolArray(constPools, code) {
-  // ────────────────────────────────────────────────────────────────────────
-  //  定数プール配列を構築する。
-  //
-  //  【変更点】
-  //  旧実装は extractFirstLocalName() で取得した「先頭の local 変数名」を
-  //  優先していたため、変数名がランダムに変わる難読化コードで誤検出する
-  //  リスクがあった。
-  //
-  //  新実装は名前に一切依存せず、以下の優先順で候補を選ぶ:
-  //    1. isLikelyConstPool=true のうち最大要素数のテーブル
-  //    2. (fallback) 要素数が最大のテーブル
-  // ────────────────────────────────────────────────────────────────────────
   if (!constPools || Object.keys(constPools).length === 0) return [];
 
-  let poolName = null;
+  // 新方式でデコード済みの 'F' プールがあればそれを優先
+  if (constPools['F'] && constPools['F']._decoded) {
+    return constPools['F'].elements.map(e => e ? e.value : null);
+  }
 
-  // 優先1: isLikelyConstPool=true で最大要素数
+  let poolName = null;
   let maxLikely = 0;
   for (const [name, pool] of Object.entries(constPools)) {
     if (pool.isLikelyConstPool && pool.count > maxLikely) {
@@ -215,31 +269,19 @@ function buildConstPoolArray(constPools, code) {
       poolName = name;
     }
   }
-
-  // fallback: 単純に最大要素数
   if (!poolName) {
     let maxCount = 0;
     for (const [name, pool] of Object.entries(constPools)) {
-      if (pool.count > maxCount) {
-        maxCount = pool.count;
-        poolName = name;
-      }
+      if (pool.count > maxCount) { maxCount = pool.count; poolName = name; }
     }
   }
-
   if (!poolName || !constPools[poolName]) return [];
 
-  // Vテーブルを抽出（Weredevs独自Base64マッピング）
   const vtable = buildVTable(code || '');
-
-  // 定数プール配列を構築し、全文字列要素に weredevsDecode を適用する
   const R = constPools[poolName].elements.map(e => e ? e.value : null);
   for (let i = 0; i < R.length; i++) {
-    if (typeof R[i] === 'string') {
-      R[i] = weredevsDecode(R[i], vtable);
-    }
+    if (typeof R[i] === 'string') R[i] = weredevsDecode(R[i], vtable);
   }
-
   return R;
 }
 
@@ -263,6 +305,18 @@ function extractWeredevZAccessor(code, constPools) {
       }
     }
   }
+
+  // 新方式: E() 関数（F[]アクセサ）も登録
+  // `local function E(E) return F[E-(-231710-(-276658))] end` のパターン
+  const eFuncM = code.match(/local\s+function\s+E\s*\(\s*E\s*\)\s*return\s+F\s*\[\s*E\s*-\s*\(([-\d+*(). ]+)\)\s*\]/);
+  if (eFuncM) {
+    try {
+      const offsetExpr = eFuncM[1].replace(/\+-/g, '-');
+      const offset = -Math.floor(Function('"use strict"; return (' + offsetExpr + ')')());
+      accessors['E'] = { funcName: 'E', poolName: 'F', offset, sign: '-', raw: eFuncM[0] };
+    } catch {}
+  }
+
   return accessors;
 }
 
@@ -338,8 +392,7 @@ function _collectLeafStatements(src, jVar, out, hintThreshold) {
 }
 
 function _splitIfThenElse(src, thenStart) {
-  let depth = 1;
-  let elsePos = -1;
+  let depth = 1, elsePos = -1;
   const keywords = /\b(if|while|for|repeat|do|function)\b|\b(end|until)\b|\belse(?:if)?\b/g;
   keywords.lastIndex = thenStart;
   let km;
@@ -380,60 +433,55 @@ function _findIfBlockEnd(src, ifStart) {
 
 function extractWeredevDispatchLoop(code) {
   try {
-  const loops = [];
-  const whileRe = /while\s+([A-Za-z_]\w*)\s+do\b/g;
-  let m;
-  while ((m = whileRe.exec(code)) !== null) {
-    const loopVar = m[1];
-    if (loopVar === 'true' || loopVar === '1') continue;
-    const doIdx = code.indexOf('do', m.index + m[0].length - 3);
-    if (doIdx === -1) continue;
-    let depth = 1, end = -1;
-    let scan = doIdx + 2;
-    const limit = Math.min(code.length, doIdx + 5000000);
-    while (scan < limit) {
-      const sub = code.slice(scan);
-      const nextDo  = sub.search(/\b(do|then|repeat)\b/);
-      const nextEnd = sub.search(/\bend\b/);
-      if (nextEnd === -1) break;
-      if (nextDo !== -1 && nextDo < nextEnd) { depth++; scan += nextDo + 2; }
-      else { depth--; if (depth === 0) { end = scan + nextEnd + 3; break; } scan += nextEnd + 3; }
+    const loops = [];
+    const whileRe = /while\s+([A-Za-z_]\w*)\s+do\b/g;
+    let m;
+    while ((m = whileRe.exec(code)) !== null) {
+      const loopVar = m[1];
+      if (loopVar === 'true' || loopVar === '1') continue;
+      const doIdx = code.indexOf('do', m.index + m[0].length - 3);
+      if (doIdx === -1) continue;
+      let depth = 1, end = -1;
+      let scan = doIdx + 2;
+      const limit = Math.min(code.length, doIdx + 5000000);
+      while (scan < limit) {
+        const sub = code.slice(scan);
+        const nextDo  = sub.search(/\b(do|then|repeat)\b/);
+        const nextEnd = sub.search(/\bend\b/);
+        if (nextEnd === -1) break;
+        if (nextDo !== -1 && nextDo < nextEnd) { depth++; scan += nextDo + 2; }
+        else { depth--; if (depth === 0) { end = scan + nextEnd + 3; break; } scan += nextEnd + 3; }
+      }
+      if (end === -1) continue;
+      const loopBody = code.substring(m.index, end);
+      const dispatchBlocks = extractIfJBlocks(loopBody, loopVar);
+      if (dispatchBlocks.length < 1) continue;
+      loops.push({ loopVar, loopStart: m.index, loopEnd: end, body: loopBody, dispatchBlocks, blockCount: dispatchBlocks.length });
     }
-    if (end === -1) continue;
-    const loopBody = code.substring(m.index, end);
-    const dispatchBlocks = extractIfJBlocks(loopBody, loopVar);
-    if (dispatchBlocks.length < 1) continue;
-    loops.push({ loopVar, loopStart: m.index, loopEnd: end, body: loopBody, dispatchBlocks, blockCount: dispatchBlocks.length });
-  }
-  const whileTrueRe = /while\s+true\s+do\b/g;
-  while ((m = whileTrueRe.exec(code)) !== null) {
-    const snippet = code.substring(m.index, Math.min(code.length, m.index + 500000));
-    const blocks = extractIfJBlocks(snippet, null);
-    if (blocks.length >= 3) {
-      const jVarM = snippet.match(/if\s+([A-Za-z_]\w*)\s*[<>=!]/);
-      const lv = jVarM ? jVarM[1] : 'J';
-      loops.push({ loopVar: lv, loopStart: m.index, loopEnd: m.index + snippet.length,
-        body: snippet, dispatchBlocks: blocks, blockCount: blocks.length, isWhileTrue: true });
+    const whileTrueRe = /while\s+true\s+do\b/g;
+    while ((m = whileTrueRe.exec(code)) !== null) {
+      const snippet = code.substring(m.index, Math.min(code.length, m.index + 500000));
+      const blocks = extractIfJBlocks(snippet, null);
+      if (blocks.length >= 3) {
+        const jVarM = snippet.match(/if\s+([A-Za-z_]\w*)\s*[<>=!]/);
+        const lv = jVarM ? jVarM[1] : 'J';
+        loops.push({ loopVar: lv, loopStart: m.index, loopEnd: m.index + snippet.length,
+          body: snippet, dispatchBlocks: blocks, blockCount: blocks.length, isWhileTrue: true });
+      }
     }
-  }
-  return loops;
+    return loops;
   } catch (err) {
     return [];
   }
 }
 
 function dumpBytecodeTables(code) {
-  // ────────────────────────────────────────────────────────────────────────
-  //  local <任意の変数名> = { ... } を検出する。
-  //  変数名は毎回ランダムなため固定名には依存しない。
-  //  テーブル本体はブレースカウントで正確に閉じ括弧を探す（ネスト対応）。
-  // ────────────────────────────────────────────────────────────────────────
   const candidates = [];
   const headerRe = /local\s+(\w+)\s*=\s*\{/g;
   let m;
   while ((m = headerRe.exec(code)) !== null) {
     const varName  = m[1];
-    const openPos  = m.index + m[0].length - 1; // '{' の位置
+    const openPos  = m.index + m[0].length - 1;
     let depth = 0, closePos = -1;
     const limit = Math.min(code.length, openPos + 500000);
     for (let i = openPos; i < limit; i++) {
@@ -441,9 +489,7 @@ function dumpBytecodeTables(code) {
       else if (code[i] === '}') { depth--; if (depth === 0) { closePos = i; break; } }
     }
     if (closePos === -1) continue;
-
     const body = code.substring(openPos + 1, closePos);
-    // 数値要素のみをカウント（文字列・ネストテーブルは除外）
     const nums = body.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
     if (nums.length >= 50) candidates.push({ name: varName, count: nums.length });
   }
@@ -456,10 +502,6 @@ function dumpBytecodeTables(code) {
 }
 
 function vmBytecodeExtractor(code) {
-  // ────────────────────────────────────────────────────────────────────────
-  //  local <任意の変数名> = { ... } を検出する（固定名依存なし）。
-  //  dumpBytecodeTables と同じくブレースカウントでテーブル本体を抽出。
-  // ────────────────────────────────────────────────────────────────────────
   const tables = [];
   const headerRe = /local\s+(\w+)\s*=\s*\{/g;
   let m;
@@ -473,7 +515,6 @@ function vmBytecodeExtractor(code) {
       else if (code[i] === '}') { depth--; if (depth === 0) { closePos = i; break; } }
     }
     if (closePos === -1) continue;
-
     const body = code.substring(openPos + 1, closePos);
     const nums  = body.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
     if (nums.length >= 10) {
