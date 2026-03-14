@@ -874,8 +874,14 @@ local __ok, __err = pcall(function()
   local r = chunk()
   if type(r) == "function" then
     -- Weredevs形式: return(function(...) ... end)(args)
-    -- chunk()の戻り値がfunctionの場合、それ自体がVMなので実行する
-    -- 実行前にもう一度loadstringフックを確実に差し替える
+    -- 末尾の引数は (getfenv and getfenv() or _ENV, unpack or table.unpack, ...)
+    -- その環境オブジェクトに直接loadstringフックを差し込む
+    local _callenv = (getfenv and getfenv()) or _ENV or {}
+    if _callenv then
+      _callenv.loadstring = __outer_hook
+      _callenv.load       = __outer_hook
+    end
+    -- getfenv(r) でVM関数自身の環境にも差し込む
     if getfenv then
       pcall(function()
         local _env = getfenv(r)
@@ -885,7 +891,9 @@ local __ok, __err = pcall(function()
         end
       end)
     end
-    r()
+    -- VM実行: Weredevsは (env, unpack, newproxy, ...) を引数に取る
+    -- _callenv を第1引数として渡すことでVM内部のloadstringをフック済みにする
+    r(_callenv, unpack or table.unpack, newproxy, setmetatable, getmetatable, select)
   end
 end)
 
