@@ -897,14 +897,8 @@ end
   return new Promise(resolve => {
     const luaCode = wrapper;
     fs.writeFileSync(tempFile, luaCode, 'utf8');
-    console.log('[DynDec] Lua実行開始 bin=' + luaBin + ' file=' + tempFile);
-    console.log('[DynDec] wrapper先頭200:', luaCode.substring(0, 200));
-    console.log('[DynDec] wrapper末尾200:', luaCode.substring(luaCode.length - 200));
     exec(`${luaBin} ${tempFile}`, { timeout: 30000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
-      // デバッグ中はファイルを残す
-      // safeUnlink(tempFile);
-      console.log('[DynDec] Lua終了 error=' + (error && error.message) + ' stdout_len=' + (stdout && stdout.length) + ' stderr=' + (stderr && stderr.substring(0, 200)));
-      console.log('[DynDec] stdout全文:', JSON.stringify(stdout && stdout.substring(0, 500)));
+      safeUnlink(tempFile);
       try {
 
       const decoded      = parseDecodedOutputs(stdout);
@@ -991,6 +985,30 @@ end
         const finalResult = { success: true, result: vmAnalysis.weredevDecompiled, method: 'weredev_decompile', vmAnalysis, WereDevVMDetected: true, _sid: sid };
         endVmSession(sid, finalResult);
         return resolve(finalResult);
+      }
+
+      // ── Weredevsモード専用: loadstringフックが発火しなくても
+      //    stdoutに直接出力された実行結果を拾う ──────────────────────────
+      // Weredevs VMは loadstring を経由せず直接コードを実行するため、
+      // print() 等の出力がマーカーなしで stdout に出る。
+      // __EXEC_ERROR__ も __DECODED_START__ もない場合で stdout に内容があれば成功とみなす。
+      if (weredevMode && stdout && stdout.trim().length > 0) {
+        const rawOut = stdout
+          .replace(/__EXEC_ERROR__:[^\n]*/g, '')
+          .replace(/__DECODED_START_0__[\s\S]*?__DECODED_END_0__/g, '')
+          .trim();
+        if (rawOut.length > 0) {
+          const finalResult = {
+            success: true,
+            result: '-- Weredevs VM 実行出力:\n' + rawOut,
+            method: 'dynamic_decode_weredevs_stdout',
+            vmAnalysis: vmAnalysis,
+            WereDevVMDetected: true,
+            _sid: sid,
+          };
+          endVmSession(sid, finalResult);
+          return resolve(finalResult);
+        }
       }
 
       let errMsg = '';
