@@ -824,7 +824,7 @@ end
 local function __log_call(name, args)
   local parts = {}
   for i = 1, #args do parts[i] = __fmt(args[i]) end
-  io.write("__CALL_LOG__:" .. name .. "(" .. table.concat(parts, ", ") .. ")\n")
+  io.write("__CALL_LOG__:" .. name .. "(" .. table.concat(parts, ", ") .. ")\\n")
   io.flush()
 end
 
@@ -996,13 +996,14 @@ end
       if (weredevMode && stdout && stdout.trim().length > 0) {
         // __CALL_LOG__ マーカーから関数呼び出しを抽出
         const callLogs = [];
-        const callLogRe = /__CALL_LOG__:(.+?)[\r\n]/g;
+        const callLogRe = /__CALL_LOG__:(.+?)\\n/g;
         let clm;
         while ((clm = callLogRe.exec(stdout)) !== null) {
           callLogs.push(clm[1].trim());
         }
         // 生の実行出力（マーカー行を除去）
         const rawOut = stdout
+          .replace(/__CALL_LOG__:[^\\n]*\\n/g, '')
           .replace(/__CALL_LOG__:[^\n]*\n/g, '')
           .replace(/__EXEC_ERROR__:[^\n]*/g, '')
           .replace(/__DECODED_START_0__[\s\S]*?__DECODED_END_0__/g, '')
