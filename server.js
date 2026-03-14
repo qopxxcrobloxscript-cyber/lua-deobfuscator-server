@@ -872,28 +872,35 @@ local __ok, __err = pcall(function()
   local chunk, err = __orig_ls_outer(__obf_code)
   if not chunk then error("parse error: " .. tostring(err)) end
   local r = chunk()
+  io.write("__DEBUG_TYPE__:" .. type(r) .. "\n")
+  io.flush()
   if type(r) == "function" then
-    -- Weredevs形式: return(function(...) ... end)(args)
-    -- 末尾の引数は (getfenv and getfenv() or _ENV, unpack or table.unpack, ...)
-    -- その環境オブジェクトに直接loadstringフックを差し込む
-    local _callenv = (getfenv and getfenv()) or _ENV or {}
-    if _callenv then
-      _callenv.loadstring = __outer_hook
-      _callenv.load       = __outer_hook
-    end
-    -- getfenv(r) でVM関数自身の環境にも差し込む
+    -- loadstring が呼ばれたときにフックするメタテーブル環境を作る
+    local _base = (getfenv and getfenv()) or _ENV or {}
+    local _mt_env = setmetatable({}, {
+      __index = function(t, k)
+        if k == "loadstring" or k == "load" then
+          io.write("__DEBUG_LS_ACCESSED__:" .. k .. "\n")
+          io.flush()
+          return __outer_hook
+        end
+        return _base[k]
+      end,
+      __newindex = function(t, k, v) _base[k] = v end,
+    })
+    -- getfenv(r) でVM関数の環境にも仕込む
     if getfenv then
       pcall(function()
         local _env = getfenv(r)
         if _env then
           _env.loadstring = __outer_hook
-          _env.load       = __outer_hook
+          _env.load = __outer_hook
+          io.write("__DEBUG_FENV_SET__:ok\n")
+          io.flush()
         end
       end)
     end
-    -- VM実行: Weredevsは (env, unpack, newproxy, ...) を引数に取る
-    -- _callenv を第1引数として渡すことでVM内部のloadstringをフック済みにする
-    r(_callenv, unpack or table.unpack, newproxy, setmetatable, getmetatable, select)
+    r(_mt_env, unpack or table.unpack, newproxy, setmetatable, getmetatable, select)
   end
 end)
 
