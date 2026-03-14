@@ -854,7 +854,9 @@ pcall(function()
   end
 end)
 ${weredevMode ? rbxEnvBlock : normalEnvBlock}
-local __obf_code = (loadstring or load)(${JSON.stringify(safeFullCode)})
+local __obf_code = [==[
+${safeFullCode}
+]==]
 
 local __orig_ls_outer = loadstring or load
 local function __outer_hook(c, ...)
