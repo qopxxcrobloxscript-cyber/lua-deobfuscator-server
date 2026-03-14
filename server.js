@@ -919,6 +919,7 @@ end
   return new Promise(resolve => {
     const luaCode = wrapper;
     fs.writeFileSync(tempFile, luaCode, 'utf8');
+console.log('[DEBUG]', luaCode.split('\n').slice(278, 284).map((l,i)=>`L${279+i}: ${l}`).join(' | '));
     console.log('[DynDec] Lua実行開始 bin=' + luaBin + ' file=' + tempFile);
     exec(`${luaBin} ${tempFile}`, { timeout: 30000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       safeUnlink(tempFile);
