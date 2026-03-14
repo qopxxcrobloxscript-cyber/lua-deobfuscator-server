@@ -36,7 +36,7 @@ const {
   advancedStaticDeobfuscate, deepStaticDeobfuscate, symbolicExecute, recursiveDeobfuscate,
 } = astTools;
 const {
-  safeEnvPreamble, hookLoadstringCode, vmHookBootstrap,
+  safeEnvPreamble, hookLoadstringCode, vmHookBootstrap, vmDumpFooter,
   injectVmHook, runLuaWithHooks, parseDecodedOutputs,
   parseVmLogs, parseVmTrace, parseBTableLog, parseVTableLog,
   parseStrLog, parseStrCharLog, parseTConcatLog,
@@ -587,7 +587,8 @@ async function dynamicDecode(code) {
   codeToRun = codeToRun.replace(/^--\[\[[\s\S]*?\]\]\s*/, '');
 
   const vmInfo = vmDetector(codeToRun);
-  const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
+  const _vmDumpFooter = (typeof vmDumpFooter === 'string') ? vmDumpFooter : '';
+  const fullCode = preamble + '\n' + codeToRun + '\n' + _vmDumpFooter;
   const safeFullCode = fullCode;
   const tempFile = path.join(tempDir, `dyndec_${makeTempId()}.lua`);
 
