@@ -551,11 +551,11 @@ async function dynamicDecode(code) {
   const sid = beginVmSession('dynamic_decode');
 
   // ── preamble ──────────────────────────────────────────────────────────
-  // Weredevsモード: hookLoadstringCode + vmHookBootstrap のみ
-  //                 （safeEnvPreamble は getfenv/setfenv を変更するためスキップ）
+  // Weredevsモード: 完全に空 (hookLoadstringCode/vmHookBootstrap も混ぜない)
+  //                 これらがWeredevsのコードと混在するとパースエラーの原因になる
   // 通常モード    : safeEnvPreamble + hookLoadstringCode + vmHookBootstrap
   const preamble = weredevMode
-    ? hookLoadstringCode + '\n' + vmHookBootstrap
+    ? ''
     : safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
 
   let vmHookInjected = false, bytecodeCandidates = [];
@@ -811,9 +811,8 @@ rawset(_G, "math",          math)
 rawset(_G, "io",            io)
 rawset(_G, "coroutine",     coroutine)
 
--- ── 全グローバル関数フック ────────────────────────────────────────────
--- 呼ばれた関数名と引数を __CALL_LOG__ マーカーで記録する。
--- これにより print 以外の呼び出しも全て追跡できる。
+-- ── 関数呼び出しフック (print / warn のみ) ───────────────────────────
+-- tostring / tonumber / error はVM内部で多用されるためフックしない
 local function __fmt(v)
   local t = type(v)
   if t == "string" then return string.format("%q", v) end
@@ -829,41 +828,19 @@ local function __log_call(name, args)
   io.flush()
 end
 
--- フック対象の関数一覧
-local __orig_print   = print
-local __orig_warn    = function(...) end
-local __orig_error   = error
-local __orig_tostr   = tostring
-local __orig_tonnum  = tonumber
-local __orig_require = require or function() return {} end
-
+local __orig_print = print
 rawset(_G, "print", function(...)
   local args = {...}
   __log_call("print", args)
-  __orig_print(...)
+  return __orig_print(...)
 end)
 rawset(_G, "warn", function(...)
-  local args = {...}
-  __log_call("warn", args)
+  __log_call("warn", {...})
 end)
-rawset(_G, "error", function(msg, lvl)
-  __log_call("error", {msg})
-  __orig_error(msg, lvl)
-end)
-rawset(_G, "tostring", function(v)
-  local r = __orig_tostr(v)
-  __log_call("tostring", {v})
-  return r
-end)
-rawset(_G, "tonumber", function(v, b)
-  local r = __orig_tonnum(v, b)
-  __log_call("tonumber", {v})
-  return r
-end)
-rawset(_G, "require", function(m)
-  __log_call("require", {m})
-  return pcall(__orig_require, m) and __orig_require(m) or {}
-end)
+rawset(_G, "tostring",  tostring)
+rawset(_G, "tonumber",  tonumber)
+rawset(_G, "error",     error)
+rawset(_G, "require",   require or function() return {} end)
 -- ══ Roblox仮想環境 END ══
 `;
 
