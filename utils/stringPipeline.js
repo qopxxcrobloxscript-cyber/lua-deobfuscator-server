@@ -141,9 +141,21 @@ function weredevsVTableDecode(str, vtable) {
       break;
     }
   }
-  const result = g.join('').replace(/\x00+$/g, '');
-  // 可視文字率が60%以上なら有効
-  return visibilityRate(result) >= 0.6 ? result : null;
+  const raw = g.join('').replace(/\x00+$/g, '');
+  const rate = visibilityRate(raw);
+
+  // 可視率60%以上なら即採用（制御文字を除去して返す）
+  if (rate >= 0.6) {
+    return raw.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+  }
+
+  // 可視率が低い場合はXOR層が重なっている可能性があるので試みる
+  if (raw.length >= 3) {
+    const xorResult = tryXorDecode(raw);
+    if (xorResult !== null) return xorResult;
+  }
+
+  return null;
 }
 
 // ────────────────────────────────────────────────────────────────────────
