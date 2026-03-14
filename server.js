@@ -767,9 +767,6 @@ local __RunService = __rbx_wrap("RunService", {
 })
 
 -- ── _G に全スタブを注入 ───────────────────────────────────────────────
--- engine.lua の setmetatable(env, {__index=...}) 相当をグローバルへ直接適用する。
--- Weredevs VM は getfenv() でグローバル環境を取得して参照するため、
--- _G への直接書き込みが最も確実な方法。
 rawset(_G, "game",          __game)
 rawset(_G, "workspace",     __game.Workspace)
 rawset(_G, "Workspace",     __game.Workspace)
@@ -790,8 +787,6 @@ rawset(_G, "RunService",    __RunService)
 rawset(_G, "tick",          os.clock)
 rawset(_G, "time",          os.clock)
 rawset(_G, "os",            os)
-rawset(_G, "warn",          function(...) end)
-rawset(_G, "error",         error)
 rawset(_G, "assert",        assert)
 rawset(_G, "pcall",         pcall)
 rawset(_G, "xpcall",        xpcall)
@@ -815,7 +810,60 @@ rawset(_G, "table",         table)
 rawset(_G, "math",          math)
 rawset(_G, "io",            io)
 rawset(_G, "coroutine",     coroutine)
-rawset(_G, "print",         print)
+
+-- ── 全グローバル関数フック ────────────────────────────────────────────
+-- 呼ばれた関数名と引数を __CALL_LOG__ マーカーで記録する。
+-- これにより print 以外の呼び出しも全て追跡できる。
+local function __fmt(v)
+  local t = type(v)
+  if t == "string" then return string.format("%q", v) end
+  if t == "number" or t == "boolean" then return tostring(v) end
+  if t == "nil" then return "nil" end
+  return "<" .. t .. ">"
+end
+
+local function __log_call(name, args)
+  local parts = {}
+  for i = 1, #args do parts[i] = __fmt(args[i]) end
+  io.write("__CALL_LOG__:" .. name .. "(" .. table.concat(parts, ", ") .. ")\\n")
+  io.flush()
+end
+
+-- フック対象の関数一覧
+local __orig_print   = print
+local __orig_warn    = function(...) end
+local __orig_error   = error
+local __orig_tostr   = tostring
+local __orig_tonnum  = tonumber
+local __orig_require = require or function() return {} end
+
+rawset(_G, "print", function(...)
+  local args = {...}
+  __log_call("print", args)
+  __orig_print(...)
+end)
+rawset(_G, "warn", function(...)
+  local args = {...}
+  __log_call("warn", args)
+end)
+rawset(_G, "error", function(msg, lvl)
+  __log_call("error", {msg})
+  __orig_error(msg, lvl)
+end)
+rawset(_G, "tostring", function(v)
+  local r = __orig_tostr(v)
+  __log_call("tostring", {v})
+  return r
+end)
+rawset(_G, "tonumber", function(v, b)
+  local r = __orig_tonnum(v, b)
+  __log_call("tonumber", {v})
+  return r
+end)
+rawset(_G, "require", function(m)
+  __log_call("require", {m})
+  return pcall(__orig_require, m) and __orig_require(m) or {}
+end)
 -- ══ Roblox仮想環境 END ══
 `;
 
@@ -967,62 +1015,39 @@ end
           vmAnalysis.weredevDecompiled = weredevResult.decompiledCode;
       }
 
-      // ── Weredevsモード最優先: stdout に内容があればそのまま返す ────────
-      // loadstringフックが発火しなくてもVMが print() 等で直接出力した内容を拾う
+      // ── Weredevsモード: stdout から呼び出しログと実行出力を取得 ──────────
       if (weredevMode && stdout && stdout.trim().length > 0) {
+        // __CALL_LOG__ マーカーから関数呼び出しを抽出
+        const callLogs = [];
+        const callLogRe = /__CALL_LOG__:(.+?)\\n/g;
+        let clm;
+        while ((clm = callLogRe.exec(stdout)) !== null) {
+          callLogs.push(clm[1].trim());
+        }
+        // 生の実行出力（マーカー行を除去）
         const rawOut = stdout
+          .replace(/__CALL_LOG__:[^\n]*\n/g, '')
           .replace(/__EXEC_ERROR__:[^\n]*/g, '')
           .replace(/__DECODED_START_0__[\s\S]*?__DECODED_END_0__/g, '')
+          .replace(/__DEBUG_[^\n]*\n/g, '')
           .trim();
+
+        const lines = [];
+        if (callLogs.length > 0) {
+          lines.push('-- ══ 関数呼び出しログ ══');
+          callLogs.forEach(l => lines.push('-- [CALL] ' + l));
+          lines.push('');
+        }
         if (rawOut.length > 0) {
-          console.log('[DynDec] Weredevs stdout直接取得成功:', rawOut.substring(0, 100));
+          lines.push('-- ══ 実行出力 ══');
+          lines.push(rawOut);
+        }
+
+        if (lines.length > 0) {
           const finalResult = {
             success: true,
-            result: rawOut,
+            result: lines.join('\n'),
             method: 'dynamic_decode_weredevs_stdout',
-            _sid: sid,
-          };
-          endVmSession(sid, finalResult);
-          return resolve(finalResult);
-        }
-      }
-
-      if (decoded.best && decoded.best.length >= 10) {
-        const finalResult = { success: true, result: decoded.best, allDecoded: decoded.all.map(d => d.code), decodedCount: decoded.all.length, method: 'dynamic_decode', vmAnalysis: (vmTrace.length > 0 || wereDevDetected) ? vmAnalysis : undefined, _sid: sid };
-        endVmSession(sid, finalResult);
-        return resolve(finalResult);
-      }
-      if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
-        const pseudoCode = vmAnalysis.reconstruction.pseudoCode || '';
-        if (pseudoCode.length >= 10) {
-          const finalResult = { success: true, result: pseudoCode, method: 'dynamic_decode_vm', vmAnalysis, WereDevVMDetected: true, _sid: sid };
-          endVmSession(sid, finalResult);
-          return resolve(finalResult);
-        }
-      }
-      if (wereDevDetected && vmAnalysis.weredevDecompiled && vmAnalysis.weredevDecompiled.length >= 50) {
-        const finalResult = { success: true, result: vmAnalysis.weredevDecompiled, method: 'weredev_decompile', vmAnalysis, WereDevVMDetected: true, _sid: sid };
-        endVmSession(sid, finalResult);
-        return resolve(finalResult);
-      }
-
-      // ── Weredevsモード専用: loadstringフックが発火しなくても
-      //    stdoutに直接出力された実行結果を拾う ──────────────────────────
-      // Weredevs VMは loadstring を経由せず直接コードを実行するため、
-      // print() 等の出力がマーカーなしで stdout に出る。
-      // __EXEC_ERROR__ も __DECODED_START__ もない場合で stdout に内容があれば成功とみなす。
-      if (weredevMode && stdout && stdout.trim().length > 0) {
-        const rawOut = stdout
-          .replace(/__EXEC_ERROR__:[^\n]*/g, '')
-          .replace(/__DECODED_START_0__[\s\S]*?__DECODED_END_0__/g, '')
-          .trim();
-        if (rawOut.length > 0) {
-          const finalResult = {
-            success: true,
-            result: '-- Weredevs VM 実行出力:\n' + rawOut,
-            method: 'dynamic_decode_weredevs_stdout',
-            vmAnalysis: vmAnalysis,
-            WereDevVMDetected: true,
             _sid: sid,
           };
           endVmSession(sid, finalResult);
