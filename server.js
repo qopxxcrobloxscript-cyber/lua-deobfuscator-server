@@ -897,8 +897,10 @@ end
   return new Promise(resolve => {
     const luaCode = wrapper;
     fs.writeFileSync(tempFile, luaCode, 'utf8');
+    console.log('[DynDec] Lua実行開始 bin=' + luaBin + ' file=' + tempFile);
     exec(`${luaBin} ${tempFile}`, { timeout: 30000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       safeUnlink(tempFile);
+      console.log('[DynDec] Lua終了 stdout=' + JSON.stringify(stdout && stdout.substring(0, 200)) + ' stderr=' + (stderr && stderr.substring(0, 100)));
       try {
 
       const decoded      = parseDecodedOutputs(stdout);
@@ -966,6 +968,26 @@ end
         vmAnalysis.reconstruction = vmDecompiler(traceForAnalysis, bytecodeDump, finalOpcodeMap);
         if (weredevResult.decompiledCode && weredevResult.decompiledCode.length > 50)
           vmAnalysis.weredevDecompiled = weredevResult.decompiledCode;
+      }
+
+      // ── Weredevsモード最優先: stdout に内容があればそのまま返す ────────
+      // loadstringフックが発火しなくてもVMが print() 等で直接出力した内容を拾う
+      if (weredevMode && stdout && stdout.trim().length > 0) {
+        const rawOut = stdout
+          .replace(/__EXEC_ERROR__:[^\n]*/g, '')
+          .replace(/__DECODED_START_0__[\s\S]*?__DECODED_END_0__/g, '')
+          .trim();
+        if (rawOut.length > 0) {
+          console.log('[DynDec] Weredevs stdout直接取得成功:', rawOut.substring(0, 100));
+          const finalResult = {
+            success: true,
+            result: rawOut,
+            method: 'dynamic_decode_weredevs_stdout',
+            _sid: sid,
+          };
+          endVmSession(sid, finalResult);
+          return resolve(finalResult);
+        }
       }
 
       if (decoded.best && decoded.best.length >= 10) {
