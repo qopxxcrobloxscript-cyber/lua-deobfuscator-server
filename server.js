@@ -872,15 +872,14 @@ local __ok, __err = pcall(function()
   local chunk, err = __orig_ls_outer(__obf_code)
   if not chunk then error("parse error: " .. tostring(err)) end
   local r = chunk()
-  io.write("__DEBUG_TYPE__:" .. type(r) .. "\n")
+  io.write("__DEBUG_TYPE__:" .. type(r) .. "\\n")
   io.flush()
   if type(r) == "function" then
-    -- loadstring が呼ばれたときにフックするメタテーブル環境を作る
     local _base = (getfenv and getfenv()) or _ENV or {}
     local _mt_env = setmetatable({}, {
       __index = function(t, k)
         if k == "loadstring" or k == "load" then
-          io.write("__DEBUG_LS_ACCESSED__:" .. k .. "\n")
+          io.write("__DEBUG_LS_ACCESSED__:" .. k .. "\\n")
           io.flush()
           return __outer_hook
         end
@@ -888,14 +887,13 @@ local __ok, __err = pcall(function()
       end,
       __newindex = function(t, k, v) _base[k] = v end,
     })
-    -- getfenv(r) でVM関数の環境にも仕込む
     if getfenv then
       pcall(function()
         local _env = getfenv(r)
         if _env then
           _env.loadstring = __outer_hook
           _env.load = __outer_hook
-          io.write("__DEBUG_FENV_SET__:ok\n")
+          io.write("__DEBUG_FENV_SET__:ok\\n")
           io.flush()
         end
       end)
