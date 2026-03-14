@@ -85,29 +85,90 @@ function visibilityRate(str) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  weredevsDecode — Weredevs文字列層の完全デコードパイプライン
-//  処理順: 1. Lua escape  →  2. Base64  →  3. XOR
+//  weredevsCustomB64Decode — Vテーブルを使った独自Base64デコード
+//  Vテーブルのマッピングをコードから動的に抽出してデコードする
 // ────────────────────────────────────────────────────────────────────────
-function weredevsDecode(str) {
+function buildVTable(sourceCode) {
+  // Vテーブルが定義されているブロックを抽出
+  const vmatch = sourceCode.match(/local\s+(?:V|g)\s*=\s*\{([\s\S]{100,}?)\}(?:local\s+\w+\s*=\s*string\.sub|for\s+\w)/);
+  if (!vmatch) return null;
+  const vtext = vmatch[1];
+  const vtable = {};
+
+  // パターン1: ["\048"]= 形式（数値エスケープ）
+  const re1 = /\[\"\\?(\d+)\"\]\s*=\s*([\d+\-*(). ]+)/g;
+  let m;
+  while ((m = re1.exec(vtext)) !== null) {
+    try {
+      const k = String.fromCharCode(parseInt(m[1]));
+      const v = Function('return ' + m[2])();
+      if (Number.isFinite(v) && v >= 0 && v < 64) vtable[k] = v;
+    } catch (_) {}
+  }
+
+  // パターン2: 単一英字キー  h=11, z=24 など
+  const re2 = /(?:^|[,;{])\s*([a-zA-Z])\s*=\s*((?:-?\d+[+\-](?:-\d+|-?\(-?\d+\))|-?\d+)(?:\s*[+\-]\s*(?:-?\d+|-?\(-?\d+\)))*)/g;
+  while ((m = re2.exec(vtext)) !== null) {
+    try {
+      const v = Function('return ' + m[2])();
+      if (Number.isFinite(v) && v >= 0 && v < 64) vtable[m[1]] = v;
+    } catch (_) {}
+  }
+
+  return Object.keys(vtable).length >= 32 ? vtable : null;
+}
+
+function weredevsVTableDecode(str, vtable) {
+  if (!vtable || !str) return null;
+  let D = 0, j = 0;
+  const g = [];
+  for (let q = 0; q < str.length; q++) {
+    const ch = str[q];
+    const mv = vtable[ch];
+    if (mv !== undefined) {
+      D = D + mv * Math.pow(64, 3 - j);
+      j++;
+      if (j === 4) {
+        j = 0;
+        g.push(String.fromCharCode(Math.floor(D / 65536), Math.floor((D % 65536) / 256), D % 256));
+        D = 0;
+      }
+    } else if (ch === '=') {
+      g.push(String.fromCharCode(Math.floor(D / 65536)));
+      if (q < str.length - 1 && str[q + 1] !== '=') {
+        g.push(String.fromCharCode(Math.floor((D % 65536) / 256)));
+      }
+      break;
+    }
+  }
+  const result = g.join('').replace(/\x00+$/g, '');
+  // 可視文字率が60%以上なら有効
+  return visibilityRate(result) >= 0.6 ? result : null;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  weredevsDecode — Weredevs文字列層の完全デコードパイプライン
+//  処理順: 1. Lua escape  →  2. Vテーブル独自Base64  →  3. 標準Base64  →  4. XOR
+// ────────────────────────────────────────────────────────────────────────
+function weredevsDecode(str, vtable) {
   if (typeof str !== 'string') return str;
 
   // 1. Lua数値エスケープを展開
   let result = decodeLuaEscapes(str);
 
-  // 2. Base64デコード（展開後の文字列が該当する場合）
-  const b64Result = tryBase64Decode(result);
-  if (b64Result !== null) {
-    result = b64Result;
+  // 2. Vテーブル独自Base64デコード（Weredevs専用）
+  if (vtable) {
+    const vResult = weredevsVTableDecode(result, vtable);
+    if (vResult !== null) return vResult;
   }
 
-  // 3. 可視率判定付き総当たりXORデコード
-  //    Base64デコードが成功していた場合はXORをスキップ（二重デコード防止）
-  if (b64Result === null) {
-    const xorResult = tryXorDecode(result);
-    if (xorResult !== null) {
-      result = xorResult;
-    }
-  }
+  // 3. 標準Base64デコード
+  const b64Result = tryBase64Decode(result);
+  if (b64Result !== null) return b64Result;
+
+  // 4. 可視率判定付き総当たりXORデコード
+  const xorResult = tryXorDecode(result);
+  if (xorResult !== null) return xorResult;
 
   return result;
 }
@@ -119,4 +180,6 @@ module.exports = {
   xorString,
   visibilityRate,
   weredevsDecode,
+  buildVTable,
+  weredevsVTableDecode,
 };
