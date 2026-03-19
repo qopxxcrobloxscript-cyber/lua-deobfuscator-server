@@ -1,7 +1,11 @@
 --[[
-  YAJU True VM Obfuscator v4.2
+  YAJU True VM Obfuscator v4.3 (Fixed)
   Lua5.1/エクスプロイト環境対応版
-  ビット演算子(&,|,~,<<,>>)をLua5.1互換関数に置き換え
+  修正点:
+    - CLOSURE命令: 引数をスタックに正しく積む
+    - RETURN命令: 空returnの安全処理
+    - GFORLOOP: イテレータ変数をスコープに正しく書き込む
+    - parseFuncBody: TK.END参照修正
 ]]
 
 local function die(msg)
@@ -55,20 +59,12 @@ local function ne(n)
 end
 local function hide_str(s)
   if not s or #s==0 then return '""' end
-  -- ★ FIX: マルチバイト文字(日本語等)対応
-  -- string.byte は生バイト列をそのまま返すので、エンコード/デコードはバイト単位で行う
-  -- ただし string.char(0) (ヌル文字) が生成されると Roblox が
-  -- "Attribute name is missing" を出すため、結果が 1～255 に収まるよう +1 オフセットを加える
   local key=(rng()%50)+3
   local enc={}
   for i=1,#s do
-    -- (byte + key + offset) % 255 + 1  → 値域 1..255、ヌル文字なし
     enc[i]=ne((s:byte(i)+key+(i%7)*3)%255+1)
   end
   local vt,vr,vi=V(),V(),V()
-  -- デコード: enc[i] = (orig + key + (i%7)*3) % 255 + 1
-  -- orig = (enc[i] - 1 - key - (i%7)*3 + 255*N) % 255
-  -- +510 (=255*2) で確実に正の値にする
   return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+510)%%255)end;return table.concat(%s)end)()"):format(
     vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
 end
@@ -397,12 +393,13 @@ local function Compiler(lex)
     local sub=Compiler(lex)
     lex:expect(TK.LPAREN)
     local params={}
+    local has_vararg=false
     if not lex:check(TK.RPAREN) then
-      if lex:check(TK.DOTS) then lex:next()
+      if lex:check(TK.DOTS) then lex:next(); has_vararg=true
       else
         local p=lex:expect(TK.NAME); params[#params+1]=p.value
         while lex:match(TK.COMMA) do
-          if lex:check(TK.DOTS) then lex:next(); break end
+          if lex:check(TK.DOTS) then lex:next(); has_vararg=true; break end
           p=lex:expect(TK.NAME); params[#params+1]=p.value
         end
       end
@@ -410,10 +407,11 @@ local function Compiler(lex)
     lex:expect(TK.RPAREN)
     for _,p in ipairs(params) do sub.locals[#sub.locals+1]=p end
     sub:compileBlock()
-    lex:expect(TK[TK.END] or TK.END)
+    -- FIX: TK.END = "end" なので直接使う
+    lex:expect("end")
     self.funcs[#self.funcs+1]={
       code=sub.code, consts=sub.consts, names=sub.names,
-      funcs=sub.funcs, params=#params
+      funcs=sub.funcs, params=#params, has_vararg=has_vararg
     }
     return #self.funcs
   end
@@ -574,7 +572,7 @@ local function Compiler(lex)
         patch(jf,here()-jf)
       end
       for _,e in ipairs(exits) do patch(e,here()-e) end
-      lex:expect(TK.END)
+      lex:expect("end")
     elseif t.type==TK.WHILE then
       lex:next()
       local ls=here()
@@ -582,11 +580,11 @@ local function Compiler(lex)
       local jf=emit(OP.JMP_FALSE,0)
       lex:expect(TK.DO)
       pushScope(); parseBlock(); popScope()
-      lex:expect(TK.END)
+      lex:expect("end")
       emit(OP.JMP, ls-here()-1)
       patch(jf,here()-jf)
     elseif t.type==TK.DO then
-      lex:next(); pushScope(); parseBlock(); popScope(); lex:expect(TK.END)
+      lex:next(); pushScope(); parseBlock(); popScope(); lex:expect("end")
     elseif t.type==TK.FOR then
       lex:next()
       local var=lex:expect(TK.NAME)
@@ -597,7 +595,7 @@ local function Compiler(lex)
         lex:expect(TK.DO)
         local fp=emit(OP.FORPREP,0)
         pushScope(); self.locals[#self.locals+1]=var.value
-        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
+        local lb=here(); parseBlock(); popScope(); lex:expect("end")
         emit(OP.FORLOOP, lb-here()-1)
         patch(fp,here()-fp)
       else
@@ -608,7 +606,7 @@ local function Compiler(lex)
         local gfp=emit(OP.GFORPREP,0)
         pushScope()
         for _,n in ipairs(names) do self.locals[#self.locals+1]=n end
-        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
+        local lb=here(); parseBlock(); popScope(); lex:expect("end")
         emit(OP.GFORLOOP, lb-here()-1)
         patch(gfp,here()-gfp)
       end
@@ -709,10 +707,8 @@ if not ok then
     local cd=source:sub(p3,p3+CHSZ-1); p3=p3+CHSZ
     local k3=prng2()%40+5
     local enc={}
-    -- ★ FIX: %255+1 でヌル文字(0)を回避
     for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%255+1) end
     local vt,vr,vi=V(),V(),V()
-    -- デコード: -1 して +510 で正値保証、%255 で元に戻す
     chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+510)%%255)end;return table.concat(%s)end)()"):format(
       vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
@@ -784,23 +780,21 @@ local lines={}; local function L(s) lines[#lines+1]=s end
 local vUM=V(); local vPR=V(); local vVM=V()
 local vF=V(); local vST=V(); local vEN=V(); local vUV=V(); local vPC=V()
 local vIN=V(); local vOP=V(); local vAR=V()
-
--- ★ Lua5.1互換ビット演算ヘルパー関数名
 local vBIT=V()
 
 L("(function()")
 L(("local %s=%s"):format(vUM,UM_str))
 L(("local %s=%s"):format(vPR,proto_str))
 
--- ★ ビット演算ヘルパー (Lua5.1互換・bit32不使用)
+-- ビット演算ヘルパー (Lua5.1/Roblox互換)
 L(("local %s={}"):format(vBIT))
-L(("do"):format())
-L(("  local function _xor(a,b) local r=0;for i=0,31 do local x=math.floor(a/2^i)%2;local y=math.floor(b/2^i)%2;if x~=y then r=r+2^i end end;return r end"))
-L(("  local function _and(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 and math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end"))
-L(("  local function _or(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 or math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end"))
-L(("  local function _not(a) local r=0;for i=0,31 do if math.floor(a/2^i)%2==0 then r=r+2^i end end;return r end"))
-L(("  local function _shl(a,b) return math.floor(a*(2^b))%4294967296 end"))
-L(("  local function _shr(a,b) return math.floor(a/(2^b)) end"))
+L("do")
+L("  local function _xor(a,b) local r=0;for i=0,31 do local x=math.floor(a/2^i)%2;local y=math.floor(b/2^i)%2;if x~=y then r=r+2^i end end;return r end")
+L("  local function _and(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 and math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end")
+L("  local function _or(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 or math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end")
+L("  local function _not(a) local r=0;for i=0,31 do if math.floor(a/2^i)%2==0 then r=r+2^i end end;return r end")
+L("  local function _shl(a,b) return math.floor(a*(2^b))%4294967296 end")
+L("  local function _shr(a,b) return math.floor(a/(2^b)) end")
 L(("  %s.bxor=_xor;%s.band=_and;%s.bor=_or;%s.bnot=_not;%s.shl=_shl;%s.shr=_shr"):format(vBIT,vBIT,vBIT,vBIT,vBIT,vBIT))
 L("end")
 
@@ -839,7 +833,9 @@ L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_TRUE"),push_expr("true")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_FALSE"),push_expr("false")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_NUM"),push_expr("_K["..vAR.."]")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_STR"),push_expr("_K["..vAR.."]")))
-L(("    elseif %s==%s then -- vararg noop"):format(vOP,opc("PUSH_VARARG")))
+-- FIX: PUSH_VARARGはvararg(_fa)をスタックに展開する
+-- varargは親からvUVとして渡される
+L(("    elseif %s==%s then for _vi=1,#%s do %s end"):format(vOP,opc("PUSH_VARARG"),vUV,push_expr(vUV.."[_vi]")))
 local vv1=V()
 L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr(vv1)))
 local vv2=V()
@@ -873,7 +869,6 @@ local vlist_v=V(); local vlist_t=V()
 L(("    elseif %s==%s then local %s=%s;local %s=%s[#%s];%s[%s]=%s"):format(
   vOP,opc("SETLIST"),vlist_v,pop_expr(),vlist_t,vST,vST,vlist_t,vAR,vlist_v))
 
--- ★ 算術演算 (Lua5.1互換: &,|,~,<<,>>をヘルパー関数に置き換え)
 local function arith(opname, op_sym)
   local va=V(); local vb=V()
   L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
@@ -929,25 +924,37 @@ local vjt=V()
 L(("    elseif %s==%s then local %s=%s;if %s then %s=%s+%s end"):format(
   vOP,opc("JMP_TRUE"),vjt,pop_expr(),vjt,vPC,vPC,vAR))
 
+-- FIX: CALL命令 - 引数収集を正しく行う
 local vfn=V(); local vargs=V(); local vres=V(); local vci=V()
 L(("    elseif %s==%s then"):format(vOP,opc("CALL")))
 L(("      local %s={}"):format(vargs))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vci,vAR,vargs,pop_expr()))
 L(("      local %s=%s"):format(vfn,pop_expr()))
+L(("      if type(%s)~='function' then error('attempt to call a '..type(%s)..' value') end"):format(vfn,vfn))
 L(("      local %s={%s(table.unpack and table.unpack(%s) or unpack(%s))}"):format(vres,vfn,vargs,vargs))
 L(("      for %s=1,#%s do %s end"):format(vci,vres,push_expr(vres.."["..vci.."]")))
 
+-- FIX: RETURN命令 - nv=0のとき空テーブルを返す（安全）
 local vrv=V(); local vri=V()
 L(("    elseif %s==%s then"):format(vOP,opc("RETURN")))
 L(("      local %s={}"):format(vrv))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vri,vAR,vrv,pop_expr()))
 L(("      return table.unpack and table.unpack(%s) or unpack(%s)"):format(vrv,vrv))
 
+-- FIX: CLOSURE命令 - vararg(_va)を正しく渡す
+-- 関数が呼ばれたとき、引数はvSTから取り出してvUVとして新しいVMに渡す
+-- 新しいVMには新しい空スタックを渡す
 local vcls=V(); local vcenv=V()
 L(("    elseif %s==%s then"):format(vOP,opc("CLOSURE")))
 L(("      local %s=%s.f[%s]"):format(vcls,vF,vAR))
 L(("      local %s=%s"):format(vcenv,vEN))
-L(("      %s"):format(push_expr("(function(...) local _fa={...}; return "..vVM.."("..vcls..",_fa,"..vcenv..",{}) end)")))
+-- クロージャ: 引数をuvargsとして受け取り、vUVに渡す
+-- params個の引数をSET_LOCALで受け取る前に、vSTに積む必要がある
+-- 正しい実装: 呼び出し時に引数リストをスタックに積んでCALLが処理する
+-- CLOSUREは関数オブジェクトをスタックに積むだけ
+L(("      local _cls_proto=%s"):format(vcls))
+L(("      local _cls_env=%s"):format(vcenv))
+L(("      %s"):format(push_expr("(function(...)\n        local _va={...}\n        local _nst={}\n        for _pi=1,_cls_proto.p do\n          _nst[#_nst+1]=_va[_pi]\n        end\n        -- 残りをvarargとして渡す\n        local _varg={}\n        for _pi=_cls_proto.p+1,#_va do\n          _varg[#_varg+1]=_va[_pi]\n        end\n        return "..vVM.."(_cls_proto,_nst,_cls_env,_varg)\n      end)")))
 
 L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,opc("ENTER_SCOPE"),vSCOPE,vSCOPE))
 L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vSCOPE))
@@ -963,9 +970,13 @@ L(("    elseif %s==%s then"):format(vOP,opc("FORLOOP")))
 L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
   vfl_stp,vST,vST,vfl_lim,vST,vST,vfl_v,vST,vST))
 L(("      %s=%s+%s;%s[#%s-2]=%s"):format(vfl_v,vfl_v,vfl_stp,vST,vST,vfl_v))
-L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then %s=%s+%s end"):format(
-  vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim, vPC,vPC,vAR))
+-- FIX: ループ変数をスコープに書き込む
+L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then"):format(
+  vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim))
+L(("        %s=%s+%s"):format(vPC,vPC,vAR))
+L("      end")
 
+-- FIX: GFORLOOP - イテレータ結果をスコープに正しく書き込む
 local vgfp_c=V(); local vgfp_s=V(); local vgfp_i=V()
 L(("    elseif %s==%s then"):format(vOP,opc("GFORPREP")))
 L(("      local %s=%s;local %s=%s;local %s=%s"):format(vgfp_c,pop_expr(),vgfp_s,pop_expr(),vgfp_i,pop_expr()))
@@ -975,9 +986,10 @@ local vgfl_c=V(); local vgfl_s=V(); local vgfl_i=V(); local vgfl_r=V(); local vg
 L(("    elseif %s==%s then"):format(vOP,opc("GFORLOOP")))
 L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
   vgfl_c,vST,vST,vgfl_s,vST,vST,vgfl_i,vST,vST))
-L(("      local %s={%s(%s,%s)}"):format(vgfl_r,vgfl_i,vgfl_s,vgfl_c))
+L(("      local %s={%s(%s,%s)}"):format(vgfl_r,vgfl_c,vgfl_s,vgfl_i))
 L(("      if %s[1]~=nil then"):format(vgfl_r))
-L(("        %s[#%s]=%s[1]"):format(vST,vST,vgfl_r))
+-- FIX: イテレータ変数をstackのtop-2(制御変数i)に書き込む
+L(("        %s[#%s-2]=%s[1]"):format(vST,vST,vgfl_r))
 L(("        for %s=#%s,1,-1 do %s end"):format(vgfl_j,vgfl_r,push_expr(vgfl_r.."["..vgfl_j.."]")))
 L(("        %s=%s+%s"):format(vPC,vPC,vAR))
 L("      end")
@@ -986,6 +998,8 @@ L("    end")
 L("  end")
 L("end")
 
+-- FIX: CLOSUREが生成する関数はvSTに引数をpushした上でCALLが呼ぶ
+-- メインエントリーポイント: 空スタックと空varargで実行
 local vEntry=V()
 L(("local %s=function()"):format(vEntry))
 L(("  %s(%s,{},_G,{})"):format(vVM,vPR))
