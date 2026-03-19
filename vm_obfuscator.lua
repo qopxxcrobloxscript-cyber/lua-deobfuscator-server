@@ -406,6 +406,17 @@ local function Compiler(lex)
     end
     lex:expect(TK.RPAREN)
     for _,p in ipairs(params) do sub.locals[#sub.locals+1]=p end
+    -- ★ FIX: パラメータをスタックからSET_LOCALで取り出す命令を生成
+    -- スタックには引数が [arg1, arg2, ...] の順で積まれているので
+    -- 逆順(右から左)でpopしてスコープに登録する
+    for i=#params,1,-1 do
+      local nm=params[i]
+      if not sub.name_idx[nm] then
+        sub.names[#sub.names+1]=nm
+        sub.name_idx[nm]=#sub.names
+      end
+      sub.code[#sub.code+1]={op=OP.SET_LOCAL, arg=sub.name_idx[nm]}
+    end
     sub:compileBlock()
     -- FIX: TK.END = "end" なので直接使う
     lex:expect("end")
@@ -963,6 +974,8 @@ local vfp_st=V(); local vfp_lim=V(); local vfp_stp=V()
 L(("    elseif %s==%s then"):format(vOP,opc("FORPREP")))
 L(("      local %s=%s;local %s=%s;local %s=%s"):format(vfp_stp,pop_expr(),vfp_lim,pop_expr(),vfp_st,pop_expr()))
 L(("      %s;%s;%s"):format(push_expr(vfp_st),push_expr(vfp_lim),push_expr(vfp_stp)))
+-- ★ FIX: ループ変数をスコープに登録(ENTER_SCOPEはFORPREPの前に実行済み)
+L(("      if _N[%s] then %s[#%s][_N[%s]]=%s end"):format(vAR,vSCOPE,vSCOPE,vAR,vfp_st))
 L(("      if (%s>0 and %s>%s) or (%s<=0 and %s<%s) then %s=%s+%s end"):format(
   vfp_stp,vfp_st,vfp_lim, vfp_stp,vfp_st,vfp_lim, vPC,vPC,vAR))
 local vfl_stp=V(); local vfl_lim=V(); local vfl_v=V()
@@ -970,9 +983,10 @@ L(("    elseif %s==%s then"):format(vOP,opc("FORLOOP")))
 L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
   vfl_stp,vST,vST,vfl_lim,vST,vST,vfl_v,vST,vST))
 L(("      %s=%s+%s;%s[#%s-2]=%s"):format(vfl_v,vfl_v,vfl_stp,vST,vST,vfl_v))
--- FIX: ループ変数をスコープに書き込む
 L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then"):format(
   vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim))
+-- ★ FIX: ループ変数をスコープに毎ループ更新
+L(("        if _N[%s] then %s[#%s][_N[%s]]=%s end"):format(vAR,vSCOPE,vSCOPE,vAR,vfl_v))
 L(("        %s=%s+%s"):format(vPC,vPC,vAR))
 L("      end")
 
