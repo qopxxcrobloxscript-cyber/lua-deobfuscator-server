@@ -1,11 +1,14 @@
 --[[
-  YAJU True VM Obfuscator v4.3 (Fixed)
+  YAJU True VM Obfuscator v4.4 (Fixed)
   Lua5.1/エクスプロイト環境対応版
   修正点:
-    - CLOSURE命令: 引数をスタックに正しく積む
+    - CLOSURE命令: 単行クロージャで日本語コメント混入を防止
     - RETURN命令: 空returnの安全処理
     - GFORLOOP: イテレータ変数をスコープに正しく書き込む
     - parseFuncBody: TK.END参照修正
+    - PUSH_VARARG: varargをスタックに正しく展開
+    - CALL: type check追加
+    - SET_LOCAL: 引数を逆順でpop
 ]]
 
 local function die(msg)
@@ -406,9 +409,6 @@ local function Compiler(lex)
     end
     lex:expect(TK.RPAREN)
     for _,p in ipairs(params) do sub.locals[#sub.locals+1]=p end
-    -- ★ FIX: パラメータをスタックからSET_LOCALで取り出す命令を生成
-    -- スタックには引数が [arg1, arg2, ...] の順で積まれているので
-    -- 逆順(右から左)でpopしてスコープに登録する
     for i=#params,1,-1 do
       local nm=params[i]
       if not sub.name_idx[nm] then
@@ -418,7 +418,6 @@ local function Compiler(lex)
       sub.code[#sub.code+1]={op=OP.SET_LOCAL, arg=sub.name_idx[nm]}
     end
     sub:compileBlock()
-    -- FIX: TK.END = "end" なので直接使う
     lex:expect("end")
     self.funcs[#self.funcs+1]={
       code=sub.code, consts=sub.consts, names=sub.names,
@@ -797,7 +796,6 @@ L("(function()")
 L(("local %s=%s"):format(vUM,UM_str))
 L(("local %s=%s"):format(vPR,proto_str))
 
--- ビット演算ヘルパー (Lua5.1/Roblox互換)
 L(("local %s={}"):format(vBIT))
 L("do")
 L("  local function _xor(a,b) local r=0;for i=0,31 do local x=math.floor(a/2^i)%2;local y=math.floor(b/2^i)%2;if x~=y then r=r+2^i end end;return r end")
@@ -844,8 +842,6 @@ L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_TRUE"),push_expr("true")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_FALSE"),push_expr("false")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_NUM"),push_expr("_K["..vAR.."]")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_STR"),push_expr("_K["..vAR.."]")))
--- FIX: PUSH_VARARGはvararg(_fa)をスタックに展開する
--- varargは親からvUVとして渡される
 L(("    elseif %s==%s then for _vi=1,#%s do %s end"):format(vOP,opc("PUSH_VARARG"),vUV,push_expr(vUV.."[_vi]")))
 local vv1=V()
 L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr(vv1)))
@@ -935,7 +931,6 @@ local vjt=V()
 L(("    elseif %s==%s then local %s=%s;if %s then %s=%s+%s end"):format(
   vOP,opc("JMP_TRUE"),vjt,pop_expr(),vjt,vPC,vPC,vAR))
 
--- FIX: CALL命令 - 引数収集を正しく行う
 local vfn=V(); local vargs=V(); local vres=V(); local vci=V()
 L(("    elseif %s==%s then"):format(vOP,opc("CALL")))
 L(("      local %s={}"):format(vargs))
@@ -945,27 +940,19 @@ L(("      if type(%s)~='function' then error('attempt to call a '..type(%s)..' v
 L(("      local %s={%s(table.unpack and table.unpack(%s) or unpack(%s))}"):format(vres,vfn,vargs,vargs))
 L(("      for %s=1,#%s do %s end"):format(vci,vres,push_expr(vres.."["..vci.."]")))
 
--- FIX: RETURN命令 - nv=0のとき空テーブルを返す（安全）
 local vrv=V(); local vri=V()
 L(("    elseif %s==%s then"):format(vOP,opc("RETURN")))
 L(("      local %s={}"):format(vrv))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vri,vAR,vrv,pop_expr()))
 L(("      return table.unpack and table.unpack(%s) or unpack(%s)"):format(vrv,vrv))
 
--- FIX: CLOSURE命令 - vararg(_va)を正しく渡す
--- 関数が呼ばれたとき、引数はvSTから取り出してvUVとして新しいVMに渡す
--- 新しいVMには新しい空スタックを渡す
+-- CLOSURE: 単行・日本語コメントなし
 local vcls=V(); local vcenv=V()
 L(("    elseif %s==%s then"):format(vOP,opc("CLOSURE")))
 L(("      local %s=%s.f[%s]"):format(vcls,vF,vAR))
 L(("      local %s=%s"):format(vcenv,vEN))
--- クロージャ: 引数をuvargsとして受け取り、vUVに渡す
--- params個の引数をSET_LOCALで受け取る前に、vSTに積む必要がある
--- 正しい実装: 呼び出し時に引数リストをスタックに積んでCALLが処理する
--- CLOSUREは関数オブジェクトをスタックに積むだけ
-L(("      local _cls_proto=%s"):format(vcls))
-L(("      local _cls_env=%s"):format(vcenv))
-L(("      %s"):format(push_expr("(function(...)\n        local _va={...}\n        local _nst={}\n        for _pi=1,_cls_proto.p do\n          _nst[#_nst+1]=_va[_pi]\n        end\n        local _varg={}\n        for _pi=_cls_proto.p+1,#_va do\n          _varg[#_varg+1]=_va[_pi]\n        end\n        return "..vVM.."(_cls_proto,_nst,_cls_env,_varg)\n      end)")))
+L(("      local _cls_proto=%s;local _cls_env=%s"):format(vcls,vcenv))
+L(("      %s"):format(push_expr("(function(...) local _va={...};local _nst={};for _pi=1,_cls_proto.p do _nst[#_nst+1]=_va[_pi] end;local _varg={};for _pi=_cls_proto.p+1,#_va do _varg[#_varg+1]=_va[_pi] end;return "..vVM.."(_cls_proto,_nst,_cls_env,_varg) end)")))
 
 L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,opc("ENTER_SCOPE"),vSCOPE,vSCOPE))
 L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vSCOPE))
@@ -974,7 +961,6 @@ local vfp_st=V(); local vfp_lim=V(); local vfp_stp=V()
 L(("    elseif %s==%s then"):format(vOP,opc("FORPREP")))
 L(("      local %s=%s;local %s=%s;local %s=%s"):format(vfp_stp,pop_expr(),vfp_lim,pop_expr(),vfp_st,pop_expr()))
 L(("      %s;%s;%s"):format(push_expr(vfp_st),push_expr(vfp_lim),push_expr(vfp_stp)))
--- ★ FIX: ループ変数をスコープに登録(ENTER_SCOPEはFORPREPの前に実行済み)
 L(("      if _N[%s] then %s[#%s][_N[%s]]=%s end"):format(vAR,vSCOPE,vSCOPE,vAR,vfp_st))
 L(("      if (%s>0 and %s>%s) or (%s<=0 and %s<%s) then %s=%s+%s end"):format(
   vfp_stp,vfp_st,vfp_lim, vfp_stp,vfp_st,vfp_lim, vPC,vPC,vAR))
@@ -985,12 +971,10 @@ L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
 L(("      %s=%s+%s;%s[#%s-2]=%s"):format(vfl_v,vfl_v,vfl_stp,vST,vST,vfl_v))
 L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then"):format(
   vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim))
--- ★ FIX: ループ変数をスコープに毎ループ更新
 L(("        if _N[%s] then %s[#%s][_N[%s]]=%s end"):format(vAR,vSCOPE,vSCOPE,vAR,vfl_v))
 L(("        %s=%s+%s"):format(vPC,vPC,vAR))
 L("      end")
 
--- FIX: GFORLOOP - イテレータ結果をスコープに正しく書き込む
 local vgfp_c=V(); local vgfp_s=V(); local vgfp_i=V()
 L(("    elseif %s==%s then"):format(vOP,opc("GFORPREP")))
 L(("      local %s=%s;local %s=%s;local %s=%s"):format(vgfp_c,pop_expr(),vgfp_s,pop_expr(),vgfp_i,pop_expr()))
@@ -1002,7 +986,6 @@ L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
   vgfl_c,vST,vST,vgfl_s,vST,vST,vgfl_i,vST,vST))
 L(("      local %s={%s(%s,%s)}"):format(vgfl_r,vgfl_c,vgfl_s,vgfl_i))
 L(("      if %s[1]~=nil then"):format(vgfl_r))
--- FIX: イテレータ変数をstackのtop-2(制御変数i)に書き込む
 L(("        %s[#%s-2]=%s[1]"):format(vST,vST,vgfl_r))
 L(("        for %s=#%s,1,-1 do %s end"):format(vgfl_j,vgfl_r,push_expr(vgfl_r.."["..vgfl_j.."]")))
 L(("        %s=%s+%s"):format(vPC,vPC,vAR))
@@ -1012,8 +995,6 @@ L("    end")
 L("  end")
 L("end")
 
--- FIX: CLOSUREが生成する関数はvSTに引数をpushした上でCALLが呼ぶ
--- メインエントリーポイント: 空スタックと空varargで実行
 local vEntry=V()
 L(("local %s=function()"):format(vEntry))
 L(("  %s(%s,{},_G,{})"):format(vVM,vPR))
