@@ -965,7 +965,7 @@ L(("      local %s=%s"):format(vcenv,vEN))
 -- CLOSUREは関数オブジェクトをスタックに積むだけ
 L(("      local _cls_proto=%s"):format(vcls))
 L(("      local _cls_env=%s"):format(vcenv))
-L(("      %s"):format(push_expr("(function(...)\n        local _va={...}\n        local _nst={}\n        for _pi=1,_cls_proto.p do\n          _nst[#_nst+1]=_va[_pi]\n        end\n        -- 残りをvarargとして渡す\n        local _varg={}\n        for _pi=_cls_proto.p+1,#_va do\n          _varg[#_varg+1]=_va[_pi]\n        end\n        return "..vVM.."(_cls_proto,_nst,_cls_env,_varg)\n      end)")))
+L(("      %s"):format(push_expr("(function(...)\n        local _va={...}\n        local _nst={}\n        for _pi=1,_cls_proto.p do\n          _nst[#_nst+1]=_va[_pi]\n        end\n        local _varg={}\n        for _pi=_cls_proto.p+1,#_va do\n          _varg[#_varg+1]=_va[_pi]\n        end\n        return "..vVM.."(_cls_proto,_nst,_cls_env,_varg)\n      end)")))
 
 L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,opc("ENTER_SCOPE"),vSCOPE,vSCOPE))
 L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vSCOPE))
