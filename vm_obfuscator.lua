@@ -55,6 +55,7 @@ end
 local function ne(n)
   if type(n)~="number" then return tostring(n) end
   if n==0 then return "0" end
+  if n<0 then return tostring(n) end
   local r=rng()%3
   if r==0 then local a=(rng()%40)+2;local b=math.floor(n/a);local c=n-a*b;return("(%d*%d+%d)"):format(a,b,c)
   elseif r==1 then local o=(rng()%80)+5;return("(%d-%d)"):format(n+o,o)
