@@ -1348,7 +1348,7 @@ function obfuscateWithCustomVM(code, options = {}) {
       }
       try {
         if (!fs.existsSync(tmpOut)) { resolve({ success: false, error: '出力ファイルが見つかりません' }); return; }
-        const result = fs.readFileSync(tmpOut, 'utf8');
+        const result = fs.readFileSync(tmpOut, 'utf8').replace(/[@\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
         if (!result || result.trim().length === 0) { resolve({ success: false, error: 'VM難読化の出力が空でした' }); return; }
         resolve({ success: true, result, seed, method: 'custom_vm' });
       } finally {
