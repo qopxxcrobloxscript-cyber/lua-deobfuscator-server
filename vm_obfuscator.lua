@@ -846,7 +846,8 @@ L(("    elseif %s==%s then for _vi=1,#%s do %s end"):format(vOP,opc("PUSH_VARARG
 local vv1=V()
 L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr(vv1)))
 local vv2=V()
-L(("    elseif %s==%s then local %s=%s[_N[%s]];%s"):format(vOP,opc("PUSH_GLOBAL"),vv2,vEN,vAR,push_expr(vv2)))
+-- 変更後（getfenvまたはrawgetでフォールバック）
+L(("    elseif %s==%s then local %s=%s[_N[%s]];if %s==nil then %s=rawget(_G,_N[%s]) end;%s"):format(vOP,opc("PUSH_GLOBAL"),vv2,vEN,vAR,vv2,vv2,vAR,push_expr(vv2)))
 L(("    elseif %s==%s then %s"):format(vOP,opc("POP"),pop_expr()))
 local vv3=V()
 L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc("DUP"),vv3,top_expr(),push_expr(vv3)))
