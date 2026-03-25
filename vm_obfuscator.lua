@@ -63,7 +63,7 @@ local function ne(n)
 end
 local function hide_str(s)
   if not s or #s==0 then return '""' end
-  for i=1,#s do if s:byte(i)<32 or s:byte(i)>126 then return string.format("%q",s) end end  -- この行追加
+   for i=1,#s do local b=s:byte(i) if b<32 or b>126 or b==39 or b==34 or b==92 then return string.format("%q",s) end end -- この行追加
   local key=(rng()%50)+3
   local enc={}
   for i=1,#s do
