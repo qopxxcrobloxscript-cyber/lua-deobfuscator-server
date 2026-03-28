@@ -1,14 +1,7 @@
 --[[
-  YAJU True VM Obfuscator v4.4 (Fixed)
+  YAJU True VM Obfuscator v4.2
   Lua5.1/エクスプロイト環境対応版
-  修正点:
-    - CLOSURE命令: 単行クロージャで日本語コメント混入を防止
-    - RETURN命令: 空returnの安全処理
-    - GFORLOOP: イテレータ変数をスコープに正しく書き込む
-    - parseFuncBody: TK.END参照修正
-    - PUSH_VARARG: varargをスタックに正しく展開
-    - CALL: type check追加
-    - SET_LOCAL: 引数を逆順でpop
+  ビット演算子(&,|,~,<<,>>)をLua5.1互換関数に置き換え
 ]]
 
 local function die(msg)
@@ -54,37 +47,31 @@ local function V()
 end
 local function ne(n)
   if type(n)~="number" then return tostring(n) end
-  n = math.floor(n)
   if n==0 then return "0" end
-  if n<0 then return tostring(n) end
   local r=rng()%3
-  if r==0 then
-    local a=(rng()%40)+2
-    local b=math.floor(n/a)
-    local c=n-a*b
-    if c<0 then c=0; b=math.floor(n/a) end
-    return("(%d*%d+%d)"):format(a,b,c)
-  elseif r==1 then
-    local o=(rng()%80)+5
-    return("(%d-%d)"):format(n+o,o)
-  else
-    local f=(rng()%6)+2
-    local q=math.floor(n/f)
-    local c=n-f*q
-    if c<0 then c=0; q=math.floor(n/f) end
-    return("(%d*%d+%d)"):format(f,q,c)
-  end
+  if r==0 then local a=(rng()%40)+2;local b=math.floor(n/a);local c=n-a*b;return("(%d*%d+%d)"):format(a,b,c)
+  elseif r==1 then local o=(rng()%80)+5;return("(%d-%d)"):format(n+o,o)
+  else local f=(rng()%6)+2;local q=math.floor(n/f);local c=n-f*q;return("(%d*%d+%d)"):format(f,q,c) end
 end
+
+-- ★ FIX: %255+1 → %256+1 に変更
+-- 元の %255+1 だと byte=254 のとき (254+key+offset)%255 = 0 になり
+-- デコード時に string.char(0) = ヌル文字が生成されて
+-- Roblox の "Attribute name is missing" エラーが発生する。
+-- %256+1 にすると値域が 1..256 になり、string.char(0) が絶対に出ない。
+-- デコード側も対応して %255 → %256、+510 → +512 に変更する。
 local function hide_str(s)
   if not s or #s==0 then return '""' end
-   for i=1,#s do local b=s:byte(i) if b<32 or b>126 or b==39 or b==34 or b==92 then return string.format("%q",s) end end -- この行追加
   local key=(rng()%50)+3
   local enc={}
   for i=1,#s do
-    enc[i]=ne((s:byte(i)+key+(i%7)*3)%255+1)
+    -- (byte + key + offset) % 256 + 1  → 値域 1..256、ヌル文字なし
+    enc[i]=ne((s:byte(i)+key+(i%7)*3)%256+1)
   end
   local vt,vr,vi=V(),V(),V()
-  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+510)%%255)end;return table.concat(%s)end)()"):format(
+  -- デコード: (enc - 1 - key - i%7*3 + 512) % 256
+  -- +512 (=256*2) で確実に正の値にする
+  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
     vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
 end
 
@@ -412,32 +399,23 @@ local function Compiler(lex)
     local sub=Compiler(lex)
     lex:expect(TK.LPAREN)
     local params={}
-    local has_vararg=false
     if not lex:check(TK.RPAREN) then
-      if lex:check(TK.DOTS) then lex:next(); has_vararg=true
+      if lex:check(TK.DOTS) then lex:next()
       else
         local p=lex:expect(TK.NAME); params[#params+1]=p.value
         while lex:match(TK.COMMA) do
-          if lex:check(TK.DOTS) then lex:next(); has_vararg=true; break end
+          if lex:check(TK.DOTS) then lex:next(); break end
           p=lex:expect(TK.NAME); params[#params+1]=p.value
         end
       end
     end
     lex:expect(TK.RPAREN)
     for _,p in ipairs(params) do sub.locals[#sub.locals+1]=p end
-    for i=#params,1,-1 do
-      local nm=params[i]
-      if not sub.name_idx[nm] then
-        sub.names[#sub.names+1]=nm
-        sub.name_idx[nm]=#sub.names
-      end
-      sub.code[#sub.code+1]={op=OP.SET_LOCAL, arg=sub.name_idx[nm]}
-    end
     sub:compileBlock()
-    lex:expect("end")
+    lex:expect(TK[TK.END] or TK.END)
     self.funcs[#self.funcs+1]={
       code=sub.code, consts=sub.consts, names=sub.names,
-      funcs=sub.funcs, params=#params, has_vararg=has_vararg
+      funcs=sub.funcs, params=#params
     }
     return #self.funcs
   end
@@ -598,7 +576,7 @@ local function Compiler(lex)
         patch(jf,here()-jf)
       end
       for _,e in ipairs(exits) do patch(e,here()-e) end
-      lex:expect("end")
+      lex:expect(TK.END)
     elseif t.type==TK.WHILE then
       lex:next()
       local ls=here()
@@ -606,11 +584,11 @@ local function Compiler(lex)
       local jf=emit(OP.JMP_FALSE,0)
       lex:expect(TK.DO)
       pushScope(); parseBlock(); popScope()
-      lex:expect("end")
+      lex:expect(TK.END)
       emit(OP.JMP, ls-here()-1)
       patch(jf,here()-jf)
     elseif t.type==TK.DO then
-      lex:next(); pushScope(); parseBlock(); popScope(); lex:expect("end")
+      lex:next(); pushScope(); parseBlock(); popScope(); lex:expect(TK.END)
     elseif t.type==TK.FOR then
       lex:next()
       local var=lex:expect(TK.NAME)
@@ -621,7 +599,7 @@ local function Compiler(lex)
         lex:expect(TK.DO)
         local fp=emit(OP.FORPREP,0)
         pushScope(); self.locals[#self.locals+1]=var.value
-        local lb=here(); parseBlock(); popScope(); lex:expect("end")
+        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
         emit(OP.FORLOOP, lb-here()-1)
         patch(fp,here()-fp)
       else
@@ -632,7 +610,7 @@ local function Compiler(lex)
         local gfp=emit(OP.GFORPREP,0)
         pushScope()
         for _,n in ipairs(names) do self.locals[#self.locals+1]=n end
-        local lb=here(); parseBlock(); popScope(); lex:expect("end")
+        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
         emit(OP.GFORLOOP, lb-here()-1)
         patch(gfp,here()-gfp)
       end
@@ -733,9 +711,11 @@ if not ok then
     local cd=source:sub(p3,p3+CHSZ-1); p3=p3+CHSZ
     local k3=prng2()%40+5
     local enc={}
-    for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%255+1) end
+    -- ★ FIX: %256+1 でヌル文字(0)を回避
+    for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%256+1) end
     local vt,vr,vi=V(),V(),V()
-    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+510)%%255)end;return table.concat(%s)end)()"):format(
+    -- デコード: -1 して +512 で正値保証、%256 で元に戻す
+    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
       vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
   end
@@ -806,21 +786,25 @@ local lines={}; local function L(s) lines[#lines+1]=s end
 local vUM=V(); local vPR=V(); local vVM=V()
 local vF=V(); local vST=V(); local vEN=V(); local vUV=V(); local vPC=V()
 local vIN=V(); local vOP=V(); local vAR=V()
+
+-- ★ Lua5.1互換ビット演算ヘルパー関数名
 local vBIT=V()
 
 L("(function()")
 L(("local %s=%s"):format(vUM,UM_str))
 L(("local %s=%s"):format(vPR,proto_str))
 
-L(("local %s={}"):format(vBIT))
-L("do")
+-- ★ ビット演算ヘルパー (Lua5.1互換・bit32使用 → Roblox標準)
+-- 独自実装は遅くてバグりやすいので bit32 に切り替え
+L(("local %s=bit32 or {}"):format(vBIT))
+L("if not bit32 then")
 L("  local function _xor(a,b) local r=0;for i=0,31 do local x=math.floor(a/2^i)%2;local y=math.floor(b/2^i)%2;if x~=y then r=r+2^i end end;return r end")
 L("  local function _and(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 and math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end")
 L("  local function _or(a,b) local r=0;for i=0,31 do if math.floor(a/2^i)%2==1 or math.floor(b/2^i)%2==1 then r=r+2^i end end;return r end")
 L("  local function _not(a) local r=0;for i=0,31 do if math.floor(a/2^i)%2==0 then r=r+2^i end end;return r end")
 L("  local function _shl(a,b) return math.floor(a*(2^b))%4294967296 end")
 L("  local function _shr(a,b) return math.floor(a/(2^b)) end")
-L(("  %s.bxor=_xor;%s.band=_and;%s.bor=_or;%s.bnot=_not;%s.shl=_shl;%s.shr=_shr"):format(vBIT,vBIT,vBIT,vBIT,vBIT,vBIT))
+L(("  %s.bxor=_xor;%s.band=_and;%s.bor=_or;%s.bnot=_not;%s.lshift=_shl;%s.rshift=_shr"):format(vBIT,vBIT,vBIT,vBIT,vBIT,vBIT))
 L("end")
 
 L(("local %s"):format(vVM))
@@ -858,12 +842,11 @@ L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_TRUE"),push_expr("true")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_FALSE"),push_expr("false")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_NUM"),push_expr("_K["..vAR.."]")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_STR"),push_expr("_K["..vAR.."]")))
-L(("    elseif %s==%s then for _vi=1,#%s do %s end"):format(vOP,opc("PUSH_VARARG"),vUV,push_expr(vUV.."[_vi]")))
+L(("    elseif %s==%s then -- vararg noop"):format(vOP,opc("PUSH_VARARG")))
 local vv1=V()
 L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr(vv1)))
 local vv2=V()
--- 変更後（getfenvまたはrawgetでフォールバック）
-L(("    elseif %s==%s then local %s=%s[_N[%s]];if %s==nil and getfenv then %s=getfenv(0)[_N[%s]] end;%s"):format(vOP,opc("PUSH_GLOBAL"),vv2,vEN,vAR,vv2,vv2,vAR,push_expr(vv2)))
+L(("    elseif %s==%s then local %s=%s[_N[%s]];%s"):format(vOP,opc("PUSH_GLOBAL"),vv2,vEN,vAR,push_expr(vv2)))
 L(("    elseif %s==%s then %s"):format(vOP,opc("POP"),pop_expr()))
 local vv3=V()
 L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc("DUP"),vv3,top_expr(),push_expr(vv3)))
@@ -893,11 +876,13 @@ local vlist_v=V(); local vlist_t=V()
 L(("    elseif %s==%s then local %s=%s;local %s=%s[#%s];%s[%s]=%s"):format(
   vOP,opc("SETLIST"),vlist_v,pop_expr(),vlist_t,vST,vST,vlist_t,vAR,vlist_v))
 
+-- ★ 算術演算 (bit32 使用)
 local function arith(opname, op_sym)
   local va=V(); local vb=V()
   L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
     vOP,opc(opname),vb,pop_expr(),va,pop_expr(),push_expr(va..op_sym..vb)))
 end
+-- ★ FIX: shl/shr は bit32.lshift/rshift を使う (独自実装の shl/shr → lshift/rshift)
 local function arith_fn(opname, fn_name)
   local va=V(); local vb=V()
   L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
@@ -916,7 +901,8 @@ do
     vOP,opc("IDIV"),vb,pop_expr(),va,pop_expr(),push_expr("math.floor("..va.."/"..vb..")")))
 end
 arith_fn("BAND","band"); arith_fn("BOR","bor"); arith_fn("BXOR","bxor")
-arith_fn("SHL","shl"); arith_fn("SHR","shr")
+-- ★ FIX: shl/shr のメソッド名を lshift/rshift に修正 (bit32 標準名)
+arith_fn("SHL","lshift"); arith_fn("SHR","rshift")
 arith("CONCAT","..")
 
 local function unary(opname, op_sym)
@@ -953,7 +939,6 @@ L(("    elseif %s==%s then"):format(vOP,opc("CALL")))
 L(("      local %s={}"):format(vargs))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vci,vAR,vargs,pop_expr()))
 L(("      local %s=%s"):format(vfn,pop_expr()))
-L(("      if type(%s)~='function' then error('attempt to call a '..type(%s)..' value') end"):format(vfn,vfn))
 L(("      local %s={%s(table.unpack and table.unpack(%s) or unpack(%s))}"):format(vres,vfn,vargs,vargs))
 L(("      for %s=1,#%s do %s end"):format(vci,vres,push_expr(vres.."["..vci.."]")))
 
@@ -963,13 +948,11 @@ L(("      local %s={}"):format(vrv))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vri,vAR,vrv,pop_expr()))
 L(("      return table.unpack and table.unpack(%s) or unpack(%s)"):format(vrv,vrv))
 
--- CLOSURE: 単行・日本語コメントなし
 local vcls=V(); local vcenv=V()
 L(("    elseif %s==%s then"):format(vOP,opc("CLOSURE")))
 L(("      local %s=%s.f[%s]"):format(vcls,vF,vAR))
 L(("      local %s=%s"):format(vcenv,vEN))
-L(("      local _cls_proto=%s;local _cls_env=%s"):format(vcls,vcenv))
-L(("      %s"):format(push_expr("(function(...) local _va={...};local _nst={};for _pi=1,_cls_proto.p do _nst[#_nst+1]=_va[_pi] end;local _varg={};for _pi=_cls_proto.p+1,#_va do _varg[#_varg+1]=_va[_pi] end;return "..vVM.."(_cls_proto,_nst,_cls_env,_varg) end)")))
+L(("      %s"):format(push_expr("(function(...) local _fa={...}; return "..vVM.."("..vcls..",_fa,"..vcenv..",{}) end)")))
 
 L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,opc("ENTER_SCOPE"),vSCOPE,vSCOPE))
 L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vSCOPE))
@@ -978,7 +961,6 @@ local vfp_st=V(); local vfp_lim=V(); local vfp_stp=V()
 L(("    elseif %s==%s then"):format(vOP,opc("FORPREP")))
 L(("      local %s=%s;local %s=%s;local %s=%s"):format(vfp_stp,pop_expr(),vfp_lim,pop_expr(),vfp_st,pop_expr()))
 L(("      %s;%s;%s"):format(push_expr(vfp_st),push_expr(vfp_lim),push_expr(vfp_stp)))
-L(("      if _N[%s] then %s[#%s][_N[%s]]=%s end"):format(vAR,vSCOPE,vSCOPE,vAR,vfp_st))
 L(("      if (%s>0 and %s>%s) or (%s<=0 and %s<%s) then %s=%s+%s end"):format(
   vfp_stp,vfp_st,vfp_lim, vfp_stp,vfp_st,vfp_lim, vPC,vPC,vAR))
 local vfl_stp=V(); local vfl_lim=V(); local vfl_v=V()
@@ -986,11 +968,8 @@ L(("    elseif %s==%s then"):format(vOP,opc("FORLOOP")))
 L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
   vfl_stp,vST,vST,vfl_lim,vST,vST,vfl_v,vST,vST))
 L(("      %s=%s+%s;%s[#%s-2]=%s"):format(vfl_v,vfl_v,vfl_stp,vST,vST,vfl_v))
-L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then"):format(
-  vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim))
-L(("        if _N[%s] then %s[#%s][_N[%s]]=%s end"):format(vAR,vSCOPE,vSCOPE,vAR,vfl_v))
-L(("        %s=%s+%s"):format(vPC,vPC,vAR))
-L("      end")
+L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then %s=%s+%s end"):format(
+  vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim, vPC,vPC,vAR))
 
 local vgfp_c=V(); local vgfp_s=V(); local vgfp_i=V()
 L(("    elseif %s==%s then"):format(vOP,opc("GFORPREP")))
@@ -1001,9 +980,9 @@ local vgfl_c=V(); local vgfl_s=V(); local vgfl_i=V(); local vgfl_r=V(); local vg
 L(("    elseif %s==%s then"):format(vOP,opc("GFORLOOP")))
 L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
   vgfl_c,vST,vST,vgfl_s,vST,vST,vgfl_i,vST,vST))
-L(("      local %s={%s(%s,%s)}"):format(vgfl_r,vgfl_c,vgfl_s,vgfl_i))
+L(("      local %s={%s(%s,%s)}"):format(vgfl_r,vgfl_i,vgfl_s,vgfl_c))
 L(("      if %s[1]~=nil then"):format(vgfl_r))
-L(("        %s[#%s-2]=%s[1]"):format(vST,vST,vgfl_r))
+L(("        %s[#%s]=%s[1]"):format(vST,vST,vgfl_r))
 L(("        for %s=#%s,1,-1 do %s end"):format(vgfl_j,vgfl_r,push_expr(vgfl_r.."["..vgfl_j.."]")))
 L(("        %s=%s+%s"):format(vPC,vPC,vAR))
 L("      end")
