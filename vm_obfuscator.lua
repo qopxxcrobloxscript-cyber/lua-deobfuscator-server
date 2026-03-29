@@ -54,24 +54,19 @@ local function ne(n)
   else local f=(rng()%6)+2;local q=math.floor(n/f);local c=n-f*q;return("(%d*%d+%d)"):format(f,q,c) end
 end
 
--- ★ FIX: %255+1 → %256+1 に変更
--- 元の %255+1 だと byte=254 のとき (254+key+offset)%255 = 0 になり
--- デコード時に string.char(0) = ヌル文字が生成されて
--- Roblox の "Attribute name is missing" エラーが発生する。
--- %256+1 にすると値域が 1..256 になり、string.char(0) が絶対に出ない。
--- デコード側も対応して %255 → %256、+510 → +512 に変更する。
+-- ★ FIX: %253+2 で値域を 2..254 に限定
+-- 0 → Roblox "Attribute name is missing" を回避
+-- 1,255 も除外して安全マージンを確保
 local function hide_str(s)
   if not s or #s==0 then return '""' end
   local key=(rng()%50)+3
   local enc={}
   for i=1,#s do
-    -- (byte + key + offset) % 256 + 1  → 値域 1..256、ヌル文字なし
-    enc[i]=ne((s:byte(i)+key+(i%7)*3)%256+1)
+    enc[i]=ne((s:byte(i)+key+(i%7)*3)%253+2)
   end
   local vt,vr,vi=V(),V(),V()
-  -- デコード: (enc - 1 - key - i%7*3 + 512) % 256
-  -- +512 (=256*2) で確実に正の値にする
-  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
+  -- デコード: (enc - 2 - key - i%7*3 + 253*4) % 253 → 元のバイト値
+  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-2-%d-%s%%7*3+1012)%%253)end;return table.concat(%s)end)()"):format(
     vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
 end
 
@@ -711,11 +706,11 @@ if not ok then
     local cd=source:sub(p3,p3+CHSZ-1); p3=p3+CHSZ
     local k3=prng2()%40+5
     local enc={}
-    -- ★ FIX: %256+1 でヌル文字(0)を回避
-    for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%256+1) end
+    -- ★ FIX: %253+2 で値域 2..254、0を確実に回避
+    for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%253+2) end
     local vt,vr,vi=V(),V(),V()
-    -- デコード: -1 して +512 で正値保証、%256 で元に戻す
-    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
+    -- デコード: (enc - 2 - k3 - i%7*3 + 1012) % 253
+    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-2-%d-%s%%7*3+1012)%%253)end;return table.concat(%s)end)()"):format(
       vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
   end
