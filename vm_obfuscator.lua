@@ -54,23 +54,20 @@ local function ne(n)
   else local f=(rng()%6)+2;local q=math.floor(n/f);local c=n-f*q;return("(%d*%d+%d)"):format(f,q,c) end
 end
 
--- ★ FIX: 257マーカー方式
--- byte=0 のとき enc=257 (特殊マーカー)、それ以外は (byte+key+i%7*3)%256+1 → 値域1..256
--- デコード時: enc==257 → string.char(0)、それ以外 → (enc-1-key-i%7*3+1024)%256
--- string.char(0)はLuaでは有効だがRobloxのAttribute名解釈でエラーになるケースがある
--- 通常のLuaコード（識別子・文字列リテラル）には0バイトは含まれないので実害なし
+-- ★ FIX: %255+1 方式（値域1..255、\0絶対なし）
+-- enc = (byte + key + i%7*3 - 1) % 255 + 1 → 値域1..255
+-- dec = (enc - 1 - key - i%7*3 + 1020) % 255 + 1 → 値域1..255
+-- 入力のLua識別子・文字列リテラルにbyte=0は来ないので情報落ちなし
 local function hide_str(s)
   if not s or #s==0 then return '""' end
   local key=(rng()%50)+3
   local enc={}
   for i=1,#s do
-    local b=s:byte(i)
-    if b==0 then enc[i]="257"
-    else enc[i]=ne((b+key+(i%7)*3)%256+1) end
+    enc[i]=ne((s:byte(i)+key+(i%7)*3-1)%255+1)
   end
   local vt,vr,vi=V(),V(),V()
-  return("(function()local %s={%s};local %s={};for %s=1,#%s do local _e=%s[%s];if _e==257 then %s[%s]=string.char(0)else %s[%s]=string.char((_e-1-%d-%s%%7*3+1024)%%256)end end;return table.concat(%s)end)()"):format(
-    vt,table.concat(enc,","),vr,vi,vt,vt,vi,vr,vi,vr,vi,key,vi,vr)
+  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+1020)%%255+1)end;return table.concat(%s)end)()"):format(
+    vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
 end
 
 local TK = {
@@ -709,15 +706,11 @@ if not ok then
     local cd=source:sub(p3,p3+CHSZ-1); p3=p3+CHSZ
     local k3=prng2()%40+5
     local enc={}
-    -- ★ FIX: 257マーカー方式でヌル文字回避
-    for i=1,#cd do
-      local b=cd:byte(i)
-      if b==0 then enc[i]="257"
-      else enc[i]=ne((b+k3+(i%7)*3)%256+1) end
-    end
+    -- ★ FIX: %255+1方式 値域1..255、 絶対なし
+    for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3-1)%255+1) end
     local vt,vr,vi=V(),V(),V()
-    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do local _e=%s[%s];if _e==257 then %s[%s]=string.char(0)else %s[%s]=string.char((_e-1-%d-%s%%7*3+1024)%%256)end end;return table.concat(%s)end)()"):format(
-      vt,table.concat(enc,","),vr,vi,vt,vt,vi,vr,vi,vr,vi,k3,vi,vr)
+    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+1020)%%255+1)end;return table.concat(%s)end)()"):format(
+      vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
   end
   local ord={}; for i=1,#chs do ord[i]=i end
