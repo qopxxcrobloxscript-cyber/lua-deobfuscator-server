@@ -271,13 +271,28 @@ local OP={
   GFORPREP=55, GFORLOOP=56,
   ENTER_SCOPE=57, LEAVE_SCOPE=58,
   PUSH_VARARG=59,
+  BIND_PARAM=60,
+  BIND_FORVAR=61,
+  BIND_GFORVARS=62,
+  CALL_MULTI=63,
+  TBL_SET_FIELD=64,
+  TBL_SET_TABLE=65,
+  RETURN_MULTI=66,
+  CAPTURE_VARARG=67,
+  SETLIST_MULTI=68,
 }
 
-local function Compiler(lex)
+local function Compiler(lex, parent)
   local self={}
   self.code={}; self.consts={}; self.const_idx={}
   self.names={}; self.name_idx={}
   self.funcs={}; self.locals={}; self.scope={}
+  self.parent=parent
+  -- FIX: break文が emit(OP.JMP,0) するだけでパッチされておらず、常にオフセット0
+  -- (=次の命令へ、実質何もしない)のままだったため break が機能していなかった。
+  -- ループ開始時にbreakStackへ新しいリストをpushし、break文はそこへジャンプ命令の
+  -- インデックスを記録、ループ終了時にそれら全てをループの外側へpatchする。
+  self.breakStack={}
 
   local function emit(op,arg) self.code[#self.code+1]={op=op,arg=arg or 0}; return #self.code end
   local function patch(i,v) self.code[i].arg=v end
@@ -291,7 +306,21 @@ local function Compiler(lex)
     if not self.name_idx[n] then self.names[#self.names+1]=n; self.name_idx[n]=#self.names end
     return self.name_idx[n]
   end
-  local function isLocal(n) for i=#self.locals,1,-1 do if self.locals[i]==n then return true end end end
+  -- FIX: 外部(parseFuncBody)からパラメータ束縛コードを注入できるように公開
+  self.emit=emit
+  self.addName=addName
+  -- FIX: isLocalが自分自身のlocalsしか見ておらず、ネストした関数(クロージャ)の
+  -- 中で外側関数のローカル変数(upvalue)を参照すると常にfalseを返し、グローバル
+  -- 変数として誤ってコンパイルされてしまうバグがあった。親コンパイラの連鎖を
+  -- 辿って外側のローカル変数も見えるようにする。
+  local function isLocal(n)
+    local c=self
+    while c do
+      for i=#c.locals,1,-1 do if c.locals[i]==n then return true end end
+      c=c.parent
+    end
+    return false
+  end
   local function pushScope() self.scope[#self.scope+1]=#self.locals; emit(OP.ENTER_SCOPE) end
   local function popScope()
     local p=self.scope[#self.scope]; self.scope[#self.scope]=nil
@@ -336,6 +365,9 @@ local function Compiler(lex)
   end
 
   local function parseSuffixedExpr()
+    -- 戻り値 kind: 最後に "call" ならこの式全体が(添字等を挟まず)単純呼び出しで
+    -- 終わったことを示す。呼び出し元(generic forのin節)はこれを使って
+    -- CALL→CALL_MULTIへの差し替え判断に利用する。
     local kind, name = parsePrimary()
     while true do
       local t=lex:peek()
@@ -375,14 +407,34 @@ local function Compiler(lex)
       if t.type==TK.LBRACKET then
         lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
         lex:expect(TK.ASSIGN); parseExpr()
-        emit(OP.SET_TABLE)
+        -- FIX: 代入文用のSET_TABLEはtableをpopしてしまい、テーブルコンストラクタの
+        -- 用途(続くフィールドのためにtableをスタックに残す必要がある)と衝突していた。
+        -- コンストラクタ専用のTBL_SET_TABLEを使う。
+        emit(OP.TBL_SET_TABLE)
       elseif t.type==TK.NAME and lex:peek(1).type==TK.ASSIGN then
         local n=lex:next(); lex:next()
         parseExpr()
-        emit(OP.SET_FIELD, addName(n.value))
+        -- FIX: 同様にSET_FIELDもtableを残さないため、コンストラクタ専用の
+        -- TBL_SET_FIELDを使う。
+        emit(OP.TBL_SET_FIELD, addName(n.value))
+      elseif t.type==TK.DOTS then
+        -- FIX: {...} のように可変長引数がテーブルの配列部要素として使われる場合、
+        -- Lua仕様上その位置が最後の要素なら全展開される。PUSH_VARARGは複数値を
+        -- 全部STへpushする実装にしたため、SETLIST(1個ずつ)ではなく専用の
+        -- SETLIST_MULTIで、pushされた値を全てtableの配列部に追加する。
+        lex:next(); emit(OP.PUSH_VARARG)
+        emit(OP.SETLIST_MULTI, count)
       else
-        parseExpr(); count=count+1
-        emit(OP.SETLIST, count)
+        local isBareCall = parseExpr()
+        count=count+1
+        local isLastElem = lex:check(TK.RBRACE) or (not lex:check(TK.COMMA) and not lex:check(TK.SEMI))
+        if isBareCall and isLastElem then
+          local lastIns=self.code[#self.code]
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+          emit(OP.SETLIST_MULTI, count-1)
+        else
+          emit(OP.SETLIST, count)
+        end
       end
       if not lex:match(TK.COMMA) then lex:match(TK.SEMI) end
       if lex:check(TK.RBRACE) then break end
@@ -391,21 +443,37 @@ local function Compiler(lex)
   end
 
   function parseFuncBody()
-    local sub=Compiler(lex)
+    local sub=Compiler(lex, self)
     lex:expect(TK.LPAREN)
     local params={}
+    local hasVararg=false
     if not lex:check(TK.RPAREN) then
-      if lex:check(TK.DOTS) then lex:next()
+      if lex:check(TK.DOTS) then lex:next(); hasVararg=true
       else
         local p=lex:expect(TK.NAME); params[#params+1]=p.value
         while lex:match(TK.COMMA) do
-          if lex:check(TK.DOTS) then lex:next(); break end
+          if lex:check(TK.DOTS) then lex:next(); hasVararg=true; break end
           p=lex:expect(TK.NAME); params[#params+1]=p.value
         end
       end
     end
     lex:expect(TK.RPAREN)
     for _,p in ipairs(params) do sub.locals[#sub.locals+1]=p end
+    -- FIX: 呼び出し時に初期スタック(ST)へ積まれた引数を、パラメータ名としてローカルスコープに束縛する。
+    -- これが無いと関数本体内でパラメータ名を参照してもnilになり、かつ未消費の引数がスタックに
+    -- 残ったまま後続のPUSH/CALL命令のスタック位置がズレて誤動作する原因になる。
+    -- BIND_PARAM の arg はパラメータ名の name_idx。実行時は ST の先頭要素を1個ずつ
+    -- table.remove(ST,1) で取り出し、その名前で SET_LOCAL する（呼び出し時の引数順=宣言順）。
+    for _,p in ipairs(params) do
+      sub.emit(OP.BIND_PARAM, sub.addName(p))
+    end
+    -- FIX: PUSH_VARARGが何もしない(noop)実装のままだったため `...` や
+    -- `local args={...}` が常に空になっていた。固定パラメータを全てBIND_PARAM
+    -- した後、STに残っている引数(=可変長引数)をCAPTURE_VARARGでVM内部の
+    -- vararg保存領域にコピーし、PUSH_VARARGがそこから展開できるようにする。
+    if hasVararg then
+      sub.emit(OP.CAPTURE_VARARG)
+    end
     sub:compileBlock()
     lex:expect(TK[TK.END] or TK.END)
     self.funcs[#self.funcs+1]={
@@ -417,15 +485,15 @@ local function Compiler(lex)
 
   local function parseSimpleExpr()
     local t=lex:peek()
-    if t.type==TK.NUMBER then lex:next(); emit(OP.PUSH_NUM, addConst(t.value))
-    elseif t.type==TK.STRING then lex:next(); emit(OP.PUSH_STR, addConst(t.value))
-    elseif t.type==TK.TRUE then lex:next(); emit(OP.PUSH_TRUE)
-    elseif t.type==TK.FALSE then lex:next(); emit(OP.PUSH_FALSE)
-    elseif t.type==TK.NIL then lex:next(); emit(OP.PUSH_NIL)
-    elseif t.type==TK.DOTS then lex:next(); emit(OP.PUSH_VARARG)
-    elseif t.type==TK.FUNCTION then lex:next(); local fi=parseFuncBody(); emit(OP.CLOSURE,fi)
-    elseif t.type==TK.LBRACE then parseTableConstructor()
-    else parseSuffixedExpr() end
+    if t.type==TK.NUMBER then lex:next(); emit(OP.PUSH_NUM, addConst(t.value)); return false
+    elseif t.type==TK.STRING then lex:next(); emit(OP.PUSH_STR, addConst(t.value)); return false
+    elseif t.type==TK.TRUE then lex:next(); emit(OP.PUSH_TRUE); return false
+    elseif t.type==TK.FALSE then lex:next(); emit(OP.PUSH_FALSE); return false
+    elseif t.type==TK.NIL then lex:next(); emit(OP.PUSH_NIL); return false
+    elseif t.type==TK.DOTS then lex:next(); emit(OP.PUSH_VARARG); return false
+    elseif t.type==TK.FUNCTION then lex:next(); local fi=parseFuncBody(); emit(OP.CLOSURE,fi); return false
+    elseif t.type==TK.LBRACE then parseTableConstructor(); return false
+    else local k=parseSuffixedExpr(); return k=="call" end
   end
 
   local UNOP={[TK.MINUS]=OP.UNM,[TK.NOT]=OP.NOT,[TK.HASH]=OP.LEN,[TK.TILDE]=OP.BNOT}
@@ -452,11 +520,13 @@ local function Compiler(lex)
     limit=limit or 0
     local t=lex:peek()
     local uop=UNOP[t.type]
-    if uop then lex:next(); parseExpr(11); emit(uop)
-    else parseSimpleExpr() end
+    local isBareCall
+    if uop then lex:next(); parseExpr(11); emit(uop); isBareCall=false
+    else isBareCall=parseSimpleExpr() end
     local prio=BINPRIO[lex:peek().type]
     while prio and prio[1]>limit do
       local op=lex:next()
+      isBareCall=false
       if op.type==TK.AND then
         local j=emit(OP.AND_JMP,0); parseExpr(prio[2]); patch(j,here()-j)
       elseif op.type==TK.OR then
@@ -466,12 +536,13 @@ local function Compiler(lex)
       end
       prio=BINPRIO[lex:peek().type]
     end
+    return isBareCall
   end
 
   local function parseExprList()
-    local n=1; parseExpr()
-    while lex:match(TK.COMMA) do parseExpr(); n=n+1 end
-    return n
+    local n=1; local lastIsBareCall=parseExpr()
+    while lex:match(TK.COMMA) do lastIsBareCall=parseExpr(); n=n+1 end
+    return n, lastIsBareCall
   end
 
   local function parseAssignOrCall()
@@ -525,8 +596,17 @@ local function Compiler(lex)
       lhs[#lhs+1]=extra
     end
     lex:expect(TK.ASSIGN)
-    local nvals=parseExprList()
-    if nvals~=#lhs then emit(OP.ADJUST,#lhs) end
+    -- FIX: 多重代入(local a,b,c = f())で、右辺の最後の式が呼び出しの場合はLua仕様
+    -- 上「多値展開」される。以前はCALLが常に1値に切り詰められるため、a,b,cの
+    -- うちaにしか値が入らず、b,cはADJUSTの無限ループバグ(nilを番兵無しで積もう
+    -- としていた)と相まって壊れていた。ここでは最後の式が単純呼び出しならCALL_MULTI
+    -- に差し替え、戻り値の実数はADJUSTが実行時に#lhsへ調整する。
+    local nvals,lastIsBareCall=parseExprList()
+    if lastIsBareCall then
+      local lastIns=self.code[#self.code]
+      if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+    end
+    if nvals~=#lhs or lastIsBareCall then emit(OP.ADJUST,#lhs) end
     for i=#lhs,1,-1 do
       local b=lhs[i]
       if #b.suffixes==0 then
@@ -578,10 +658,13 @@ local function Compiler(lex)
       parseExpr()
       local jf=emit(OP.JMP_FALSE,0)
       lex:expect(TK.DO)
+      self.breakStack[#self.breakStack+1]={}
       pushScope(); parseBlock(); popScope()
       lex:expect(TK.END)
       emit(OP.JMP, ls-here()-1)
       patch(jf,here()-jf)
+      local bl=table.remove(self.breakStack)
+      for _,bi in ipairs(bl) do patch(bi, here()-bi) end
     elseif t.type==TK.DO then
       lex:next(); pushScope(); parseBlock(); popScope(); lex:expect(TK.END)
     elseif t.type==TK.FOR then
@@ -593,28 +676,67 @@ local function Compiler(lex)
         else emit(OP.PUSH_NUM,addConst(1)) end
         lex:expect(TK.DO)
         local fp=emit(OP.FORPREP,0)
-        pushScope(); self.locals[#self.locals+1]=var.value
-        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
+        self.locals[#self.locals+1]=var.value
+        -- FIX: 数値forのループ変数はスタック上(st/lim/stpの一番下)に留まるだけで
+        -- ローカルスコープに束縛されないため、本体内で参照するとnilになっていた。
+        -- また ENTER_SCOPE/LEAVE_SCOPE を lb(ジャンプ先)より前に置くと、初回しか
+        -- ENTER_SCOPEが実行されないのに毎周LEAVE_SCOPEだけ実行され、2周目以降で
+        -- スコープスタックが枯渇するバグになる。ENTER/LEAVEを lb..FORLOOP の
+        -- 範囲(=毎周実行される範囲)に含める。
+        local lb=here()
+        self.breakStack[#self.breakStack+1]={}
+        pushScope()
+        emit(OP.BIND_FORVAR, addName(var.value))
+        parseBlock(); popScope(); lex:expect(TK.END)
         emit(OP.FORLOOP, lb-here()-1)
         patch(fp,here()-fp)
+        local bl=table.remove(self.breakStack)
+        for _,bi in ipairs(bl) do patch(bi, here()-bi) end
       else
         local names={var.value}
         while lex:match(TK.COMMA) do names[#names+1]=lex:expect(TK.NAME).value end
-        lex:expect(TK.IN); parseExprList()
+        lex:expect(TK.IN)
+        -- FIX: generic forの `in` 節 (explist) は、Lua仕様上「最後の式だけ多値展開」
+        -- される。典型的には `in ipairs(t) do` のように1つの呼び出し式が3値
+        -- (iterator,state,control)を返す。このVMのCALLは通常1値に切り詰める
+        -- ようにしたため、ここでは最後の式が(演算子を挟まない)単純な呼び出し式
+        -- で終わっていれば、そのCALL命令をCALL_MULTIに差し替えて全戻り値をpushさせる。
+        local lastIsBareCall = parseExpr()
+        while lex:match(TK.COMMA) do lastIsBareCall = parseExpr() end
+        if lastIsBareCall then
+          local lastIns=self.code[#self.code]
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+        end
         lex:expect(TK.DO)
         local gfp=emit(OP.GFORPREP,0)
-        pushScope()
         for _,n in ipairs(names) do self.locals[#self.locals+1]=n end
-        local lb=here(); parseBlock(); popScope(); lex:expect(TK.END)
+        -- FIX: generic forの複数ループ変数(i,v等)もスタックに積まれるだけで
+        -- ローカルスコープに束縛されていなかった。ループ本体の先頭(=GFORLOOPの
+        -- ジャンプ先)で毎回SET_LOCALする。lb はこの束縛命令群の直前に置き、
+        -- GFORLOOPが毎周ここへ戻って来るたびに再束縛されるようにする。
+        -- BIND_GFORVARS は毎回 ri をインクリメントしながら results[ri] を取得するため、
+        -- names は宣言順のままemitする(names[1]→results[1], names[2]→results[2], ...)。
+        -- また ENTER_SCOPE も lb..GFORLOOP の範囲(毎周実行される範囲)に含める必要がある
+        -- (数値forと同じ理由: 初回しかENTER_SCOPEが走らないとスコープが枯渇する)。
+        local lb=here()
+        self.breakStack[#self.breakStack+1]={}
+        pushScope()
+        for _,n in ipairs(names) do emit(OP.BIND_GFORVARS, addName(n)) end
+        parseBlock(); popScope(); lex:expect(TK.END)
         emit(OP.GFORLOOP, lb-here()-1)
         patch(gfp,here()-gfp)
+        local bl=table.remove(self.breakStack)
+        for _,bi in ipairs(bl) do patch(bi, here()-bi) end
       end
     elseif t.type==TK.REPEAT then
       lex:next()
       local ls=here()
+      self.breakStack[#self.breakStack+1]={}
       pushScope(); parseBlock()
       lex:expect(TK.UNTIL); parseExpr(); popScope()
       emit(OP.JMP_FALSE, ls-here()-1)
+      local bl=table.remove(self.breakStack)
+      for _,bi in ipairs(bl) do patch(bi, here()-bi) end
     elseif t.type==TK.FUNCTION then
       lex:next()
       local name=lex:expect(TK.NAME)
@@ -642,8 +764,15 @@ local function Compiler(lex)
         local names={}; names[#names+1]=lex:expect(TK.NAME).value
         while lex:match(TK.COMMA) do names[#names+1]=lex:expect(TK.NAME).value end
         local nv=0
-        if lex:match(TK.ASSIGN) then nv=parseExprList() end
-        if nv~=#names then emit(OP.ADJUST,#names) end
+        local lastIsBareCall=false
+        if lex:match(TK.ASSIGN) then nv,lastIsBareCall=parseExprList() end
+        -- FIX: local a,b,c = f() のように最後の式が呼び出しで終わる場合、Lua仕様上
+        -- 多値展開される。CALLをCALL_MULTIに差し替え、ADJUSTで#namesへ調整する。
+        if lastIsBareCall then
+          local lastIns=self.code[#self.code]
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+        end
+        if nv~=#names or lastIsBareCall then emit(OP.ADJUST,#names) end
         for i=#names,1,-1 do
           self.locals[#self.locals+1]=names[i]
           emit(OP.SET_LOCAL,addName(names[i]))
@@ -652,13 +781,28 @@ local function Compiler(lex)
     elseif t.type==TK.RETURN then
       lex:next()
       local nv=0
+      local lastIsBareCall=false
       if not (lex:check(TK.END) or lex:check(TK.ELSE) or lex:check(TK.ELSEIF)
            or lex:check(TK.UNTIL) or lex:check(TK.EOF)) then
-        nv=parseExprList()
+        nv,lastIsBareCall=parseExprList()
       end
-      emit(OP.RETURN,nv); lex:match(TK.SEMI)
+      -- FIX: return f() のように最後の式が呼び出しで終わる場合、Lua仕様上
+      -- fの全戻り値がそのまま返される(多値展開)。CALLをCALL_MULTIに差し替える。
+      -- RETURN自体は arg(=nv、式の個数)個をpopして返すが、CALL_MULTIで
+      -- 複数値が積まれていた場合はADJUSTで実際の個数に揃えてから返す必要がある。
+      if lastIsBareCall then
+        local lastIns=self.code[#self.code]
+        if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+        emit(OP.RETURN_MULTI, nv-1)
+      else
+        emit(OP.RETURN,nv)
+      end
+      lex:match(TK.SEMI)
     elseif t.type==TK.BREAK then
-      lex:next(); emit(OP.JMP,0)
+      lex:next()
+      local bi=emit(OP.JMP,0)
+      local bl=self.breakStack[#self.breakStack]
+      if bl then bl[#bl+1]=bi end
     elseif t.type==TK.GOTO then
       lex:next(); lex:next()
     elseif t.type==TK.DCOLON then
@@ -735,7 +879,7 @@ end
 local proto=result
 
 math.randomseed(seed)
-local MAX_OP=59
+local MAX_OP=68
 local pool={}; for i=1,MAX_OP do pool[i]=i end
 for i=MAX_OP,2,-1 do local j=math.random(1,i); pool[i],pool[j]=pool[j],pool[i] end
 local op2c={}; local c2op={}
@@ -810,8 +954,30 @@ L(("  local %s=%s.k"):format("_K",vF))
 L(("  local %s=%s.n"):format("_N",vF))
 L(("  local %s=1"):format(vPC))
 L("  local _unpack=table.unpack or unpack")
+-- FIX: 呼び出し結果を {f(...)} でテーブル化すると、戻り値の末尾にnilが含まれる
+-- 場合(例: pairs()は3番目にnilを返す) #演算子で要素数が正しく取れない
+-- (Luaの仕様上、nilを含む配列の長さは未定義動作になりうる)バグがあった。
+-- table.pack相当のヘルパーを用意し、.nフィールドで正確な個数を保持する。
+L("  local _pack=table.pack or function(...) return {n=select('#',...), ...} end")
+-- FIX: 式評価用スタック(ST)は ST[#ST+1]=v という「配列の末尾に積む」実装のため、
+-- v が nil だと実質何も起きず(Luaのテーブルにnilを代入するのは要素削除と同義)、
+-- スタックの見かけの長さが変わらずGFORPREP等の複数pop処理が壊れるバグがあった。
+-- ST上でnilを表すための番兵値を用意し、CALL_MULTI等でpushする際はnilの代わりに
+-- この番兵を積み、pop側(GFORPREP/GFORLOOP)で番兵を実際のnilに変換して使う。
+local vNILSENT=V()
+L(("  local %s=setmetatable({},{__tostring=function() return 'nil' end})"):format(vNILSENT))
 local vSCOPE=V()
-L(("  local %s={{}}"):format(vSCOPE))
+-- FIX: クロージャ(ネストした関数)が外側関数のローカル変数(upvalue)を参照できな
+-- かったバグを修正。以前は毎回のVM呼び出しで vSCOPE={{}} と真っさらに初期化して
+-- いたため、子関数は親のスコープに一切アクセスできなかった。
+-- ここでは第4引数(vUV)として「呼び出し元スコープチェーンのコピー」を受け取り、
+-- それをベースに新しいスコープを1段追加する。CLOSURE命令側で、クロージャ生成時点
+-- の vSCOPE 全体をコピーして子VM呼び出しの第4引数として渡すようにする。
+local vSCOPE_base=V()
+L(("  local %s={}"):format(vSCOPE_base))
+L(("  for _si=1,#%s do %s[_si]=%s[_si] end"):format(vUV,vSCOPE_base,vUV))
+L(("  %s[#%s+1]={}"):format(vSCOPE_base,vSCOPE_base))
+L(("  local %s=%s"):format(vSCOPE,vSCOPE_base))
 local vSET_L=V(); local vGET_L=V()
 L(("  local function %s(nm,val)"):format(vSET_L))
 L(("    for _i=#%s,1,-1 do if %s[_i][nm]~=nil then %s[_i][nm]=val;return end end"):format(vSCOPE,vSCOPE,vSCOPE))
@@ -820,6 +986,21 @@ L("  end")
 L(("  local function %s(nm)"):format(vGET_L))
 L(("    for _i=#%s,1,-1 do local v=%s[_i][nm];if v~=nil then return v end end"):format(vSCOPE,vSCOPE))
 L("  end")
+-- FIX: 数値for/generic forの内部状態(st/lim/stp や f/s/i)を式評価用スタック(ST)と
+-- 共有すると、ループ本体内の式評価(push/pop)がそれらを巻き込んで破壊してしまう。
+-- そのため専用のフレームスタックを別に用意し、本体側のSTとは独立させる。
+local vNFOR=V(); local vGFOR=V()
+L(("  local %s={}"):format(vNFOR))
+L(("  local %s={}"):format(vGFOR))
+-- FIX: PUSH_VARARGが常にnoopだったため `...` が機能していなかった。
+-- CAPTURE_VARARGが固定パラメータ消費後の残りSTをここに保存し、PUSH_VARARGが
+-- それをSTへ展開する。
+local vVARARG=V()
+L(("  local %s={n=0}"):format(vVARARG))
+-- FIX: SETLIST_MULTIが「直前のPUSH_VARARG/CALL_MULTIが何個の値をpushしたか」を
+-- 知るための記録用変数。
+local vLASTMULTI=V()
+L(("  local %s=0"):format(vLASTMULTI))
 
 L("  while true do")
 L(("    local %s=%s.c[%s]"):format(vIN,vF,vPC))
@@ -828,7 +1009,11 @@ L(("    local %s=%s[%s[1]]"):format(vOP,vUM,vIN))
 L(("    local %s=%s[2]"):format(vAR,vIN))
 L(("    %s=%s+1"):format(vPC,vPC))
 
-local function pop_expr() return ("table.remove(%s)"):format(vST) end
+-- FIX: ST上のnilは番兵値(vNILSENT)で表現されている場合があるため、pop時に
+-- 自動的に実際のnilへ変換するヘルパーを用意し、全てのpop_expr呼び出しが
+-- 透過的に正しいnil値を受け取れるようにする。
+L(("  local function _popv(t) local v=table.remove(t); if v==%s then return nil end; return v end"):format(vNILSENT))
+local function pop_expr() return ("_popv(%s)"):format(vST) end
 local function push_expr(v) return ("%s[#%s+1]=%s"):format(vST,vST,v) end
 local function top_expr() return ("%s[#%s]"):format(vST,vST) end
 
@@ -837,7 +1022,21 @@ L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_TRUE"),push_expr("true")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_FALSE"),push_expr("false")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_NUM"),push_expr("_K["..vAR.."]")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_STR"),push_expr("_K["..vAR.."]")))
-L(("    elseif %s==%s then -- vararg noop"):format(vOP,opc("PUSH_VARARG")))
+-- FIX: PUSH_VARARG — CAPTURE_VARARGが保存したvararg値を全てSTへ展開する。
+-- nilが含まれていても正しく扱えるよう番兵値を使う。
+L(("    elseif %s==%s then for _vi=1,%s.n do local _v=%s[_vi]; %s end; %s=%s.n"):format(
+  vOP,opc("PUSH_VARARG"),vVARARG,vVARARG,push_expr("(_v==nil and "..vNILSENT.." or _v)"),vLASTMULTI,vVARARG))
+-- FIX: CAPTURE_VARARG — 固定パラメータをBIND_PARAMで全て消費した後、STに残って
+-- いる引数(=可変長引数)を vararg保存領域にコピーする。.nで正確な個数を保持する
+-- (残りの引数にnilが含まれる可能性は低いが念のため番兵経由で扱う)。
+L(("    elseif %s==%s then local _vn=#%s; %s={n=_vn}; for _vi=1,_vn do %s[_vi]=%s[_vi] end; for _vi=1,_vn do %s[_vi]=nil end"):format(
+  vOP,opc("CAPTURE_VARARG"),vST,vVARARG,vVARARG,vST,vST))
+-- FIX: BIND_PARAM — 呼び出し時にSTの先頭に積まれた引数を1個ずつ取り出し、
+-- パラメータ名としてローカルスコープにSET_LOCALする。これが無いと関数内で
+-- パラメータ名を参照してもnilになり、かつ未消費の引数がスタックに残留して
+-- 後続のPUSH/CALL命令のスタック位置がズレる。
+L(("    elseif %s==%s then local %s=table.remove(%s,1);%s(_N[%s],%s)"):format(
+  vOP,opc("BIND_PARAM"),"_bp",vST,vSET_L,vAR,"_bp"))
 local vv1=V()
 L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr(vv1)))
 local vv2=V()
@@ -848,8 +1047,12 @@ L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc("DUP"),vv3,top_expr()
 local vs1=V(); local vs2=V()
 L(("    elseif %s==%s then local %s=%s;local %s=%s;"):format(vOP,opc("SWAP"),vs1,pop_expr(),vs2,pop_expr()))
 L(("      %s;%s"):format(push_expr(vs1),push_expr(vs2)))
+-- FIX: ADJUST が push_expr("nil") で不足分を埋めようとしていたが、
+-- ST[#ST+1]=nil は実質何もしない(Luaのnil代入は要素削除と同義)ため #ST が
+-- 増えず無限ループするバグがあった。nilの代わりに番兵値を積み、代入先で
+-- 番兵をnilに変換して使う(SET_LOCAL/SET_GLOBALで変換)。
 L(("    elseif %s==%s then while #%s<%s do %s end;while #%s>%s do %s end"):format(
-  vOP,opc("ADJUST"),vST,vAR,push_expr("nil"),vST,vAR,pop_expr()))
+  vOP,opc("ADJUST"),vST,vAR,push_expr(vNILSENT),vST,vAR,pop_expr()))
 local vsl=V()
 L(("    elseif %s==%s then local %s=%s;%s(_N[%s],%s)"):format(vOP,opc("SET_LOCAL"),vsl,pop_expr(),vSET_L,vAR,vsl))
 local vsg=V()
@@ -870,6 +1073,28 @@ L(("    elseif %s==%s then local %s=%s;local %s=%s;%s[_N[%s]]=%s"):format(
 local vlist_v=V(); local vlist_t=V()
 L(("    elseif %s==%s then local %s=%s;local %s=%s[#%s];%s[%s]=%s"):format(
   vOP,opc("SETLIST"),vlist_v,pop_expr(),vlist_t,vST,vST,vlist_t,vAR,vlist_v))
+
+-- FIX: SETLIST_MULTI — {...} や末尾の関数呼び出しがテーブルコンストラクタの
+-- 最後の配列要素として使われる場合、Lua仕様上その全戻り値/可変長引数が展開
+-- されて連番で格納される。直前のPUSH_VARARG/CALL_MULTIが何個pushしたかを
+-- vLASTMULTI に記録しておき、ここでその個数分だけpopしてテーブルに連番格納する。
+local vlm_i=V(); local vlm_v=V(); local vlm_t=V()
+L(("    elseif %s==%s then"):format(vOP,opc("SETLIST_MULTI")))
+L(("      local %s={}"):format(vlm_v))
+L(("      for %s=1,%s do %s[%s]=%s end"):format(vlm_i,vLASTMULTI,vlm_v,vlm_i,pop_expr()))
+L(("      local %s=%s[#%s]"):format(vlm_t,vST,vST))
+L(("      for %s=1,%s do %s[%s+%s]=%s[%s] end"):format(vlm_i,vLASTMULTI,vlm_t,vAR,vlm_i,vlm_v,vlm_i))
+
+-- FIX: TBL_SET_FIELD / TBL_SET_TABLE — テーブルコンストラクタ専用。
+-- 代入文用のSET_FIELD/SET_TABLEはtableをpopして戻さないため、コンストラクタの
+-- 「複数フィールドを積み上げて構築する」用途(tableをスタックに残し続ける必要が
+-- ある)と衝突していた。SETLISTと同様、valueだけpopしテーブルはST[#ST]参照のまま残す。
+local vtsf_v=V(); local vtsf_t=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s[#%s];%s[_N[%s]]=%s"):format(
+  vOP,opc("TBL_SET_FIELD"),vtsf_v,pop_expr(),vtsf_t,vST,vST,vtsf_t,vAR,vtsf_v))
+local vtst_v=V(); local vtst_k=V(); local vtst_t=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s;local %s=%s[#%s];%s[%s]=%s"):format(
+  vOP,opc("TBL_SET_TABLE"),vtst_v,pop_expr(),vtst_k,pop_expr(),vtst_t,vST,vST,vtst_t,vtst_k,vtst_v))
 
 -- ★ 算術演算 (bit32 使用)
 local function arith(opname, op_sym)
@@ -934,20 +1159,62 @@ L(("    elseif %s==%s then"):format(vOP,opc("CALL")))
 L(("      local %s={}"):format(vargs))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vci,vAR,vargs,pop_expr()))
 L(("      local %s=%s"):format(vfn,pop_expr()))
-L(("      local %s={%s(_unpack(%s))}"):format(vres,vfn,vargs,vargs))
-L(("      for %s=1,#%s do %s end"):format(vci,vres,push_expr(vres.."["..vci.."]")))
+L(("      local %s=_pack(%s(_unpack(%s)))"):format(vres,vfn,vargs))
+-- FIX: 呼び出し結果を複数値そのままpushしていたため、CALLの結果を式の途中で
+-- 使う場合(例: print(ipairs(t)) の内側呼び出し)に、外側の命令のnargsカウントと
+-- 実際に積まれた値の数がズレてスタックが崩壊するバグがあった。
+-- このVMは「1つの式=1つのスタック値」という前提で命令のarg(個数)を決めているため、
+-- 呼び出し結果は常に先頭の戻り値1個だけをpushする(Luaの「非末尾式は1値に切り詰め」
+-- 仕様に相当)。複数戻り値をそのまま使いたい場合(a,b=f() 等)は別途対応が必要。
+L(("      %s"):format(push_expr(vres.."[1]")))
+
+-- FIX: CALL_MULTI — CALLと同じ呼び出し処理だが、戻り値をすべてpushする。
+-- generic forの `in` 節 (例: in ipairs(t) do) のように、Lua仕様で多値展開が
+-- 必要な場面でのみパーサーがCALLをこれに差し替えて使う。
+local vfn2=V(); local vargs2=V(); local vres2=V(); local vci2=V()
+L(("    elseif %s==%s then"):format(vOP,opc("CALL_MULTI")))
+L(("      local %s={}"):format(vargs2))
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vci2,vAR,vargs2,pop_expr()))
+L(("      local %s=%s"):format(vfn2,pop_expr()))
+L(("      local %s=_pack(%s(_unpack(%s)))"):format(vres2,vfn2,vargs2))
+-- FIX: 戻り値にnilが含まれていても正しくpushできるよう、nilの代わりに番兵値を積む。
+L(("      for %s=1,%s.n do local _v=%s[%s]; %s end"):format(
+  vci2,vres2,vres2,vci2, push_expr("(_v==nil and "..vNILSENT.." or _v)")))
+L(("      %s=%s.n"):format(vLASTMULTI,vres2))
 
 local vrv=V(); local vri=V()
 L(("    elseif %s==%s then"):format(vOP,opc("RETURN")))
 L(("      local %s={}"):format(vrv))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vri,vAR,vrv,pop_expr()))
-L(("      return _unpack(%s)"):format(vrv,vrv))
+-- FIX: _unpack(t) は既定で #t を使うため、戻り値の末尾にnilが含まれる場合
+-- (例: return a, nil) に切り詰められてしまう。個数はコンパイル時に既知(vAR)
+-- なので、それを明示してunpackする。
+L(("      return _unpack(%s,1,%s)"):format(vrv,vAR))
+
+-- FIX: RETURN_MULTI — `return f()` のように最後の式が呼び出しで終わる場合、
+-- Lua仕様上fの全戻り値がそのまま返される。arg=最後の式より前にある固定個数の式の数。
+-- スタックに残っている全要素(固定値+CALL_MULTIが積んだ複数値)をpopし、
+-- 番兵をnilへ変換してから返す。
+local vrmv=V(); local vrmn=V(); local vrmi=V()
+L(("    elseif %s==%s then"):format(vOP,opc("RETURN_MULTI")))
+L(("      local %s=#%s"):format(vrmn,vST))
+L(("      local %s={}"):format(vrmv))
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vrmi,vrmn,vrmv,pop_expr()))
+L(("      return _unpack(%s,1,%s)"):format(vrmv,vrmn))
 
 local vcls=V(); local vcenv=V()
 L(("    elseif %s==%s then"):format(vOP,opc("CLOSURE")))
 L(("      local %s=%s.f[%s]"):format(vcls,vF,vAR))
 L(("      local %s=%s"):format(vcenv,vEN))
-L(("      %s"):format(push_expr("(function(...) local _fa={...}; return "..vVM.."("..vcls..",_fa,"..vcenv..",{}) end)")))
+-- FIX: クロージャ生成時点のスコープチェーン(vSCOPE、外側のローカル変数を含む)を
+-- コピーしてキャプチャし、子関数が呼ばれるたびにそのコピーを子VMの第4引数として
+-- 渡す。これにより inner関数が outer関数のローカル変数(upvalue)を参照できる。
+-- (テーブルそのものではなく浅いコピーを都度渡すのは、複数回の呼び出し間で
+--  子VMが自分のスコープを積み増しても親のキャプチャ済みチェーンを汚染しない
+--  ようにするため)
+L(("      local %s={}"):format("_capScope"))
+L(("      for _csi=1,#%s do %s[_csi]=%s[_csi] end"):format(vSCOPE,"_capScope",vSCOPE))
+L(("      %s"):format(push_expr("(function(...) local _fa={...}; local _cs={}; for _i=1,#_capScope do _cs[_i]=_capScope[_i] end; return "..vVM.."("..vcls..",_fa,"..vcenv..",_cs) end)")))
 
 L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,opc("ENTER_SCOPE"),vSCOPE,vSCOPE))
 L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vSCOPE))
@@ -955,31 +1222,60 @@ L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vS
 local vfp_st=V(); local vfp_lim=V(); local vfp_stp=V()
 L(("    elseif %s==%s then"):format(vOP,opc("FORPREP")))
 L(("      local %s=%s;local %s=%s;local %s=%s"):format(vfp_stp,pop_expr(),vfp_lim,pop_expr(),vfp_st,pop_expr()))
-L(("      %s;%s;%s"):format(push_expr(vfp_st),push_expr(vfp_lim),push_expr(vfp_stp)))
+L(("      %s[#%s+1]={%s,%s,%s}"):format(vNFOR,vNFOR,vfp_st,vfp_lim,vfp_stp))
 L(("      if (%s>0 and %s>%s) or (%s<=0 and %s<%s) then %s=%s+%s end"):format(
   vfp_stp,vfp_st,vfp_lim, vfp_stp,vfp_st,vfp_lim, vPC,vPC,vAR))
-local vfl_stp=V(); local vfl_lim=V(); local vfl_v=V()
+local vfl_fr=V()
 L(("    elseif %s==%s then"):format(vOP,opc("FORLOOP")))
-L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
-  vfl_stp,vST,vST,vfl_lim,vST,vST,vfl_v,vST,vST))
-L(("      %s=%s+%s;%s[#%s-2]=%s"):format(vfl_v,vfl_v,vfl_stp,vST,vST,vfl_v))
-L(("      if (%s>0 and %s<=%s) or (%s<=0 and %s>=%s) then %s=%s+%s end"):format(
-  vfl_stp,vfl_v,vfl_lim, vfl_stp,vfl_v,vfl_lim, vPC,vPC,vAR))
+L(("      local %s=%s[#%s]"):format(vfl_fr,vNFOR,vNFOR))
+L(("      %s[1]=%s[1]+%s[3]"):format(vfl_fr,vfl_fr,vfl_fr))
+L(("      if (%s[3]>0 and %s[1]<=%s[2]) or (%s[3]<=0 and %s[1]>=%s[2]) then %s=%s+%s"):format(
+  vfl_fr,vfl_fr,vfl_fr, vfl_fr,vfl_fr,vfl_fr, vPC,vPC,vAR))
+L(("      else %s[#%s]=nil end"):format(vNFOR,vNFOR))
 
-local vgfp_c=V(); local vgfp_s=V(); local vgfp_i=V()
+-- FIX: BIND_FORVAR — 専用フレームスタック vNFOR の一番上のフレームから
+-- 現在値(st)を取り出し、ループ変数名でローカルスコープにSET_LOCALする。
+-- 式評価用スタック(ST)とは分離しているため本体内の演算で破壊されない。
+L(("    elseif %s==%s then local %s=%s[#%s][1];%s(_N[%s],%s)"):format(
+  vOP,opc("BIND_FORVAR"),"_bfv",vNFOR,vNFOR,vSET_L,vAR,"_bfv"))
+-- FIX: BIND_GFORVARS — 専用フレームスタック vGFOR の一番上のフレームに保存された
+-- results配列から、呼ばれた順に1個ずつ取り出して対応する変数名にSET_LOCALする。
+-- (parseStat側で names を逆順にemitしているので、実行順は names[1],names[2],... となり
+--  results[1],results[2],...と正しく対応する)
+local vgv_fr=V()
+L(("    elseif %s==%s then"):format(vOP,opc("BIND_GFORVARS")))
+L(("      local %s=%s[#%s]"):format(vgv_fr,vGFOR,vGFOR))
+L(("      %s.ri=(%s.ri or 0)+1"):format(vgv_fr,vgv_fr))
+L(("      %s(_N[%s],%s.results[%s.ri])"):format(vSET_L,vAR,vgv_fr,vgv_fr))
+
+local vgfp_c=V(); local vgfp_s=V(); local vgfp_i=V(); local vgfp_r=V()
 L(("    elseif %s==%s then"):format(vOP,opc("GFORPREP")))
 L(("      local %s=%s;local %s=%s;local %s=%s"):format(vgfp_c,pop_expr(),vgfp_s,pop_expr(),vgfp_i,pop_expr()))
-L(("      %s;%s;%s"):format(push_expr(vgfp_i),push_expr(vgfp_s),push_expr(vgfp_c)))
-
-local vgfl_c=V(); local vgfl_s=V(); local vgfl_i=V(); local vgfl_r=V(); local vgfl_j=V()
-L(("    elseif %s==%s then"):format(vOP,opc("GFORLOOP")))
-L(("      local %s=%s[#%s];local %s=%s[#%s-1];local %s=%s[#%s-2]"):format(
-  vgfl_c,vST,vST,vgfl_s,vST,vST,vgfl_i,vST,vST))
-L(("      local %s={%s(%s,%s)}"):format(vgfl_r,vgfl_i,vgfl_s,vgfl_c))
-L(("      if %s[1]~=nil then"):format(vgfl_r))
-L(("        %s[#%s]=%s[1]"):format(vST,vST,vgfl_r))
-L(("        for %s=#%s,1,-1 do %s end"):format(vgfl_j,vgfl_r,push_expr(vgfl_r.."["..vgfl_j.."]")))
+-- vgfp_c=初期control値, vgfp_s=state, vgfp_i=iterator関数 (parseExprList評価順 f,s,var の逆popなので)
+-- FIX: GFORPREPはフレームを積むだけで初回のイテレータ呼び出しをしていなかったため、
+-- 直後のBIND_GFORVARSが空のresultsを参照してnilを束縛してしまうバグがあった。
+-- ここで最初の呼び出し f(s,c) を行い、resultsを埋めてから本体へ入る。
+-- (呼び出し結果がnilなら最初からループ0回、GFORLOOPまで到達しないよう
+--  arg(ジャンプ先=GFORLOOPの次)へ飛ばす)
+L(("      local %s={%s(%s,%s)}"):format(vgfp_r,vgfp_i,vgfp_s,vgfp_c))
+L(("      if %s[1]==nil then"):format(vgfp_r))
 L(("        %s=%s+%s"):format(vPC,vPC,vAR))
+L("      else")
+L(("        %s[#%s+1]={f=%s,s=%s,c=%s[1],results=%s,ri=0}"):format(vGFOR,vGFOR,vgfp_i,vgfp_s,vgfp_r,vgfp_r))
+L("      end")
+
+-- FIX: GFORLOOP — 専用フレームスタック(vGFOR)を使い、式評価用スタック(ST)を汚さない。
+-- イテレータ関数を呼び、結果が nil でなければ次周のcontrol値を更新してresultsを保存、
+-- BIND_GFORVARSが順に取り出せるようにする。
+local vgfl_fr=V(); local vgfl_r=V()
+L(("    elseif %s==%s then"):format(vOP,opc("GFORLOOP")))
+L(("      local %s=%s[#%s]"):format(vgfl_fr,vGFOR,vGFOR))
+L(("      local %s={%s.f(%s.s,%s.c)}"):format(vgfl_r,vgfl_fr,vgfl_fr,vgfl_fr))
+L(("      if %s[1]~=nil then"):format(vgfl_r))
+L(("        %s.c=%s[1];%s.results=%s;%s.ri=0"):format(vgfl_fr,vgfl_r,vgfl_fr,vgfl_r,vgfl_fr))
+L(("        %s=%s+%s"):format(vPC,vPC,vAR))
+L("      else")
+L(("        %s[#%s]=nil"):format(vGFOR,vGFOR))
 L("      end")
 
 L("    end")
