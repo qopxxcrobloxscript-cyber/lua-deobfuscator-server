@@ -220,7 +220,7 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
       <div class="card-label">[ 02 ] ENCRYPTION LAYERS</div>
       <div class="range-row">
         <span style="font-size:.82em;color:#888">Base64層数</span>
-        <input type="range" id="b64Layers" min="1" max="50" value="5">
+        <input type="range" id="b64Layers" min="0" max="50" value="5">
         <span class="range-val" id="layerVal">5</span>
       </div>
       <div id="layerWarning" class="warn" style="display:none">⚠️ 30層以上は処理に時間がかかります</div>
@@ -228,7 +228,7 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
       <div class="card-label" style="margin-top:18px">[ 03 ] JUNK CODE INTENSITY</div>
       <div class="range-row">
         <span style="font-size:.82em;color:#888">ダミーコード</span>
-        <input type="range" id="junkIntensity" min="1" max="500" value="200">
+        <input type="range" id="junkIntensity" min="0" max="500" value="200">
         <span class="range-val" id="junkVal">200</span>
       </div>
       <small class="hint">推奨: 150〜300 ／ 最大500</small>
@@ -516,14 +516,45 @@ byId('deobfFileInput').addEventListener('change',()=>handleFile('deobfFileInput'
 // ════════════════════════════════════════════════════
 //  変数名生成 / 数値偽装 / エンコード関数群
 // ════════════════════════════════════════════════════
+let __usedVarNames = null; // Set, reset at the start of each processObfuscation() call
+const LUA_RESERVED_WORDS = new Set([
+  "and","break","do","else","elseif","end","false","for","function","if","in",
+  "local","nil","not","or","repeat","return","then","true","until","while"
+]);
 function generateVarName(lite){
-  if(lite){const t="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";return t[Math.floor(Math.random()*t.length)];}
-  const starts=["I","l","O","Il","lI","OI","IO","lO","Ol"];
-  let e=starts[Math.floor(Math.random()*starts.length)];
-  const chars=["I","l","O","_","1","0"];
-  const len=10+Math.floor(8*Math.random());
-  for(let a=0;a<len;a++) e+=chars[Math.floor(Math.random()*chars.length)];
-  return e;
+  const LITE_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+  let name;
+  let attempts = 0;
+  do {
+    if (lite) {
+      // Single characters run out fast (only ~53 possible). Once most are used,
+      // fall back to two-character names to avoid looping forever while still
+      // keeping output short. This also guarantees generateVarName never returns
+      // a name already in use, which previously caused variable collisions.
+      if (attempts < 200) {
+        name = LITE_ALPHABET[Math.floor(Math.random() * LITE_ALPHABET.length)];
+      } else {
+        name = LITE_ALPHABET[Math.floor(Math.random() * LITE_ALPHABET.length)]
+             + LITE_ALPHABET[Math.floor(Math.random() * LITE_ALPHABET.length)];
+      }
+    } else {
+      const starts=["I","l","O","Il","lI","OI","IO","lO","Ol"];
+      let e=starts[Math.floor(Math.random()*starts.length)];
+      const chars=["I","l","O","_","1","0"];
+      const len=10+Math.floor(8*Math.random());
+      for(let a=0;a<len;a++) e+=chars[Math.floor(Math.random()*chars.length)];
+      name = e;
+    }
+    attempts++;
+    // A short two-character lite name can randomly collide with an actual Lua
+    // reserved word (e.g. "or", "do", "if", "in") — those are hard syntax errors
+    // when used as an identifier ('<name>' expected near 'or'), so reject them here.
+  } while (
+    ((__usedVarNames && __usedVarNames.has(name)) || LUA_RESERVED_WORDS.has(name))
+    && attempts < 500
+  );
+  if (__usedVarNames) __usedVarNames.add(name);
+  return name;
 }
 function numToExpr(n){
   const r=Math.random();
@@ -572,6 +603,29 @@ function strToEncodedChar(str){
   catch(e){return strToChar(str);}
 }
 function strToChar(str){const c=[];for(let i=0;i<str.length;i++)c.push(str.charCodeAt(i));return `string.char(${c.join(',')})`;}
+// Safely embed an arbitrary byte string (0-255 per char code) as a Lua double-quoted
+// string literal. Escapes backslash/quote/newline/CR and represents every other
+// non-printable byte as a zero-padded decimal escape (\027, not \27 — avoids the
+// following literal digit being misread as part of the escape, e.g. \27 + "7" -> \277).
+// This replaces the previous approach of directly interpolating the payload into
+// `"${a}"`, which broke whenever the payload (raw Lua source at layers=0, or raw XOR
+// byte output) happened to contain a quote, backslash, newline, or control byte.
+function toLuaSafeString(str){
+  let out = '';
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    const ch = str[i];
+    if (ch === '\\') out += '\\\\';
+    else if (ch === '"') out += '\\"';
+    else if (code === 10) out += '\\n';
+    else if (code === 13) out += '\\r';
+    else if (code === 0) out += '\\000';
+    else if (code < 32 || code === 127) out += '\\' + String(code).padStart(3, '0');
+    else if (code > 255) out += '\\' + String(code).padStart(3, '0'); // shouldn't normally happen, stay safe
+    else out += ch;
+  }
+  return `"${out}"`;
+}
 function bytesToBase64(t){return btoa(Array.from(t,t=>String.fromCodePoint(t)).join(""));}
 
 // ════════════════════════════════════════════════════
@@ -613,9 +667,18 @@ function injectJunkIntoCode(code,intensity,lite,opts){
   const encStr=s=>(opts&&opts.useSaltEncode)?strToEncodedChar(s):strToChar(s);
   const encNum=n=>(opts&&opts.useNumExpr)?numToExpr(n):String(n);
   const lines=code.split('\n'),result=[];
+  // In Lua, "return" must be the last statement in its block — inserting anything
+  // after one is a syntax error. Skip insertion right after a line that ends with a
+  // bare return statement (no trailing ';' or 'end' that would close the block first).
+  const endsWithBareReturn = (line) => {
+    const trimmed = line.trimEnd();
+    if (trimmed === '') return false;
+    if (/\bend;?$/.test(trimmed)) return false;
+    return /\breturn\b[^;]*$/.test(trimmed);
+  };
   for(let i=0;i<lines.length;i++){
     result.push(lines[i]);
-    if(Math.random()>0.7&&intensity>50){
+    if(Math.random()>0.7&&intensity>50&&!endsWithBareReturn(lines[i])){
       const n=Math.floor(Math.random()*3)+1;
       for(let j=0;j<n;j++){
         const r=Math.random();
@@ -625,10 +688,81 @@ function injectJunkIntoCode(code,intensity,lite,opts){
       }
     }
   }
-  return result.join(lite?'':'\n');
+  // A single space is always a safe statement separator in Lua and prevents token
+  // gluing (see note above); joining with '' previously caused e.g. "endlocal".
+  return result.join(lite?' ':'\n');
 }
 function minifyCode(code){
-  return code.replace(/--\[\[[\s\S]*?\]\]/g,'').replace(/--[^\n]*/g,'').replace(/\n\s*\n/g,'\n').replace(/[ \t]+/g,' ').trim();
+  // String/comment-aware minifier — see history: a blind-regex approach corrupted
+  // any embedded string payload that happened to contain "--" (e.g. raw Lua source
+  // with a comment on its first line), because the regex couldn't tell the difference
+  // between a real comment and text inside a string literal.
+  let out = '';
+  let i = 0;
+  const n = code.length;
+  while (i < n) {
+    const c = code[i];
+    // long-bracket string/comment open: [=*[
+    if (c === '[') {
+      let j = i + 1, eq = 0;
+      while (code[j] === '=') { eq++; j++; }
+      if (code[j] === '[') {
+        const close = ']' + '='.repeat(eq) + ']';
+        const end = code.indexOf(close, j + 1);
+        const stop = end === -1 ? n : end + close.length;
+        out += code.slice(i, stop);
+        i = stop;
+        continue;
+      }
+    }
+    if (c === '"' || c === "'") {
+      const quote = c;
+      let j = i + 1;
+      while (j < n) {
+        if (code[j] === '\\') { j += 2; continue; }
+        if (code[j] === quote) { j++; break; }
+        j++;
+      }
+      out += code.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '-' && code[i + 1] === '-') {
+      // real comment (outside any string) — check for long-bracket comment form --[[ ]]
+      let j = i + 2;
+      if (code[j] === '[') {
+        let k = j + 1, eq = 0;
+        while (code[k] === '=') { eq++; k++; }
+        if (code[k] === '[') {
+          const close = ']' + '='.repeat(eq) + ']';
+          const end = code.indexOf(close, k + 1);
+          i = end === -1 ? n : end + close.length;
+          continue;
+        }
+      }
+      // single-line comment: skip to end of line (keep the newline itself)
+      const nl = code.indexOf('\n', j);
+      i = nl === -1 ? n : nl;
+      continue;
+    }
+    // Outside strings/comments: collapse whitespace, since this segment is real Lua
+    // code (not a payload) and safe to touch.
+    if (c === '\n') {
+      out += '\n';
+      i++;
+      while (i < n && /[ \t\r\n]/.test(code[i])) i++;
+      continue;
+    }
+    if (c === ' ' || c === '\t') {
+      out += ' ';
+      i++;
+      while (i < n && (code[i] === ' ' || code[i] === '\t')) i++;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out.trim();
 }
 
 // ════════════════════════════════════════════════════
@@ -670,7 +804,7 @@ function makeObfuscatedB64Alphabet(vAlpha, vParts, vConcat, lite) {
     const enc = bytes.map(b => b + key);
     return `(function()local _t={${enc.join(',')}};local _r={};for _i=1,#_t do _r[_i]=string.char(_t[_i]-${key})end;return table.concat(_r)end)()`;
   });
-  const sep = lite ? '' : '\n';
+  const sep = lite ? ' ' : '\n';
   return `local ${vParts}={${encChunks.join(',')}};${sep}local ${vAlpha}=table.concat(${vParts})${sep}`;
 }
 
@@ -701,7 +835,7 @@ function makeLCGConstants() {
 }
 
 function makeLoadstringRef(vRef, lite) {
-  const sep = lite ? '' : '\n';
+  const sep = lite ? ' ' : '\n';
   // エクスプロイト環境(Synapse X, KRNL等)ではloadstringは常に使える
   // 難読化のため文字列分割でアクセスする
   const patterns = [
@@ -738,6 +872,7 @@ function makeLoadstringRef(vRef, lite) {
 // ─── 本体: 上記ヘルパーを使ってprocessObfuscationを全面改訂 ───
 
 async function processObfuscation(inputCode, opts) {
+  __usedVarNames = new Set(); // fresh per-run collision tracker for generateVarName
   const TARGET_SIZE = 1.5 * 1024 * 1024;
   let a = inputCode;
   const lite = opts.useLite;
@@ -795,7 +930,7 @@ async function processObfuscation(inputCode, opts) {
     // XOR関数本体の変数名を全部ランダムに
     const v = () => generateVarName(lite);
     const vStr=v(),vB=v(),vSeed=v(),vNxt=v(),vOps=v(),vPrimes=v(),vI=v(),vR=v(),vTp=v(),vKb=v(),vPr=v(),vPass=v(),vOp=v(),vDk=v(),vOut=v(),vXF=v(),vXA=v(),vXB=v();
-    const sep = lite ? '' : '\n';
+    const sep = lite ? ' ' : '\n';
 
     // XOR演算: Lua5.1互換の純粋実装（bit32不使用）
     const xorFn = `local function ${vXF}(${vXA},${vXB})local _=0;for _i=0,7 do local _a=math.floor(${vXA}/2^_i)%2;local _b=math.floor(${vXB}/2^_i)%2;if _a~=_b then _=_+2^_i end end;return _ end${sep}`;
@@ -836,19 +971,38 @@ async function processObfuscation(inputCode, opts) {
   }
 
   // ── Base64エンコード ──
+  // Base64 grows the payload ~1.37x per layer. At high layer counts (slider allows up
+  // to 50) this compounds exponentially and can exceed the browser's max string length,
+  // throwing an uncaught RangeError that aborts obfuscation entirely with no output.
+  // Cap it so large layer counts degrade gracefully instead of crashing.
+  const MAX_SAFE_PAYLOAD = 4 * 1024 * 1024; // 4MB soft ceiling (each btoa() pass transiently allocates several times the string's size)
+  let actualLayers = 0;
   for (let i = 0; i < adjLayers; i++) {
+    if (a.length > MAX_SAFE_PAYLOAD) {
+      setObfStatus(`⚠️ サイズ上限のためBase64を${actualLayers}層で打ち切りました`, "process");
+      break;
+    }
     updateObfProgress(30 + (i / adjLayers) * 60);
     if (i % 5 === 0) await sleep(10);
-    try { a = btoa(a); }
-    catch (err) { const b = new Uint8Array(a.length); for (let j = 0; j < a.length; j++) b[j] = a.charCodeAt(j); a = bytesToBase64(b); }
+    try { a = btoa(a); actualLayers++; }
+    catch (err) {
+      try {
+        const b = new Uint8Array(a.length); for (let j = 0; j < a.length; j++) b[j] = a.charCodeAt(j);
+        a = bytesToBase64(b); actualLayers++;
+      } catch (err2) {
+        setObfStatus(`⚠️ Base64エンコードが限界に達したため${actualLayers}層で打ち切りました`, "process");
+        break;
+      }
+    }
   }
+  adjLayers = actualLayers; // downstream decoder-call count must match how many layers were actually applied
 
   // ── 変数名生成 ──
   const vLib = generateVarName(lite), vStr = generateVarName(lite), vTbl = generateVarName(lite),
         vVM  = generateVarName(lite), vSt  = generateVarName(lite);
   const vAlpha = generateVarName(lite), vParts = generateVarName(lite), vLdRef = generateVarName(lite);
   const dv3 = generateVarName(lite);
-  const sep = lite ? '' : '\n';
+  const sep = lite ? ' ' : '\n';
 
   // ── Base64デコーダを難読化して生成 ──
   // "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" を隠す
@@ -887,7 +1041,7 @@ async function processObfuscation(inputCode, opts) {
   if (opts.useJunkFunc && !lite) { const jfCount = Math.floor(adjJunk / 30) + 3; for (let i = 0; i < jfCount; i++) out += generateJunkFunction(lite); }
 
   out += b64Decoder + sep;
-  if (opts.useXor && xorDecoder) out += (lite ? xorDecoder.replace(/\n/g, '') : xorDecoder) + sep;
+  if (opts.useXor && xorDecoder) out += xorDecoder + sep;
 
   // loadstring参照を難読化して埋め込む
   out += ldRef;
@@ -897,12 +1051,12 @@ async function processObfuscation(inputCode, opts) {
     let arr = chunks.map((v, i) => ({ v, i }));
     for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; }
     const vShIdx = generateVarName(lite);
-    let tbl = '{'; arr.forEach(x => { tbl += `[${x.i+1}]="${x.v}",`; }); tbl += '}';
+    let tbl = '{'; arr.forEach(x => { tbl += `[${x.i+1}]=${toLuaSafeString(x.v)},`; }); tbl += '}';
     out += lite
-      ? `local ${vTbl}=${tbl}local ${vStr}=""for ${vShIdx}=1,${arr.length} do ${vStr}=${vStr}..${vTbl}[${vShIdx}]end`
+      ? `local ${vTbl}=${tbl} local ${vStr}="" for ${vShIdx}=1,${arr.length} do ${vStr}=${vStr}..${vTbl}[${vShIdx}] end `
       : `local ${vTbl}=${tbl}\nlocal ${vStr}=""\nfor ${vShIdx}=1,${arr.length} do ${vStr}=${vStr}..${vTbl}[${vShIdx}]end\n`;
   } else {
-    out += lite ? `local ${vStr}="${a}"` : `local ${vStr}="${a}"\n`;
+    out += lite ? `local ${vStr}=${toLuaSafeString(a)};` : `local ${vStr}=${toLuaSafeString(a)}\n`;
   }
 
   if (opts.useFlat) {
@@ -910,15 +1064,17 @@ async function processObfuscation(inputCode, opts) {
     for (let i = 0; i < adjLayers; i++) steps.push(`${vStr}=${vLib}(${vStr})`);
     if (opts.useXor && vXorVar) steps.push(`${vStr}=${vXorVar}(${vStr})`);
     // loadstringの呼び出しも難読化参照を使う（nilチェック付き）
-    steps.push(`local _f,_e=${vLdRef}(${vStr});if _f then _f() else error(_e) end return`);
-    let vm = '{'; for (let i = 0; i < steps.length; i++) vm += `[${i}]=function()${steps[i]} return ${i === steps.length - 1 ? -1 : i + 1}end,`; vm += '}';
+    steps.push(`local _f,_e=${vLdRef}(${vStr});if _f then _f() else error(_e) end`);
+    // Note the space before "end": without it, e.g. "return 10end" is an invalid Lua
+    // number token (malformed number near '10end'), not "10" followed by "end".
+    let vm = '{'; for (let i = 0; i < steps.length; i++) vm += `[${i}]=function()${steps[i]} return ${i === steps.length - 1 ? -1 : i + 1} end,`; vm += '}';
     const vVmSt = generateVarName(lite);
     out += lite
-      ? `local ${vVmSt}=0 local ${vVM}=${vm}while ${vVmSt}~=-1 do ${vVmSt}=${vVM}[${vVmSt}]()end`
+      ? `local ${vVmSt}=0; local ${vVM}=${vm} while ${vVmSt}~=-1 do ${vVmSt}=${vVM}[${vVmSt}]() end `
       : `local ${vVmSt}=0\nlocal ${vVM}=${vm}\nwhile ${vVmSt}~=-1 do ${vVmSt}=${vVM}[${vVmSt}]()end`;
   } else {
-    for (let i = 0; i < adjLayers; i++) out += lite ? `${vStr}=${vLib}(${vStr})` : `${vStr}=${vLib}(${vStr})\n`;
-    if (opts.useXor && vXorVar) out += lite ? `${vStr}=${vXorVar}(${vStr})` : `${vStr}=${vXorVar}(${vStr})\n`;
+    for (let i = 0; i < adjLayers; i++) out += lite ? `${vStr}=${vLib}(${vStr});` : `${vStr}=${vLib}(${vStr})\n`;
+    if (opts.useXor && vXorVar) out += lite ? `${vStr}=${vXorVar}(${vStr});` : `${vStr}=${vXorVar}(${vStr})\n`;
     // loadstring() の呼び出し（エクスプロイト環境では直接実行）
     out += `local _f,_e=${vLdRef}(${vStr});if _f then _f() else error(_e) end`;
   }
