@@ -933,7 +933,7 @@ async function processObfuscation(inputCode, opts) {
     if (opts.junk > 100) out = injectJunkIntoCode(out, opts.junk, opts.useLite, opts);
     if (opts.useLite) out = minifyCode(out);
     if (opts.useWrapFunc && !opts.useLite) out = `(function()\n${out}\nend)()`;
-    return `-- Obfuscation by YAJU (loadstring-free direct embed)\n${out}`;
+    return `-- Obfuscation by YAJU\n${out}`;
   }
 
   const TARGET_SIZE = 1.5 * 1024 * 1024;
