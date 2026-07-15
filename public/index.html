@@ -248,6 +248,7 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
         <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkConstArr"> 定数配列化</label>
         <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkProxyVars"> 変数Proxy化</label>
         <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkWrapFunc" checked> 関数ラップ</label>
+        <label class="chk-label" style="color:#66bb6a"><input type="checkbox" id="chkNoLoadstring"> loadstring不使用モード（Luau/サンドボックス対応）</label>
         <label class="chk-label" style="color:var(--deobf)"><input type="checkbox" id="chkLite"> 軽量化モード</label>
         <!-- Prometheus連携 -->
         <label class="chk-label" style="color:#bb86fc"><input type="checkbox" id="chkPEncStr"> [P] EncryptStrings</label>
@@ -780,7 +781,14 @@ function minifyCode(code){
  * 例:  local T = {"ABCDEFGHIJ", "KLMNOPQRST", ...}; local alpha = table.concat(T)
  */
 function makeObfuscatedB64Alphabet(vAlpha, vParts, vConcat, lite) {
-  const full = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  // NOTE: '=' (Base64 padding) is intentionally NOT included in this alphabet.
+  // Padding is a placeholder, not a data value — if it were mapped to an index
+  // (as it was previously, landing at index 64), the decoder would treat it as a
+  // real Base64 sextet instead of stopping there, producing one extra garbage
+  // byte at the end of every decode. The decoder's existing "if not X then break"
+  // checks already handle a missing map entry correctly, so simply excluding '='
+  // here makes decoding stop exactly where the real data ends.
+  const full = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   // ランダムな分割位置で複数チャンクに分ける
   const chunkSizes = [];
   let pos = 0;
@@ -834,8 +842,21 @@ function makeLCGConstants() {
   };
 }
 
-function makeLoadstringRef(vRef, lite) {
+function makeLoadstringRef(vRef, lite, noLoadstring) {
   const sep = lite ? ' ' : '\n';
+  if (noLoadstring) {
+    // Luau (e.g. play.luau.org) and Lua 5.2+ don't expose "loadstring" — the
+    // equivalent primitive there is "load". Resolve whichever one actually exists
+    // in the current global environment, in order of preference, instead of
+    // assuming an exploit-style sandbox that always provides "loadstring".
+    // Both loadstring(chunk) and load(chunk) return (function, nil) on success or
+    // (nil, errormsg) on failure, so the call site doesn't need any changes.
+    const v = () => generateVarName(lite);
+    const vLS = v(), vLD = v();
+    return `local ${vLS}=rawget(_G,"loa".."dst"..("rin".."g")) ${sep}`
+      + `local ${vLD}=rawget(_G,"lo".."ad") ${sep}`
+      + `local ${vRef}=${vLS} or ${vLD}${sep}`;
+  }
   // エクスプロイト環境(Synapse X, KRNL等)ではloadstringは常に使える
   // 難読化のため文字列分割でアクセスする
   const patterns = [
@@ -871,10 +892,25 @@ function makeLoadstringRef(vRef, lite) {
 
 // ─── 本体: 上記ヘルパーを使ってprocessObfuscationを全面改訂 ───
 
+function utf8Encode(str) {
+  // Convert a JS string (UTF-16/Unicode codepoints) into a "binary string" where
+  // each character represents exactly one UTF-8 byte (0-255). Everything downstream
+  // in processObfuscation (Base64 via btoa, XOR byte arithmetic, toLuaSafeString's
+  // \ddd escapes, etc.) assumes 1 char = 1 byte. Without this normalization, any
+  // non-ASCII input (e.g. Japanese text) produces charCodeAt() values above 255,
+  // which silently corrupts every downstream stage — btoa() throws or mangles it,
+  // XOR math wraps incorrectly, and \ddd escapes above 255 aren't valid single-byte
+  // Lua escapes. Lua treats the resulting byte string as raw UTF-8 when passed to
+  // print/io.write, so the decoded text still displays correctly at runtime.
+  const bytes = new TextEncoder().encode(str);
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  return out;
+}
 async function processObfuscation(inputCode, opts) {
   __usedVarNames = new Set(); // fresh per-run collision tracker for generateVarName
   const TARGET_SIZE = 1.5 * 1024 * 1024;
-  let a = inputCode;
+  let a = utf8Encode(inputCode); // normalize to a 1-char-per-byte string — see utf8Encode
   const lite = opts.useLite;
   let adjLayers = opts.layers, adjJunk = opts.junk;
 
@@ -958,7 +994,12 @@ async function processObfuscation(inputCode, opts) {
       + `local ${vOp}=${vOps}[${vPass}]${sep}`
       + `local ${vTp},${vKb},${vPr}=${vOp}[1],${vOp}[2],${vOp}[3]${sep}`
       + `for ${vI}=1,#${vB} do${sep}`
-      + `local ${vDk}=(${vKb}*(${vI}+${vPr}))%256${sep}`
+      // NOTE: the JS encoder above computes dk using a 0-indexed byte position
+      // (`for (let i = 0; i < bytes.length; i++)` → i starts at 0), but this Lua
+      // loop variable is 1-indexed (`for X=1,#buf do`). Using it directly shifted
+      // the keystream by one byte relative to encoding, corrupting every decode.
+      // Subtract 1 so the Lua index lines up with the JS index at the same byte.
+      + `local ${vDk}=(${vKb}*((${vI}-1)+${vPr}))%256${sep}`
       + `if ${vTp}==0 then ${vB}[${vI}]=${vXF}(${vB}[${vI}],${vDk})${sep}`
       + `elseif ${vTp}==1 then ${vB}[${vI}]=(${vB}[${vI}]-${vDk}+256)%256${sep}`
       + `elseif ${vTp}==2 then ${vB}[${vI}]=(${vB}[${vI}]+${vDk})%256 end${sep}`
@@ -1027,7 +1068,7 @@ async function processObfuscation(inputCode, opts) {
     + `return table.concat(${vRr})end${sep}`;
 
   // ── loadstring参照を難読化 ──
-  const ldRef = makeLoadstringRef(vLdRef, lite);
+  const ldRef = makeLoadstringRef(vLdRef, lite, opts.useNoLoadstring);
 
   // ── 出力コード組み立て ──
   // コメントも消す（"by YAJU" などの特徴的な文字列を除去）
@@ -1098,6 +1139,7 @@ async function startObfuscation(){
     useNumExpr:byId('chkNumExpr').checked, useJunkFunc:byId('chkJunkFunc').checked,
     useSplitStr:byId('chkSplitStr').checked, useConstArr:byId('chkConstArr').checked,
     useProxyVars:byId('chkProxyVars').checked, useWrapFunc:byId('chkWrapFunc').checked,
+    useNoLoadstring:byId('chkNoLoadstring').checked,
     useLite:byId('chkLite').checked,
   };
   const prometheusSteps=[];
