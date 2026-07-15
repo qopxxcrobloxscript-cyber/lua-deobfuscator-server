@@ -909,6 +909,33 @@ function utf8Encode(str) {
 }
 async function processObfuscation(inputCode, opts) {
   __usedVarNames = new Set(); // fresh per-run collision tracker for generateVarName
+
+  // ── 完全loadstring不使用モード（直接埋め込み） ──
+  // useNoLoadstring かつ Base64レイヤー0の場合、loadstring/load の両方が存在しない
+  // 環境（例: play.luau.org のような素のLuauサンドボックス）でも実行できるよう、
+  // 文字列化→実行時コンパイルのパイプラインを完全にスキップし、コードをそのまま
+  // Luaソースとして埋め込む。Base64/XOR/シャッフルによる「データとしての隠蔽」は
+  // 実行時コンパイラなしには原理的に不可能なため、この場合は適用されない
+  // （ダミーコード注入や変数名難読化、CustomVM自体のVM化は維持される）。
+  if (opts.useNoLoadstring && opts.layers === 0 && !opts.useXor && !opts.useShuffle && !opts.useFlat) {
+    setObfStatus("loadstring不使用モード: コードを直接埋め込み中...", "process");
+    await sleep(20);
+    let out = '';
+    if (opts.useAntiDump) {
+      const a1=generateVarName(opts.useLite),a2=generateVarName(opts.useLite),a3=generateVarName(opts.useLite);
+      out += `local function ${a1}()local ${a2}=getfenv()local ${a3}=${a2}[${strToChar("getgenv")}]if ${a3} then ${a3}()[${strToChar("saveinstance")}]=nil ${a3}()[${strToChar("save_instance")}]=nil ${a3}()[${strToChar("dumpstring")}]=nil end if debug then if debug.sethook then pcall(function()debug.sethook(function()while true do end end,"c")end)end if debug.getinfo then debug.getinfo=nil end end end pcall(${a1})\n`;
+    }
+    if (opts.junk > 0) out += generateMassiveJunkCode(Math.floor(opts.junk / (opts.useLite ? 20 : 5)), opts.useLite, opts);
+    if (opts.useJunkFunc && !opts.useLite) { const jfCount = Math.floor(opts.junk / 30) + 3; for (let i = 0; i < jfCount; i++) out += generateJunkFunction(opts.useLite); }
+    // inputCode is spliced in verbatim as real Lua source (not string-embedded),
+    // so no UTF-8/byte-safety transform is needed here — it's still text, not data.
+    out += `do\n${inputCode}\nend\n`;
+    if (opts.junk > 100) out = injectJunkIntoCode(out, opts.junk, opts.useLite, opts);
+    if (opts.useLite) out = minifyCode(out);
+    if (opts.useWrapFunc && !opts.useLite) out = `(function()\n${out}\nend)()`;
+    return `-- Obfuscation by YAJU (loadstring-free direct embed)\n${out}`;
+  }
+
   const TARGET_SIZE = 1.5 * 1024 * 1024;
   let a = utf8Encode(inputCode); // normalize to a 1-char-per-byte string — see utf8Encode
   const lite = opts.useLite;
