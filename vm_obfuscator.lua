@@ -82,6 +82,13 @@ local TK = {
   EQ="==",NEQ="~=",LT="<",GT=">",LEQ="<=",GEQ=">=",
   ASSIGN="=",LPAREN="(",RPAREN=")",LBRACE="{",RBRACE="}",LBRACKET="[",RBRACKET="]",
   DCOLON="::",SEMI=";",COLON=":",COMMA=",",DOT=".",CONCAT="..",DOTS="...",
+  -- Luau/Roblox compound assignment operators (not present in vanilla Lua 5.1,
+  -- but extremely common in real-world Luau scripts). Each compiles down to
+  -- ordinary SET_LOCAL/SET_GLOBAL/SET_FIELD/SET_TABLE opcodes after desugaring
+  -- "lhs OP= rhs" into "lhs = lhs OP rhs" in the parser, so no new VM opcodes
+  -- are needed — only new tokens and a parser case.
+  PLUSEQ="+=",MINUSEQ="-=",STAREQ="*=",SLASHEQ="/=",
+  DSLASHEQ="//=",PERCENTEQ="%=",CARETEQ="^=",CONCATEQ="..=",
 }
 local KEYWORDS={}
 for _,k in ipairs({"and","break","do","else","elseif","end","false","for",
@@ -211,6 +218,8 @@ local function Lexer(src)
       else
         local p3=peek3(); local p2=peek2()
         if p3=="..." then adv(3); self.tokens[#self.tokens+1]={type=TK.DOTS,line=line}
+        elseif p3=="..=" then adv(3); self.tokens[#self.tokens+1]={type=TK.CONCATEQ,line=line}
+        elseif p3=="//=" then adv(3); self.tokens[#self.tokens+1]={type=TK.DSLASHEQ,line=line}
         elseif p2==".." then adv(2); self.tokens[#self.tokens+1]={type=TK.CONCAT,line=line}
         elseif p2=="==" then adv(2); self.tokens[#self.tokens+1]={type=TK.EQ,line=line}
         elseif p2=="~=" then adv(2); self.tokens[#self.tokens+1]={type=TK.NEQ,line=line}
@@ -220,6 +229,12 @@ local function Lexer(src)
         elseif p2==">>" then adv(2); self.tokens[#self.tokens+1]={type=TK.RSHIFT,line=line}
         elseif p2=="//" then adv(2); self.tokens[#self.tokens+1]={type=TK.DSLASH,line=line}
         elseif p2=="::" then adv(2); self.tokens[#self.tokens+1]={type=TK.DCOLON,line=line}
+        elseif p2=="+=" then adv(2); self.tokens[#self.tokens+1]={type=TK.PLUSEQ,line=line}
+        elseif p2=="-=" then adv(2); self.tokens[#self.tokens+1]={type=TK.MINUSEQ,line=line}
+        elseif p2=="*=" then adv(2); self.tokens[#self.tokens+1]={type=TK.STAREQ,line=line}
+        elseif p2=="/=" then adv(2); self.tokens[#self.tokens+1]={type=TK.SLASHEQ,line=line}
+        elseif p2=="%=" then adv(2); self.tokens[#self.tokens+1]={type=TK.PERCENTEQ,line=line}
+        elseif p2=="^=" then adv(2); self.tokens[#self.tokens+1]={type=TK.CARETEQ,line=line}
         else
           adv()
           local sym={
@@ -280,6 +295,8 @@ local OP={
   RETURN_MULTI=66,
   CAPTURE_VARARG=67,
   SETLIST_MULTI=68,
+  CALL_VARARG_TAIL=69,
+  CALL_VARARG_TAIL_MULTI=70,
 }
 
 local function Compiler(lex, parent)
@@ -350,15 +367,21 @@ local function Compiler(lex, parent)
     if t.type==TK.LPAREN then
       lex:next()
       local n=0
+      local lastWasBareCall=false
       if not lex:check(TK.RPAREN) then
-        parseExpr(); n=1
-        while lex:match(TK.COMMA) do parseExpr(); n=n+1 end
+        lastWasBareCall=parseExpr(); n=1
+        while lex:match(TK.COMMA) do lastWasBareCall=parseExpr(); n=n+1 end
       end
-      lex:expect(TK.RPAREN); return n
+      lex:expect(TK.RPAREN)
+      -- If the final argument was a bare function call (e.g. "f(table.unpack(t))"
+      -- or "f(a, g())"), Lua semantics expand ALL of its return values in place,
+      -- not just the first one. Report this back to the caller via a second
+      -- return value so it can emit CALL_VARARG_TAIL instead of a plain CALL.
+      return n, lastWasBareCall
     elseif t.type==TK.STRING then
-      lex:next(); emit(OP.PUSH_STR, addConst(t.value)); return 1
+      lex:next(); emit(OP.PUSH_STR, addConst(t.value)); return 1, false
     elseif t.type==TK.LBRACE then
-      parseTableConstructor(); return 1
+      parseTableConstructor(); return 1, false
     else
       die("expected function args at line "..tostring(t.line))
     end
@@ -386,12 +409,27 @@ local function Compiler(lex, parent)
         emit(OP.DUP)
         emit(OP.GET_FIELD, addName(mn.value))
         emit(OP.SWAP)
-        local nargs=parseCallArgs()
-        emit(OP.CALL, nargs+1)
+        local nargs,lastWasBareCall=parseCallArgs()
+        if lastWasBareCall then
+          local lastIns=self.code[#self.code]
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
+          -- nargs counts the trailing bare-call as 1 slot even though it expands
+          -- to N values via CALL_MULTI; true fixed-arg count is nargs-1, plus 1
+          -- for the implicit self argument = nargs.
+          emit(OP.CALL_VARARG_TAIL, nargs)
+        else
+          emit(OP.CALL, nargs+1)
+        end
         kind="call"; name=nil
       elseif t.type==TK.LPAREN or t.type==TK.STRING or t.type==TK.LBRACE then
-        local nargs=parseCallArgs()
-        emit(OP.CALL, nargs)
+        local nargs,lastWasBareCall=parseCallArgs()
+        if lastWasBareCall then
+          local lastIns=self.code[#self.code]
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
+          emit(OP.CALL_VARARG_TAIL, nargs-1)
+        else
+          emit(OP.CALL, nargs)
+        end
         kind="call"; name=nil
       else break end
     end
@@ -430,7 +468,7 @@ local function Compiler(lex, parent)
         local isLastElem = lex:check(TK.RBRACE) or (not lex:check(TK.COMMA) and not lex:check(TK.SEMI))
         if isBareCall and isLastElem then
           local lastIns=self.code[#self.code]
-          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
           emit(OP.SETLIST_MULTI, count-1)
         else
           emit(OP.SETLIST, count)
@@ -552,29 +590,84 @@ local function Compiler(lex, parent)
       if t.type~=TK.NAME then die("expected name at line "..tostring(t.line)) end
       lex:next()
       local base={name=t.value, suffixes={}}
+      -- NOTE ON EVALUATION ORDER (bugfix): GET_TABLE/SET_TABLE pop the stack as
+      -- key-then-table (key must be on top, table beneath it) — see the VM's
+      -- GET_TABLE handler, which does `local k=pop(); local t=pop(); push(t[k])`.
+      -- Index-key expressions ("[expr]") must therefore be evaluated and pushed
+      -- AFTER the container is already on the stack, never before. The previous
+      -- version called parseExpr() for each "[expr]" suffix immediately while
+      -- prescanning suffixes here, before the caller ever pushed the container —
+      -- producing a [key, table] stack instead of [table, key], which silently
+      -- swapped the two for every indexed read/write. This version still
+      -- prescans suffix *shape* (field name, or "there is an index expression
+      -- here") into base.suffixes for the caller to know what it's dealing with,
+      -- but for index_expr suffixes it stores the already-correctly-ordered fact
+      -- that a key expression follows; the actual GET_TABLE/SET_TABLE emission
+      -- (which needs the container pushed first) still happens in the caller,
+      -- exactly as before — the fix here is narrower: index_expr suffixes must
+      -- only have their key expression parsed+emitted at a point where the
+      -- container is guaranteed to already be on the stack beneath them. Since
+      -- this prescan function doesn't know whether the caller will push the
+      -- container before or after calling this, and every caller in this file
+      -- pushes the container first and then walks base.suffixes emitting
+      -- GET_TABLE/GET_FIELD per entry, we defer key-expression parsing itself
+      -- into a closure stored on the suffix, to be invoked by the caller at the
+      -- correct point (container already pushed) instead of eagerly here.
       while true do
         local p=lex:peek()
         if p.type==TK.DOT then
           lex:next(); local f=lex:expect(TK.NAME)
           base.suffixes[#base.suffixes+1]={type="field",val=f.value}
         elseif p.type==TK.LBRACKET then
-          lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
-          base.suffixes[#base.suffixes+1]={type="index_expr"}
+          lex:next()
+          -- The key expression must be parsed HERE, in its correct source
+          -- position (this parser makes a single linear pass over tokens, so
+          -- parsing it later — e.g. inside a closure invoked by the caller —
+          -- would read whatever tokens happen to be at the cursor at that
+          -- later time, not this expression). However, the *value* it
+          -- produces must not enter the runtime stack yet: the container this
+          -- key applies to hasn't been pushed by the caller yet, and
+          -- GET_TABLE/SET_TABLE require [container, key] stack order. So:
+          -- parse+evaluate the key now, immediately stash it into a compiler-
+          -- internal temp local, and let emitKey() (invoked later by the
+          -- caller, once the container is on the stack) simply push that saved
+          -- value back — no re-parsing, no re-evaluation, correct order.
+          parseExpr()
+          local tmpKeyName = "__vmobf_key_" .. tostring(#self.locals+1) .. "_" .. V()
+          self.locals[#self.locals+1]=tmpKeyName
+          emit(OP.SET_LOCAL,addName(tmpKeyName))
+          local keyEmitter = function() emit(OP.PUSH_VAR,addName(tmpKeyName)) end
+          lex:expect(TK.RBRACKET)
+          base.suffixes[#base.suffixes+1]={type="index_expr", emitKey=keyEmitter}
         elseif p.type==TK.COLON or p.type==TK.LPAREN or p.type==TK.STRING or p.type==TK.LBRACE then
           if isLocal(base.name) then emit(OP.PUSH_VAR,addName(base.name))
           else emit(OP.PUSH_GLOBAL,addName(base.name)) end
           for _,s in ipairs(base.suffixes) do
             if s.type=="field" then emit(OP.GET_FIELD,addName(s.val))
-            elseif s.type=="index_expr" then emit(OP.GET_TABLE) end
+            elseif s.type=="index_expr" then s.emitKey(); emit(OP.GET_TABLE) end
           end
           while true do
             local q=lex:peek()
             if q.type==TK.COLON then
               lex:next(); local mn=lex:expect(TK.NAME)
               emit(OP.DUP); emit(OP.GET_FIELD,addName(mn.value)); emit(OP.SWAP)
-              local na=parseCallArgs(); emit(OP.CALL,na+1)
+              local na,lastWasBareCall=parseCallArgs()
+              if lastWasBareCall then
+                local lastIns=self.code[#self.code]
+                if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
+                emit(OP.CALL_VARARG_TAIL,na) -- na-1 fixed + 1 implicit self = na
+              else
+                emit(OP.CALL,na+1)
+              end
             elseif q.type==TK.LPAREN or q.type==TK.STRING or q.type==TK.LBRACE then
-              local na=parseCallArgs(); emit(OP.CALL,na)
+              local na,lastWasBareCall=parseCallArgs()
+              if lastWasBareCall then
+                local lastIns=self.code[#self.code]
+                if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
+                emit(OP.CALL_VARARG_TAIL,na-1)
+              else
+                emit(OP.CALL,na)
+              end
             elseif q.type==TK.DOT then
               lex:next(); local f=lex:expect(TK.NAME); emit(OP.GET_FIELD,addName(f.value))
             elseif q.type==TK.LBRACKET then
@@ -589,6 +682,87 @@ local function Compiler(lex, parent)
     local first=parseLhsOne()
     if first==nil then emit(OP.POP); return end
     lhs[1]=first
+
+    -- Luau compound assignment: "lhs OP= rhs" desugars to "lhs = lhs OP rhs".
+    -- Must be checked before the TK.COMMA multi-assign loop below, since
+    -- compound assignment never has multiple lhs targets (e.g. "a, b += 1, 2"
+    -- is not valid Luau any more than it's valid Lua).
+    local COMPOUND_OP = {
+      [TK.PLUSEQ]="ADD", [TK.MINUSEQ]="SUB", [TK.STAREQ]="MUL",
+      [TK.SLASHEQ]="DIV", [TK.DSLASHEQ]="IDIV", [TK.PERCENTEQ]="MOD",
+      [TK.CARETEQ]="POW", [TK.CONCATEQ]="CONCAT",
+    }
+    local compoundOpName = COMPOUND_OP[lex:peek().type]
+    if compoundOpName then
+      lex:next() -- consume the compound-assignment operator token
+      local b = first
+      if #b.suffixes==0 then
+        -- simple name target: push current value, push rhs, combine, store back
+        if isLocal(b.name) then emit(OP.PUSH_VAR,addName(b.name))
+        else emit(OP.PUSH_GLOBAL,addName(b.name)) end
+        parseExpr()
+        emit(OP[compoundOpName])
+        if isLocal(b.name) then emit(OP.SET_LOCAL,addName(b.name))
+        else emit(OP.SET_GLOBAL,addName(b.name)) end
+      else
+        -- field/index target: push the container, resolve all suffixes except the
+        -- last to get to the immediate parent table, then read-combine-write the
+        -- final field/index without re-evaluating any index expression twice.
+        if isLocal(b.name) then emit(OP.PUSH_VAR,addName(b.name))
+        else emit(OP.PUSH_GLOBAL,addName(b.name)) end
+        for si=1,#b.suffixes-1 do
+          local s=b.suffixes[si]
+          if s.type=="field" then emit(OP.GET_FIELD,addName(s.val))
+          else s.emitKey(); emit(OP.GET_TABLE) end
+        end
+        local last=b.suffixes[#b.suffixes]
+        if last.type=="field" then
+          -- stack: [table] ; GET_FIELD doesn't consume table, so DUP then GET_FIELD
+          -- reads the current value while keeping table on the stack for SET_FIELD.
+          emit(OP.DUP); emit(OP.GET_FIELD,addName(last.val))
+          parseExpr()
+          emit(OP[compoundOpName])
+          emit(OP.SET_FIELD,addName(last.val))
+        else
+          -- Indexed target "container[expr] OP= rhs". Stack right now, after
+          -- resolving every suffix-before-last above, is just [..., container]
+          -- — the key expression has NOT been evaluated yet (emitKey() is
+          -- deferred; see parseLhsOne). Evaluate it now, immediately after the
+          -- container so the runtime stack order is [container, key] as
+          -- GET_TABLE requires, then stash the key in a temp local so it can be
+          -- reused for both the read (GET_TABLE) and the write (SET_TABLE)
+          -- without a second evaluation of the index expression (which would
+          -- double any side effects, e.g. "t[f()] += 1" calling f() twice).
+          last.emitKey() -- stack: [..., container, key]
+          local tmpKey = "__vmobf_ckey_" .. tostring(#self.locals+1) .. "_" .. V()
+          local tmpVal = "__vmobf_cval_" .. tostring(#self.locals+1) .. "_" .. V()
+          self.locals[#self.locals+1]=tmpKey
+          emit(OP.SET_LOCAL,addName(tmpKey)) -- pops key; stack: [..., container]
+          emit(OP.PUSH_VAR,addName(tmpKey))
+          emit(OP.GET_TABLE) -- stack: [..., container[key]]
+          parseExpr() -- rhs; stack: [..., container[key], rhs]
+          emit(OP[compoundOpName]) -- stack: [..., combined]
+          self.locals[#self.locals+1]=tmpVal
+          emit(OP.SET_LOCAL,addName(tmpVal)) -- stash result; stack: [...]
+          -- Re-push the container prefix for the write. This re-evaluates
+          -- b.name plus any suffixes before the last one a second time — an
+          -- accepted trade-off shared by most languages' compound-assignment
+          -- desugaring (e.g. "a.b.c[k] += 1" re-evaluates "a.b" but not "k").
+          if isLocal(b.name) then emit(OP.PUSH_VAR,addName(b.name))
+          else emit(OP.PUSH_GLOBAL,addName(b.name)) end
+          for si=1,#b.suffixes-1 do
+            local s=b.suffixes[si]
+            if s.type=="field" then emit(OP.GET_FIELD,addName(s.val))
+            else s.emitKey(); emit(OP.GET_TABLE) end
+          end
+          emit(OP.PUSH_VAR,addName(tmpKey))
+          emit(OP.PUSH_VAR,addName(tmpVal))
+          emit(OP.SET_TABLE)
+        end
+      end
+      return
+    end
+
     while lex:check(TK.COMMA) do
       lex:next()
       local extra=parseLhsOne()
@@ -604,7 +778,7 @@ local function Compiler(lex, parent)
     local nvals,lastIsBareCall=parseExprList()
     if lastIsBareCall then
       local lastIns=self.code[#self.code]
-      if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+      if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
     end
     if nvals~=#lhs or lastIsBareCall then emit(OP.ADJUST,#lhs) end
     for i=#lhs,1,-1 do
@@ -613,16 +787,31 @@ local function Compiler(lex, parent)
         if isLocal(b.name) then emit(OP.SET_LOCAL,addName(b.name))
         else emit(OP.SET_GLOBAL,addName(b.name)) end
       else
+        -- BUGFIX: the value to assign is already on the stack top at this point
+        -- (pushed by parseExprList() above, before any of these per-target
+        -- pushes). SET_FIELD/SET_TABLE both expect value on top (they pop
+        -- value first, then table/key) — so the value must be stashed, the
+        -- container+suffixes+key pushed underneath in the right order, and the
+        -- value pushed back on top immediately before the SET_* instruction.
+        local tmpVal = "__vmobf_asgn_" .. tostring(#self.locals+1) .. "_" .. V()
+        self.locals[#self.locals+1]=tmpVal
+        emit(OP.SET_LOCAL,addName(tmpVal)) -- stash pending value
         if isLocal(b.name) then emit(OP.PUSH_VAR,addName(b.name))
         else emit(OP.PUSH_GLOBAL,addName(b.name)) end
         for si=1,#b.suffixes-1 do
           local s=b.suffixes[si]
           if s.type=="field" then emit(OP.GET_FIELD,addName(s.val))
-          else emit(OP.GET_TABLE) end
+          else s.emitKey(); emit(OP.GET_TABLE) end
         end
         local last=b.suffixes[#b.suffixes]
-        if last.type=="field" then emit(OP.SET_FIELD,addName(last.val))
-        else emit(OP.SET_TABLE) end
+        if last.type=="field" then
+          emit(OP.PUSH_VAR,addName(tmpVal))
+          emit(OP.SET_FIELD,addName(last.val))
+        else
+          last.emitKey()
+          emit(OP.PUSH_VAR,addName(tmpVal))
+          emit(OP.SET_TABLE)
+        end
       end
     end
   end
@@ -705,7 +894,7 @@ local function Compiler(lex, parent)
         while lex:match(TK.COMMA) do lastIsBareCall = parseExpr() end
         if lastIsBareCall then
           local lastIns=self.code[#self.code]
-          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
         end
         lex:expect(TK.DO)
         local gfp=emit(OP.GFORPREP,0)
@@ -770,7 +959,7 @@ local function Compiler(lex, parent)
         -- 多値展開される。CALLをCALL_MULTIに差し替え、ADJUSTで#namesへ調整する。
         if lastIsBareCall then
           local lastIns=self.code[#self.code]
-          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+          if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
         end
         if nv~=#names or lastIsBareCall then emit(OP.ADJUST,#names) end
         for i=#names,1,-1 do
@@ -792,7 +981,7 @@ local function Compiler(lex, parent)
       -- 複数値が積まれていた場合はADJUSTで実際の個数に揃えてから返す必要がある。
       if lastIsBareCall then
         local lastIns=self.code[#self.code]
-        if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI end
+        if lastIns and lastIns.op==OP.CALL then lastIns.op=OP.CALL_MULTI elseif lastIns and lastIns.op==OP.CALL_VARARG_TAIL then lastIns.op=OP.CALL_VARARG_TAIL_MULTI end
         emit(OP.RETURN_MULTI, nv-1)
       else
         emit(OP.RETURN,nv)
@@ -879,7 +1068,7 @@ end
 local proto=result
 
 math.randomseed(seed)
-local MAX_OP=68
+local MAX_OP=70
 local pool={}; for i=1,MAX_OP do pool[i]=i end
 for i=MAX_OP,2,-1 do local j=math.random(1,i); pool[i],pool[j]=pool[j],pool[i] end
 local op2c={}; local c2op={}
@@ -1272,6 +1461,44 @@ L(("      local %s=#%s"):format(vrmn,vST))
 L(("      local %s={}"):format(vrmv))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vrmi,vrmn,vrmv,pop_expr()))
 L(("      return _unpack(%s,1,%s)"):format(vrmv,vrmn))
+
+-- FIX: CALL_VARARG_TAIL — 呼び出し引数リストの最後が関数呼び出しで終わる場合
+-- (例: sum(table.unpack(t)) や f(a, g()))、Lua仕様上その呼び出しの全戻り値が
+-- 引数として展開される。
+-- 重要: RETURN_MULTIと違い、この命令は式の"途中"で実行されるため、スタックには
+-- 呼び出し対象の関数や、さらに外側の式の値がこの呼び出しの引数より下に残っている
+-- 可能性がある。よって「スタック全体」を使うのは不正。正しくは、直前の
+-- CALL_MULTI/PUSH_VARARGが実際に何個pushしたかを記録するvLASTMULTIと、
+-- 命令のarg(=末尾呼び出しより前にある固定引数の個数)を使って、必要な分だけを
+-- 正確にpopする(SETLIST_MULTIと同じ手法)。
+local vcvtn=V(); local vcvtv=V(); local vcvti=V(); local vcvtfn=V(); local vcvtres=V(); local vcvtfixed=V()
+L(("    elseif %s==%s then"):format(vOP,opc("CALL_VARARG_TAIL")))
+L(("      local %s={}"):format(vcvtv))
+-- pop the trailing call's contributed values first (vLASTMULTI of them; topmost on stack)
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti,vLASTMULTI,vcvtv,pop_expr()))
+-- then pop the fixed arguments that preceded the trailing call
+L(("      local %s=%s"):format(vcvtfixed,vAR))
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti,vcvtfixed,vcvtv,pop_expr()))
+L(("      local %s=%s"):format(vcvtfn,pop_expr()))
+L(("      local %s=_pack(%s(_unpack(%s)))"):format(vcvtres,vcvtfn,vcvtv))
+L(("      %s"):format(push_expr(vcvtres.."[1]")))
+
+-- FIX: CALL_VARARG_TAIL_MULTI — CALL_VARARG_TAILと同じ引数収集ロジックだが、
+-- この呼び出し自体がさらに外側の呼び出しの末尾可変引数として使われる場合
+-- (例: print(sum(table.unpack(t))) の sum(...) 部分)、CALL同様に1値だけを
+-- pushしてvLASTMULTIを更新しないと、外側がCALL_MULTIへ差し替えても正しい
+-- 個数の値を受け取れない。CALL/CALL_MULTIの関係と同様に、こちらは全戻り値を
+-- pushしvLASTMULTIを正しく更新する。
+local vcvtn2=V(); local vcvtv2=V(); local vcvti2=V(); local vcvtfn2=V(); local vcvtres2=V(); local vcvtfixed2=V()
+L(("    elseif %s==%s then"):format(vOP,opc("CALL_VARARG_TAIL_MULTI")))
+L(("      local %s={}"):format(vcvtv2))
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti2,vLASTMULTI,vcvtv2,pop_expr()))
+L(("      local %s=%s"):format(vcvtfixed2,vAR))
+L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti2,vcvtfixed2,vcvtv2,pop_expr()))
+L(("      local %s=%s"):format(vcvtfn2,pop_expr()))
+L(("      local %s=_pack(%s(_unpack(%s)))"):format(vcvtres2,vcvtfn2,vcvtv2))
+L(("      for %s=1,%s.n do %s end"):format(vcvti2,vcvtres2,push_expr("(function() local _v="..vcvtres2.."["..vcvti2.."]; return (_v==nil and "..vNILSENT.." or _v) end)()")))
+L(("      %s=%s.n"):format(vLASTMULTI,vcvtres2))
 
 local vcls=V(); local vcenv=V()
 L(("    elseif %s==%s then"):format(vOP,opc("CLOSURE")))
