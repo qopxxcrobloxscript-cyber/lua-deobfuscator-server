@@ -1269,6 +1269,15 @@ L(("    local %s=%s[%s[1]]"):format(vOP,vUM,vIN))
 L(("    local %s=%s[2]"):format(vAR,vIN))
 L(("    %s=%s+1"):format(vPC,vPC))
 
+-- HARDENING: 以降、各オペコードハンドラのブロックが始まる。解析耐性強化のため、
+-- 生成完了後にこの区間の elseif ブロックをシャッフルし出現順を毎回変える
+-- (ハンドラの実行ロジック自体は一切変更しない、ブロック単位の並び替えのみ)。
+-- NOTE: マーカーの実際の設置位置は、ヘルパー関数定義(_popv/pop_expr/push_expr/
+-- top_expr)より後、最初の本物のオペコードハンドラ(PUSH_NIL)の直前でなければ
+-- ならない。ヘルパー定義行を誤って「最初のブロック」としてシャッフル範囲に
+-- 含めてしまうと、シャッフル後にそれが elseif として書き換えられ構文が壊れる
+-- ため、マーカーはこれらの前置きコードの生成が完了した直後に置く(下記)。
+
 -- FIX: ST上のnilは番兵値(vNILSENT)で表現されている場合があるため、pop時に
 -- 自動的に実際のnilへ変換するヘルパーを用意し、全てのpop_expr呼び出しが
 -- 透過的に正しいnil値を受け取れるようにする。
@@ -1276,6 +1285,8 @@ L(("  local function _popv(t) local v=table.remove(t); if v==%s then return nil 
 local function pop_expr() return ("_popv(%s)"):format(vST) end
 local function push_expr(v) return ("%s[#%s+1]=%s"):format(vST,vST,v) end
 local function top_expr() return ("%s[#%s]"):format(vST,vST) end
+
+local DISPATCH_BLOCK_START = #lines + 1
 
 L(("    if %s==%s then %s"):format(vOP,opc("PUSH_NIL"),push_expr("nil")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_TRUE"),push_expr("true")))
@@ -1576,6 +1587,10 @@ L("      else")
 L(("        %s[#%s]=nil"):format(vGFOR,vGFOR))
 L("      end")
 
+-- HARDENING: ディスパッチチェーンの終端。DISPATCH_BLOCK_START からここまでの
+-- 行が、シャッフル対象の elseif ブロック群。
+local DISPATCH_BLOCK_END = #lines
+
 L("    end")
 L("  end")
 L("end")
@@ -1586,6 +1601,80 @@ L(("  %s(%s,{},_G,{})"):format(vVM,vPR))
 L("end")
 L(("%s()"):format(vEntry))
 L("end)()")
+
+-- HARDENING: ディスパッチハンドラの出現順をシャッフルする。
+-- DISPATCH_BLOCK_START..DISPATCH_BLOCK_END の範囲には、各オペコードの
+-- "if/elseif ... then ... (本体行...)" ブロックが順番に並んでいる。
+-- 各ブロックの境界は「行頭が (whitespace) if/elseif <vOP>==<num> then」に
+-- マッチする行を新ブロックの開始とみなすことで検出できる。この境界情報だけを
+-- 使ってブロック単位に分割し、シャッフルしてから、先頭ブロックだけ"if"に、
+-- それ以降を全て"elseif"に統一して書き戻す。ブロック内部の行は一切変更しない
+-- ため、各オペコードの実行ロジックは完全に元のまま — 変わるのは並び順だけ。
+do
+  local blockStartPattern = "^%s*e?lseif%s+"..vOP.."=="
+  local blockStartPatternIf = "^%s*if%s+"..vOP.."=="
+  local function isBlockStart(ln) return ln:match(blockStartPattern) or ln:match(blockStartPatternIf) end
+  local blocks = {}
+  local cur = nil
+  for i=DISPATCH_BLOCK_START,DISPATCH_BLOCK_END do
+    local ln = lines[i]
+    if isBlockStart(ln) then
+      if cur then blocks[#blocks+1]=cur end
+      cur = {ln}
+    else
+      if cur then cur[#cur+1]=ln
+      else
+        -- Shouldn't happen (first line in range must be a block start), but
+        -- guard against it just in case by starting an implicit block.
+        cur = {ln}
+      end
+    end
+  end
+  if cur then blocks[#blocks+1]=cur end
+
+  -- Fisher-Yates shuffle of the block order
+  for i=#blocks,2,-1 do
+    local j=math.random(1,i)
+    blocks[i],blocks[j]=blocks[j],blocks[i]
+  end
+
+  -- Rewrite first line of each block: first block in the new order uses "if",
+  -- every other block uses "elseif" — regardless of which opcode it originally
+  -- represented or where it originally sat in the chain.
+  -- IMPORTANT: exactly one block in the whole chain was originally written with
+  -- bare "if" (the first one emitted, PUSH_NIL) and all the rest with "elseif".
+  -- The rewrite must handle a block whose firstLine starts with EITHER keyword,
+  -- since shuffling can place the "if"-originated block anywhere in the new
+  -- order, and can place any "elseif"-originated block into position 1.
+  local rebuilt = {}
+  for bi,block in ipairs(blocks) do
+    local firstLine = block[1]
+    local rewritten
+    if bi==1 then
+      -- Normalize to "if", whether the source line started with "if" or "elseif".
+      rewritten = firstLine:gsub("^(%s*)elseif%s+", "%1if ", 1)
+      if rewritten == firstLine then
+        rewritten = firstLine:gsub("^(%s*)if%s+", "%1if ", 1)
+      end
+    else
+      -- Normalize to "elseif", whether the source line started with "if" or "elseif".
+      rewritten = firstLine:gsub("^(%s*)elseif%s+", "%1elseif ", 1)
+      if rewritten == firstLine then
+        rewritten = firstLine:gsub("^(%s*)if%s+", "%1elseif ", 1)
+      end
+    end
+    rebuilt[#rebuilt+1]=rewritten
+    for k=2,#block do rebuilt[#rebuilt+1]=block[k] end
+  end
+
+  -- Splice the shuffled+rewritten lines back into the original `lines` array
+  -- in place of the original DISPATCH_BLOCK_START..DISPATCH_BLOCK_END range.
+  local newLines = {}
+  for i=1,DISPATCH_BLOCK_START-1 do newLines[#newLines+1]=lines[i] end
+  for _,ln in ipairs(rebuilt) do newLines[#newLines+1]=ln end
+  for i=DISPATCH_BLOCK_END+1,#lines do newLines[#newLines+1]=lines[i] end
+  lines = newLines
+end
 
 local final=table.concat(lines,"\n")
 local fw=io.open(output_file,"w")
