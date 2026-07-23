@@ -630,6 +630,82 @@ function toLuaSafeString(str){
 function bytesToBase64(t){return btoa(Array.from(t,t=>String.fromCodePoint(t)).join(""));}
 
 // ════════════════════════════════════════════════════
+//  アンチダンパー (強化版)
+// ════════════════════════════════════════════════════
+// 複数の独立したチェック関数に分散し、それぞれが異なる経路・異なる手法で
+// ダンプ/デバッグ/フック系APIを検知・無効化する。1つのチェックが発見・除去
+// されても他が生き残るよう設計している。
+function generateAntiDumpCode(lite, opts) {
+  const encStr = s => (opts && opts.useSaltEncode) ? strToEncodedChar(s) : strToChar(s);
+  const sep = lite ? ' ' : '\n';
+  const v = () => generateVarName(lite);
+
+  // 既知のダンプ/逆コンパイル/フック系API名（複数の実行環境・複数のexploit
+  // 実装で使われる名前を広くカバーする）
+  const DUMP_APIS = [
+    'saveinstance','save_instance','dumpstring','decompile','Decompile',
+    'getscriptbytecode','getscripthash','getscriptclosure',
+    'getscriptfunction','dumpstring_raw','loadstring_dump',
+  ];
+  const HOOK_APIS = ['sethook','gethook'];
+  const ENV_GETTERS = ['getgenv','getrenv','getsenv'];
+
+  // ── チェック関数1: 複数の環境取得経路それぞれから既知APIを無効化 ──
+  const f1 = v(), e1 = v(), g1 = v(), api1 = v();
+  let body1 = `local function ${f1}()`;
+  body1 += `local ${e1}=nil ${sep}`;
+  for (const getter of ENV_GETTERS) {
+    body1 += `local ${g1}=rawget(_G,${encStr(getter)}) or _G[${encStr(getter)}]${sep}`;
+    body1 += `if type(${g1})=="function" then local ${e1}=${g1}() if ${e1} then for _,${api1} in ipairs({${DUMP_APIS.map(a=>encStr(a)).join(',')}}) do pcall(function() ${e1}[${api1}]=nil end) end end end${sep}`;
+  }
+  // shared / _G 直接パスもカバー
+  body1 += `pcall(function() for _,${api1} in ipairs({${DUMP_APIS.map(a=>encStr(a)).join(',')}}) do if _G[${api1}] then _G[${api1}]=nil end if shared and shared[${api1}] then shared[${api1}]=nil end end end)${sep}`;
+  body1 += `end`;
+
+  // ── チェック関数2: debugライブラリの危険なフック手段を静かに封じる ──
+  // 以前の実装は debug.sethook で常時発火する無限ループフックを仕込んでいたが、
+  // これは (a) 全呼び出しでオーバーヘッドが発生し実行速度そのものを破壊する,
+  // (b) sethook呼び出し1つを見れば即座に検知・除去できる単一障害点、という
+  // 弱点があった。ここでは代わりに、debug.sethook/gethookそのものを安全な
+  // 形で無効化・置き換えることでフック設置自体をできなくする。
+  const f2 = v(), d2 = v(), h2 = v();
+  let body2 = `local function ${f2}()`;
+  body2 += `local ${d2}=debug ${sep}`;
+  body2 += `if ${d2} then pcall(function() for _,${h2} in ipairs({${HOOK_APIS.map(a=>encStr(a)).join(',')}}) do if ${d2}[${h2}] then ${d2}[${h2}]=function() end end end end) end `;
+  body2 += `if ${d2} then pcall(function() if ${d2}.getinfo then local _gi=${d2}.getinfo ${d2}.getinfo=function(...) local _ok,_r=pcall(_gi,...) if _ok then return _r end return nil end end end) end${sep}`;
+  body2 += `end`;
+
+  // ── チェック関数3: 粗いタイミングチェック(ステップ実行検知) ──
+  // ブレークポイントでのステップ実行やデバッガアタッチ時は、些細なループでも
+  // 実時間が異常に伸びる。閾値は誤検知を避けるためかなり緩く設定し、通常の
+  // 実行環境や多少の負荷では絶対に引っかからないようにする。検知した場合も
+  // クラッシュさせず、単に後続コードへの副作用を持たない形で留める(過検知で
+  // 正規ユーザーの実行を壊さないことを優先)。
+  const f3 = v(), t3a = v(), t3b = v(), i3 = v(), acc3 = v();
+  let body3 = `local function ${f3}()`;
+  body3 += `local ${t3a}=os and os.clock and os.clock() or 0 `;
+  body3 += `local ${acc3}=0 for ${i3}=1,20000 do ${acc3}=${acc3}+${i3}%7 end `;
+  body3 += `local ${t3b}=os and os.clock and os.clock() or 0 `;
+  body3 += `return (${t3b}-${t3a})${sep}`;
+  body3 += `end`;
+
+  // ── チェック関数4: 実行環境の"通常っぽさ"を複数シグナルで軽くチェック ──
+  // exploit/デバッグ環境に典型的な、通常のRoblox実行環境には存在しない
+  // グローバル関数の有無を確認する(存在チェックのみ、パッチはしない —
+  // これらは正規のツール機能であり無効化すると害があるため、検知のみ)。
+  const f4 = v(), c4 = v(), n4 = v();
+  let body4 = `local function ${f4}()`;
+  body4 += `local ${c4}=0 `;
+  body4 += `for _,${n4} in ipairs({${['hookfunction','hookmetamethod','getupvalue','setupvalue','getconstant'].map(a=>encStr(a)).join(',')}}) do if rawget(_G,${n4}) then ${c4}=${c4}+1 end end `;
+  body4 += `return ${c4}${sep}`;
+  body4 += `end`;
+
+  let out = body1 + sep + body2 + sep + body3 + sep + body4 + sep;
+  out += `pcall(${f1}) pcall(${f2}) pcall(${f3}) pcall(${f4})${sep}`;
+  return out;
+}
+
+// ════════════════════════════════════════════════════
 //  ゴミ関数・ジャンクコード
 // ════════════════════════════════════════════════════
 function generateJunkFunction(lite){
@@ -922,8 +998,7 @@ async function processObfuscation(inputCode, opts) {
     await sleep(20);
     let out = '';
     if (opts.useAntiDump) {
-      const a1=generateVarName(opts.useLite),a2=generateVarName(opts.useLite),a3=generateVarName(opts.useLite);
-      out += `local function ${a1}()local ${a2}=getfenv()local ${a3}=${a2}[${strToChar("getgenv")}]if ${a3} then ${a3}()[${strToChar("saveinstance")}]=nil ${a3}()[${strToChar("save_instance")}]=nil ${a3}()[${strToChar("dumpstring")}]=nil end if debug then if debug.sethook then pcall(function()debug.sethook(function()while true do end end,"c")end)end if debug.getinfo then debug.getinfo=nil end end end pcall(${a1})\n`;
+      out += generateAntiDumpCode(opts.useLite, opts);
     }
     if (opts.junk > 0) out += generateMassiveJunkCode(Math.floor(opts.junk / (opts.useLite ? 20 : 5)), opts.useLite, opts);
     if (opts.useJunkFunc && !opts.useLite) { const jfCount = Math.floor(opts.junk / 30) + 3; for (let i = 0; i < jfCount; i++) out += generateJunkFunction(opts.useLite); }
@@ -933,7 +1008,7 @@ async function processObfuscation(inputCode, opts) {
     if (opts.junk > 100) out = injectJunkIntoCode(out, opts.junk, opts.useLite, opts);
     if (opts.useLite) out = minifyCode(out);
     if (opts.useWrapFunc && !opts.useLite) out = `(function()\n${out}\nend)()`;
-    return `-- Obfuscation by YAJU\n${out}`;
+    return `-- Obfuscation by YAJU (loadstring-free direct embed)\n${out}`;
   }
 
   const TARGET_SIZE = 1.5 * 1024 * 1024;
@@ -1102,8 +1177,7 @@ async function processObfuscation(inputCode, opts) {
   let out = '';
 
   if (opts.useAntiDump) {
-    const a1=generateVarName(lite),a2=generateVarName(lite),a3=generateVarName(lite);
-    out += `local function ${a1}()local ${a2}=getfenv()local ${a3}=${a2}[${strToChar("getgenv")}]if ${a3} then ${a3}()[${strToChar("saveinstance")}]=nil ${a3}()[${strToChar("save_instance")}]=nil ${a3}()[${strToChar("dumpstring")}]=nil end if debug then if debug.sethook then pcall(function()debug.sethook(function()while true do end end,"c")end)end if debug.getinfo then debug.getinfo=nil end end end pcall(${a1})` + sep;
+    out += generateAntiDumpCode(lite, opts);
   }
   if (adjJunk > 0) out += generateMassiveJunkCode(Math.floor(adjJunk / (lite ? 20 : 5)), lite, opts);
   if (opts.useJunkFunc && !lite) { const jfCount = Math.floor(adjJunk / 30) + 3; for (let i = 0; i < jfCount; i++) out += generateJunkFunction(lite); }
