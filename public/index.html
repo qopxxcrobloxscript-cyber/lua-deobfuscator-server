@@ -630,57 +630,106 @@ function toLuaSafeString(str){
 function bytesToBase64(t){return btoa(Array.from(t,t=>String.fromCodePoint(t)).join(""));}
 
 // ════════════════════════════════════════════════════
-//  アンチダンパー (強化版)
+//  アンチダンパー (超強化版)
 // ════════════════════════════════════════════════════
-// 複数の独立したチェック関数に分散し、それぞれが異なる経路・異なる手法で
-// ダンプ/デバッグ/フック系APIを検知・無効化する。1つのチェックが発見・除去
-// されても他が生き残るよう設計している。
+// 【強化前の弱点】既知ツールで実際に解読された結果、以下が判明した:
+//   - string.char(103,101,116,...) は完全な定数配列なので、逆コンパイラが
+//     実行せずに一瞬で元の文字列へ定数畳み込みしてしまう
+//   - ipairs({"saveinstance","decompile",...}) のような固定文字列配列も
+//     そのまま復元され、"ここがAPI名リストだ"と一目でわかってしまう
+//   - genv/getgenv/getrenv 等のイディオムが典型的すぎ、逆コンパイラの
+//     意味復元(変数リネーム)パスにそのまま拾われる
+//   - 4つの独立した名前付き関数として綺麗に分離されていたため、
+//     「ここがアンチダンプブロックだ」という強い目印になっていた
+// 【対策】
+//   1. 文字列は常に strToSaltXor(ループ+XORで復元、単純な定数畳み込み不可)
+//   2. 危険API名を文字列リストとして埋め込まず、各名前を多項式ハッシュ値
+//      (ただの数値)に変換し、実行時に環境テーブルを pairs() で全走査して
+//      ハッシュが一致したキーだけ nil 化する。→ 出力には「API名の配列」が
+//      一切現れず、数値の配列にしか見えない
+//   3. 複数のチェックを1つの巨大関数に統合し、ローカル変数を大量に混在
+//      させることで「アンチダンプ専用ブロック」という切り出しやすい構造を崩す
 function generateAntiDumpCode(lite, opts) {
-  const encStr = s => (opts && opts.useSaltEncode) ? strToEncodedChar(s) : strToChar(s);
   const sep = lite ? ' ' : '\n';
   const v = () => generateVarName(lite);
+  // アンチダンプは常に最強のエンコード(ループ+XOR)を使う。他オプションの
+  // 設定(useSaltEncode)に関係なく強制する — ここだけは手を抜かない。
+  const encStr = s => strToSaltXor(s);
 
-  // 既知のダンプ/逆コンパイル/フック系API名（複数の実行環境・複数のexploit
-  // 実装で使われる名前を広くカバーする）
+  // 簡易多項式ハッシュ(実行時にもLuaで同じ式を計算して比較する)
+  // JS/Lua5.1 両方で完全に同一の結果になることを検証済み(+, *, % のみ使用 —
+  // Lua5.1にはビット演算子がないため、それに依存しない設計にしている)。
+  const HASH_MOD = 2147483647; // 2^31 - 1, safe for both JS Number and Lua double precision
+  function polyHash(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) {
+      h = (h * 33 + str.charCodeAt(i)) % HASH_MOD;
+    }
+    return h;
+  }
+
   const DUMP_APIS = [
     'saveinstance','save_instance','dumpstring','decompile','Decompile',
     'getscriptbytecode','getscripthash','getscriptclosure',
     'getscriptfunction','dumpstring_raw','loadstring_dump',
+    'checkcaller','getcallingscript','isexecutorclosure',
   ];
   const HOOK_APIS = ['sethook','gethook'];
   const ENV_GETTERS = ['getgenv','getrenv','getsenv'];
+  const SIGNAL_APIS = ['hookfunction','hookmetamethod','getupvalue','setupvalue','getconstant'];
 
-  // ── チェック関数1: 複数の環境取得経路それぞれから既知APIを無効化 ──
-  const f1 = v(), e1 = v(), g1 = v(), api1 = v();
+  // Luaでの多項式ハッシュ計算式。JS側のpolyHash(h*33+charCode)%MODと完全一致
+  // することを検証済み(+, *, % のみ使用、ビット演算非依存)。
+  const vHashFn = v(), vHK = v(), vHi = v(), vHh = v(), vHmod = v();
+  let hashFnDef = `local function ${vHashFn}(${vHK})local ${vHh}=5381 local ${vHmod}=${HASH_MOD} `;
+  hashFnDef += `for ${vHi}=1,#${vHK} do local _b=string.byte(${vHK},${vHi}) `;
+  hashFnDef += `${vHh}=(${vHh}*33+_b)%${vHmod} end `;
+  hashFnDef += `return ${vHh} end${sep}`;
+
+  const vHashTbl = v();
+  const hashList = DUMP_APIS.map(a => polyHash(a));
+  let hashTblDef = `local ${vHashTbl}={${hashList.join(',')}}${sep}`;
+
+  const vHookHashTbl = v();
+  const hookHashList = HOOK_APIS.map(a => polyHash(a));
+  let hookHashTblDef = `local ${vHookHashTbl}={${hookHashList.join(',')}}${sep}`;
+
+  const vSignalHashTbl = v();
+  const signalHashList = SIGNAL_APIS.map(a => polyHash(a));
+  let signalHashTblDef = `local ${vSignalHashTbl}={${signalHashList.join(',')}}${sep}`;
+
+  const vMatch = v(), vTbl = v(), vKey = v(), vVal = v(), vHashes = v(), vH = v();
+  let matchFnDef = `local function ${vMatch}(${vTbl},${vHashes})`;
+  matchFnDef += `if type(${vTbl})~="table" then return end `;
+  matchFnDef += `local _ok=pcall(function() for ${vKey},${vVal} in pairs(${vTbl}) do `;
+  matchFnDef += `if type(${vKey})=="string" then local ${vH}=${vHashFn}(${vKey}) `;
+  matchFnDef += `for _,_hv in ipairs(${vHashes}) do if _hv==${vH} then pcall(function() ${vTbl}[${vKey}]=nil end) break end end end end end) `;
+  matchFnDef += `end${sep}`;
+
+  // ── 環境取得関数名も文字列リストで持たず、同じハッシュ照合方式で _G を走査 ──
+  const vGetterHashTbl = v();
+  const getterHashList = ENV_GETTERS.map(a => polyHash(a));
+  let getterHashTblDef = `local ${vGetterHashTbl}={${getterHashList.join(',')}}${sep}`;
+
+  const f1 = v(), gk = v(), gv = v(), gh = v(), genvResult = v();
   let body1 = `local function ${f1}()`;
-  body1 += `local ${e1}=nil ${sep}`;
-  for (const getter of ENV_GETTERS) {
-    body1 += `local ${g1}=rawget(_G,${encStr(getter)}) or _G[${encStr(getter)}]${sep}`;
-    body1 += `if type(${g1})=="function" then local ${e1}=${g1}() if ${e1} then for _,${api1} in ipairs({${DUMP_APIS.map(a=>encStr(a)).join(',')}}) do pcall(function() ${e1}[${api1}]=nil end) end end end${sep}`;
-  }
-  // shared / _G 直接パスもカバー
-  body1 += `pcall(function() for _,${api1} in ipairs({${DUMP_APIS.map(a=>encStr(a)).join(',')}}) do if _G[${api1}] then _G[${api1}]=nil end if shared and shared[${api1}] then shared[${api1}]=nil end end end)${sep}`;
+  body1 += `local _ok1=pcall(function() for ${gk},${gv} in pairs(_G) do `;
+  body1 += `if type(${gk})=="string" and type(${gv})=="function" then local ${gh}=${vHashFn}(${gk}) `;
+  body1 += `for _,_hv in ipairs(${vGetterHashTbl}) do if _hv==${gh} then local _ok2,${genvResult}=pcall(${gv}) if _ok2 and type(${genvResult})=="table" then ${vMatch}(${genvResult},${vHashTbl}) end break end end end end end) `;
+  // shared / _G 直接パスも同じハッシュ照合で
+  body1 += `${vMatch}(_G,${vHashTbl}) `;
+  body1 += `if shared then ${vMatch}(shared,${vHashTbl}) end${sep}`;
   body1 += `end`;
 
-  // ── チェック関数2: debugライブラリの危険なフック手段を静かに封じる ──
-  // 以前の実装は debug.sethook で常時発火する無限ループフックを仕込んでいたが、
-  // これは (a) 全呼び出しでオーバーヘッドが発生し実行速度そのものを破壊する,
-  // (b) sethook呼び出し1つを見れば即座に検知・除去できる単一障害点、という
-  // 弱点があった。ここでは代わりに、debug.sethook/gethookそのものを安全な
-  // 形で無効化・置き換えることでフック設置自体をできなくする。
-  const f2 = v(), d2 = v(), h2 = v();
+  // ── debugライブラリの危険なフック手段を封じる(ハッシュ照合ベース) ──
+  const f2 = v(), d2 = v();
   let body2 = `local function ${f2}()`;
   body2 += `local ${d2}=debug ${sep}`;
-  body2 += `if ${d2} then pcall(function() for _,${h2} in ipairs({${HOOK_APIS.map(a=>encStr(a)).join(',')}}) do if ${d2}[${h2}] then ${d2}[${h2}]=function() end end end end) end `;
-  body2 += `if ${d2} then pcall(function() if ${d2}.getinfo then local _gi=${d2}.getinfo ${d2}.getinfo=function(...) local _ok,_r=pcall(_gi,...) if _ok then return _r end return nil end end end) end${sep}`;
+  body2 += `if ${d2} then ${vMatch}(${d2},${vHookHashTbl}) `;
+  body2 += `pcall(function() if ${d2}.getinfo then local _gi=${d2}.getinfo ${d2}.getinfo=function(...) local _ok,_r=pcall(_gi,...) if _ok then return _r end return nil end end end) end${sep}`;
   body2 += `end`;
 
-  // ── チェック関数3: 粗いタイミングチェック(ステップ実行検知) ──
-  // ブレークポイントでのステップ実行やデバッガアタッチ時は、些細なループでも
-  // 実時間が異常に伸びる。閾値は誤検知を避けるためかなり緩く設定し、通常の
-  // 実行環境や多少の負荷では絶対に引っかからないようにする。検知した場合も
-  // クラッシュさせず、単に後続コードへの副作用を持たない形で留める(過検知で
-  // 正規ユーザーの実行を壊さないことを優先)。
+  // ── 粗いタイミングチェック(ステップ実行検知) ──
   const f3 = v(), t3a = v(), t3b = v(), i3 = v(), acc3 = v();
   let body3 = `local function ${f3}()`;
   body3 += `local ${t3a}=os and os.clock and os.clock() or 0 `;
@@ -693,14 +742,18 @@ function generateAntiDumpCode(lite, opts) {
   // exploit/デバッグ環境に典型的な、通常のRoblox実行環境には存在しない
   // グローバル関数の有無を確認する(存在チェックのみ、パッチはしない —
   // これらは正規のツール機能であり無効化すると害があるため、検知のみ)。
-  const f4 = v(), c4 = v(), n4 = v();
+  // ハッシュ照合方式を使い、文字列リストを一切露出させない。
+  const f4 = v(), c4 = v(), gk4 = v(), gv4 = v(), gh4 = v();
   let body4 = `local function ${f4}()`;
   body4 += `local ${c4}=0 `;
-  body4 += `for _,${n4} in ipairs({${['hookfunction','hookmetamethod','getupvalue','setupvalue','getconstant'].map(a=>encStr(a)).join(',')}}) do if rawget(_G,${n4}) then ${c4}=${c4}+1 end end `;
+  body4 += `pcall(function() for ${gk4},${gv4} in pairs(_G) do `;
+  body4 += `if type(${gk4})=="string" then local ${gh4}=${vHashFn}(${gk4}) `;
+  body4 += `for _,_hv in ipairs(${vSignalHashTbl}) do if _hv==${gh4} then ${c4}=${c4}+1 break end end end end end) `;
   body4 += `return ${c4}${sep}`;
   body4 += `end`;
 
-  let out = body1 + sep + body2 + sep + body3 + sep + body4 + sep;
+  let out = hashFnDef + hashTblDef + hookHashTblDef + signalHashTblDef + getterHashTblDef + matchFnDef;
+  out += body1 + sep + body2 + sep + body3 + sep + body4 + sep;
   out += `pcall(${f1}) pcall(${f2}) pcall(${f3}) pcall(${f4})${sep}`;
   return out;
 }
