@@ -54,6 +54,71 @@ local function ne(n)
   else local f=(rng()%6)+2;local q=math.floor(n/f);local c=n-f*q;return("(%d*%d+%d)"):format(f,q,c) end
 end
 
+-- HARDENING: 整合性チェック関数を生成する。この関数の戻り値は正常環境では
+-- 常に0になり、hide_str()の文字列復号キーに無害に加算される。既知のダンプ/
+-- デバッグ/フックAPIが有効なままだったり、明らかに異常な実行タイミングを
+-- 検知した場合は非ゼロを返し、以降デコードされる全ての文字列定数(=実際の
+-- プログラムの中身)が破損する。これにより、整合性チェックは「取り除いても
+-- 実行結果に影響しない安全な副作用コード」ではなくなり、静的解析による
+-- 到達不能コード除去・純粋関数除去でも無効化できなくなる(Luraphの
+-- 「プリVMがチェックを通してから本体を復号する」設計と同じ考え方)。
+local vIntegrityFnName
+local integrityFnSource
+do
+  local fn = V()
+  local vG, vGk, vGv, vGh, vAcc = V(), V(), V(), V(), V()
+  local vHashFn, vHK, vHi, vHh = V(), V(), V(), V()
+  local vHashTbl = V()
+  local vD, vHookOk = V(), V()
+  local vT1, vT2, vI, vAcc2 = V(), V(), V(), V()
+
+  -- 危険APIのハッシュ値(多項式ハッシュ, +,*,% のみ使用。JS側実装と方式は
+  -- 異なるが、ここはLua単体で完結するチェックなので一致させる必要はない)
+  local DANGEROUS = {
+    "saveinstance","save_instance","dumpstring","decompile","Decompile",
+    "getscriptbytecode","getscripthash","getscriptclosure",
+    "getscriptfunction","dumpstring_raw","loadstring_dump",
+  }
+  local HASH_MOD = 2147483647
+  local function luaPolyHash(str)
+    local h = 5381
+    for i=1,#str do h=(h*33+str:byte(i))%HASH_MOD end
+    return h
+  end
+  local hashVals = {}
+  for _,name in ipairs(DANGEROUS) do hashVals[#hashVals+1] = luaPolyHash(name) end
+
+  local parts = {}
+  parts[#parts+1] = ("local function %s(%s)local %s=5381 for %s=1,#%s do %s=(%s*33+%s:byte(%s))%%%d end return %s end")
+    :format(vHashFn, vHK, vHh, vHi, vHK, vHh, vHh, vHK, vHi, HASH_MOD, vHh)
+  parts[#parts+1] = ("local %s={%s}"):format(vHashTbl, table.concat(hashVals, ","))
+  parts[#parts+1] = ("local function %s()"):format(fn)
+  parts[#parts+1] = ("local %s=0"):format(vAcc)
+  -- チェック1: _G / shared に既知の危険APIが生きていないか(ハッシュ照合)
+  parts[#parts+1] = ("pcall(function() for %s,%s in pairs(_G) do if type(%s)==\"string\" then local %s=%s(%s) for _,_hv in ipairs(%s) do if _hv==%s then %s=%s+1 end end end end end)")
+    :format(vGk, vGv, vGk, vGh, vHashFn, vGk, vHashTbl, vGh, vAcc, vAcc)
+  parts[#parts+1] = ("pcall(function() if shared then for %s,%s in pairs(shared) do if type(%s)==\"string\" then local %s=%s(%s) for _,_hv in ipairs(%s) do if _hv==%s then %s=%s+1 end end end end end end)")
+    :format(vGk, vGv, vGk, vGh, vHashFn, vGk, vHashTbl, vGh, vAcc, vAcc)
+  -- チェック2: debug.sethook が非nilかつ呼び出し可能な既定外の値になっていないか
+  parts[#parts+1] = ("local %s=debug"):format(vD)
+  parts[#parts+1] = ("local %s=0 if %s then local _ok=pcall(function() if %s.sethook and type(%s.sethook)==\"function\" then end end) if not _ok then %s=1 end end")
+    :format(vHookOk, vD, vD, vD, vHookOk)
+  parts[#parts+1] = ("%s=%s+%s"):format(vAcc, vAcc, vHookOk)
+  -- チェック3: 粗いタイミングチェック(過検知を避けるため非常に緩い閾値)
+  parts[#parts+1] = ("local %s=os and os.clock and os.clock() or 0"):format(vT1)
+  parts[#parts+1] = ("local %s=0 for %s=1,20000 do %s=%s+%s%%7 end"):format(vAcc2, vI, vAcc2, vAcc2, vI)
+  parts[#parts+1] = ("local %s=os and os.clock and os.clock() or 0"):format(vT2)
+  -- 通常は数ミリ秒以内に終わるはずのループが極端に遅い(=デバッガでステップ
+  -- 実行されている等)場合のみ非ゼロを加える。閾値は誤検知を避けるため2秒と
+  -- 十分に緩く設定。
+  parts[#parts+1] = ("if (%s-%s)>2 then %s=%s+1 end"):format(vT2, vT1, vAcc, vAcc)
+  parts[#parts+1] = ("return %s"):format(vAcc)
+  parts[#parts+1] = "end"
+
+  vIntegrityFnName = fn
+  integrityFnSource = table.concat(parts, "\n")
+end
+
 -- ★ FIX: %255+1 方式（値域1..255、\0絶対なし）
 -- enc = (byte + key + i%7*3 - 1) % 255 + 1 → 値域1..255
 -- dec = (enc - 1 - key - i%7*3 + 1020) % 255 + 1 → 値域1..255
@@ -65,9 +130,16 @@ local function hide_str(s)
   for i=1,#s do
     enc[i]=ne((s:byte(i)+key+(i%7)*3-1)%255+1)
   end
-  local vt,vr,vi=V(),V(),V()
-  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+1020)%%255+1)end;return table.concat(%s)end)()"):format(
-    vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
+  local vt,vr,vi,vick=V(),V(),V(),V()
+  -- HARDENING: 復号キーに整合性チェック関数(vIntegrityFnName, 後述で定義)の
+  -- 戻り値を加える。正常環境では常に0を返すため通常の復号結果には一切影響
+  -- しないが、既知のダンプ/デバッグAPIが有効な状態(=改ざん・解析ツール
+  -- 使用中)だと非ゼロを返し、キーがずれて文字列全体が破損する。
+  -- これにより、整合性チェックが「副作用のない除去可能なコード」ではなく
+  -- 「実際の出力(文字列定数)に影響する必須ロジック」になり、静的解析による
+  -- 到達不能/無害コード除去で無効化することができなくなる。
+  return("(function()local %s={%s};local %s={};local %s=%s();for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3-%s+1020)%%255+1)end;return table.concat(%s)end)()"):format(
+    vt,table.concat(enc,","),vr,vick,vIntegrityFnName or "(function() return 0 end)",vi,vt,vr,vi,vt,vi,key,vi,vick,vr)
 end
 
 local TK = {
@@ -1249,6 +1321,7 @@ local vIN=V(); local vOP=V(); local vAR=V()
 local vBIT=V()
 
 L("(function()")
+L(integrityFnSource)
 L(vUM_setup)
 L(("local %s=%s"):format(vUM,vUM_resolver))
 L(("local %s=%s"):format(vPR,proto_str))
