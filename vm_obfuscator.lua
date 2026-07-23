@@ -1069,10 +1069,35 @@ local proto=result
 
 math.randomseed(seed)
 local MAX_OP=70
+local DISPATCH_BAND_COUNT = math.random(2,4)
+-- Each band occupies a widely-separated numeric range so a coarse range check
+-- can cheaply tell which band vOP falls into before doing the usual linear
+-- opcode comparison within that band. Band 0 keeps the original 1..MAX_OP
+-- range (so unshuffled/legacy assumptions about small values stay harmless);
+-- other bands are offset by a random large multiple of 10000 per band so
+-- ranges never collide and are trivially distinguishable by simple comparisons.
+local bandOffsets = {0}
+do
+  local usedOffsets = {[0]=true}
+  for b=2,DISPATCH_BAND_COUNT do
+    local off
+    repeat off = (math.random(1,50)) * 10000 until not usedOffsets[off]
+    usedOffsets[off]=true
+    bandOffsets[b]=off
+  end
+end
 local pool={}; for i=1,MAX_OP do pool[i]=i end
 for i=MAX_OP,2,-1 do local j=math.random(1,i); pool[i],pool[j]=pool[j],pool[i] end
+-- Assign each opcode slot (1..MAX_OP) to a random band, then its final shuffled
+-- value is (band's base permutation value) + (band's offset).
+local opBand={}
+for i=1,MAX_OP do opBand[i]=math.random(1,DISPATCH_BAND_COUNT) end
 local op2c={}; local c2op={}
-for i=1,MAX_OP do op2c[i]=pool[i]; c2op[pool[i]]=i end
+for i=1,MAX_OP do
+  local band = opBand[i]
+  local val = pool[i] + bandOffsets[band]
+  op2c[i]=val; c2op[val]=i
+end
 
 local function remap(p)
   for _,ins in ipairs(p.code) do ins.op=op2c[ins.op] or ins.op end
@@ -1102,9 +1127,115 @@ end
 
 local proto_str=serial(proto)
 
-local UM_parts={}
-for k,v in pairs(c2op) do UM_parts[#UM_parts+1]=("[%s]=%s"):format(ne(k),ne(v)) end
-local UM_str="{"..table.concat(UM_parts,",").."}"
+-- HARDENING: c2op(シャッフル後の値→実オペコード)を単一の連想配列として
+-- 露出させず、複数のシャード(部分テーブル)に分割し、シャードごとにテーブル
+-- リテラル形式かif/elseif形式かをランダムに選んでレンダリングする。
+-- 1つの「対応表」を一望できないようにし、静的解析には複数の関数呼び出しと
+-- 分岐条件を辿らせる必要がある構造にする。
+local function buildShardedResolver()
+  local keys = {}
+  for k in pairs(c2op) do keys[#keys+1] = k end
+  -- shuffle key order so shard membership doesn't correlate with opcode value
+  for i=#keys,2,-1 do local j=math.random(1,i); keys[i],keys[j]=keys[j],keys[i] end
+
+  local shardCount = math.random(3,6)
+  local shards = {}
+  for i=1,shardCount do shards[i] = {} end
+  for i,k in ipairs(keys) do
+    local s = ((i-1) % shardCount) + 1
+    shards[s][#shards[s]+1] = k
+  end
+
+  local vResolve = V()
+  local shardFnNames = {}
+  local preLines = {}
+  for si,shard in ipairs(shards) do
+    local vShardFn = V()
+    shardFnNames[si] = vShardFn
+    local style = math.random(1,2)
+    if style==1 or #shard==0 then
+      -- table-literal shard: {[k]=v,...}
+      local parts = {}
+      for _,k in ipairs(shard) do parts[#parts+1] = ("[%s]=%s"):format(ne(k), ne(c2op[k])) end
+      local vTbl = V()
+      preLines[#preLines+1] = ("local %s={%s}"):format(vTbl, table.concat(parts,","))
+      preLines[#preLines+1] = ("local function %s(_k) return %s[_k] end"):format(vShardFn, vTbl)
+    else
+      -- if/elseif-chain shard: no table literal at all for this shard
+      local vA = V()
+      local body = {}
+      for ki,k in ipairs(shard) do
+        local kw = (ki==1) and "if" or "elseif"
+        body[#body+1] = ("  %s %s==%s then return %s"):format(kw, vA, ne(k), ne(c2op[k]))
+      end
+      preLines[#preLines+1] = ("local function %s(%s)"):format(vShardFn, vA)
+      for _,ln in ipairs(body) do preLines[#preLines+1]=ln end
+      preLines[#preLines+1] = "  end"
+      preLines[#preLines+1] = "end"
+    end
+  end
+
+  -- HARDENING (two-tier dispatch): route to the right shard via band first.
+  -- Each opcode's shuffled value already lives in one of DISPATCH_BAND_COUNT
+  -- disjoint numeric ranges (band 0 is 1..MAX_OP, other bands are offset by a
+  -- random multiple of 10000 — see bandOffsets above). The resolver first does
+  -- a coarse range check to find which band a key falls in, then only needs a
+  -- per-band routing table (much smaller and less revealing than one flat
+  -- table covering every opcode) to find the shard within that band.
+  local perBandRouting = {} -- band index -> { [key]=shardIndex, ... } (as ne() parts)
+  for b=1,DISPATCH_BAND_COUNT do perBandRouting[b] = {} end
+  for i,k in ipairs(keys) do
+    local s = ((i-1) % shardCount) + 1
+    -- Determine which band this key's value belongs to by checking range
+    -- membership against bandOffsets (band b's range is [offset+1, offset+MAX_OP]).
+    local band = 1
+    for b=DISPATCH_BAND_COUNT,1,-1 do
+      if k > bandOffsets[b] and k <= bandOffsets[b]+MAX_OP then band=b; break end
+    end
+    perBandRouting[band][#perBandRouting[band]+1] = ("[%s]=%s"):format(ne(k), ne(s))
+  end
+
+  local vRoute = V()
+  local vBandLo, vBandHi = V(), V()
+  -- Emit one small per-band routing table, plus a coarse band-selector function
+  -- that picks the right table via range comparison before doing the lookup.
+  local bandTblNames = {}
+  for b=1,DISPATCH_BAND_COUNT do
+    local vBTbl = V()
+    bandTblNames[b] = vBTbl
+    local parts = perBandRouting[b]
+    preLines[#preLines+1] = ("local %s={%s}"):format(vBTbl, table.concat(parts, ","))
+  end
+  local vBandSelect = V()
+  do
+    local body = {}
+    -- Sort bands by offset descending so the range checks (k > offset) find the
+    -- correct (highest matching) band first, mirroring how band membership was
+    -- computed above.
+    local order = {}
+    for b=1,DISPATCH_BAND_COUNT do order[#order+1]=b end
+    table.sort(order, function(a,c) return bandOffsets[a] > bandOffsets[c] end)
+    for oi,b in ipairs(order) do
+      local kw = (oi==1) and "if" or "elseif"
+      body[#body+1] = ("  %s _k>%s then return %s"):format(kw, ne(bandOffsets[b]), bandTblNames[b])
+    end
+    preLines[#preLines+1] = ("local function %s(_k)"):format(vBandSelect)
+    for _,ln in ipairs(body) do preLines[#preLines+1]=ln end
+    preLines[#preLines+1] = "  end"
+    preLines[#preLines+1] = ("  return %s"):format(bandTblNames[1])
+    preLines[#preLines+1] = "end"
+  end
+
+  local vShardTbl = V()
+  local shardRefs = {}
+  for si,fn in ipairs(shardFnNames) do shardRefs[#shardRefs+1] = fn end
+  preLines[#preLines+1] = ("local %s={%s}"):format(vShardTbl, table.concat(shardRefs,","))
+  preLines[#preLines+1] = ("local function %s(_k) return %s[%s(_k)[_k]](_k) end"):format(vResolve, vShardTbl, vBandSelect)
+
+  return vResolve, table.concat(preLines, "\n")
+end
+
+local vUM_resolver, vUM_setup = buildShardedResolver()
 
 local function opc(name) return ne(OP[name]) end
 
@@ -1118,7 +1249,8 @@ local vIN=V(); local vOP=V(); local vAR=V()
 local vBIT=V()
 
 L("(function()")
-L(("local %s=%s"):format(vUM,UM_str))
+L(vUM_setup)
+L(("local %s=%s"):format(vUM,vUM_resolver))
 L(("local %s=%s"):format(vPR,proto_str))
 
 -- ★ ビット演算ヘルパー (Lua5.1互換・bit32使用 → Roblox標準)
@@ -1265,7 +1397,7 @@ L(("  local %s=0"):format(vLASTMULTI))
 L("  while true do")
 L(("    local %s=%s.c[%s]"):format(vIN,vF,vPC))
 L(("    if not %s then break end"):format(vIN))
-L(("    local %s=%s[%s[1]]"):format(vOP,vUM,vIN))
+L(("    local %s=%s(%s[1])"):format(vOP,vUM,vIN))
 L(("    local %s=%s[2]"):format(vAR,vIN))
 L(("    %s=%s+1"):format(vPC,vPC))
 
@@ -1631,6 +1763,40 @@ do
     end
   end
   if cur then blocks[#blocks+1]=cur end
+
+  -- HARDENING: デコイ(実行されない偽)ハンドラブロックを混入する。
+  -- 比較値はMAX_OPの範囲外(実際の命令のarg/opには絶対に現れない値)からランダムに
+  -- 選ぶため、実行時に絶対にマッチせず完全なデッドコードだが、構造的には本物の
+  -- ハンドラと見分けがつかない(同じ "if/elseif <vOP>==<num> then <本体>" の形)。
+  -- 本体は既存のオペコード実装パターンを模した無害などこにも影響しないローカル
+  -- 変数操作にする。
+  local DECOY_COUNT = math.random(8, 16)
+  for _=1,DECOY_COUNT do
+    -- Pick a comparison value guaranteed to never equal any real op2c value
+    -- (those are all in 1..MAX_OP after shuffling). Use a random large offset.
+    local decoyVal = MAX_OP + 1000 + math.random(1, 900000)
+    local pattern = math.random(1,4)
+    local decoyLines = {}
+    local vTmp1, vTmp2, vTmp3 = V(), V(), V()
+    if pattern==1 then
+      decoyLines[1] = ("    elseif %s==%s then local %s=%s;%s=%s+%s"):format(
+        vOP, ne(decoyVal), vTmp1, top_expr(), vPC, vPC, ne(math.random(1,9)))
+    elseif pattern==2 then
+      decoyLines[1] = ("    elseif %s==%s then"):format(vOP, ne(decoyVal))
+      decoyLines[2] = ("      local %s={}"):format(vTmp1)
+      decoyLines[3] = ("      for %s=1,%s do %s[%s]=%s end"):format(vTmp2, ne(math.random(1,5)), vTmp1, vTmp2, ne(math.random(0,999)))
+      decoyLines[4] = ("      %s=#%s"):format(vTmp3, vTmp1)
+    elseif pattern==3 then
+      decoyLines[1] = ("    elseif %s==%s then local %s=%s;local %s=%s;if %s then %s=%s+%s end"):format(
+        vOP, ne(decoyVal), vTmp1, pop_expr(), vTmp2, pop_expr(), vTmp1, vPC, vPC, ne(math.random(1,20)))
+    else
+      decoyLines[1] = ("    elseif %s==%s then"):format(vOP, ne(decoyVal))
+      decoyLines[2] = ("      local %s=%s"):format(vTmp1, ne(math.random(0,255)))
+      decoyLines[3] = ("      local %s=%s"):format(vTmp2, ne(math.random(0,255)))
+      decoyLines[4] = ("      %s=(%s+%s)%%%s"):format(vTmp3, vTmp1, vTmp2, ne(math.random(2,9)))
+    end
+    blocks[#blocks+1] = decoyLines
+  end
 
   -- Fisher-Yates shuffle of the block order
   for i=#blocks,2,-1 do
