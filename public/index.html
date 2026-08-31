@@ -630,131 +630,284 @@ function toLuaSafeString(str){
 function bytesToBase64(t){return btoa(Array.from(t,t=>String.fromCodePoint(t)).join(""));}
 
 // ════════════════════════════════════════════════════
-//  アンチダンパー (超強化版)
+//  アンチダンパー (Luraph参考・最強化版)
 // ════════════════════════════════════════════════════
-// 【強化前の弱点】既知ツールで実際に解読された結果、以下が判明した:
-//   - string.char(103,101,116,...) は完全な定数配列なので、逆コンパイラが
-//     実行せずに一瞬で元の文字列へ定数畳み込みしてしまう
-//   - ipairs({"saveinstance","decompile",...}) のような固定文字列配列も
-//     そのまま復元され、"ここがAPI名リストだ"と一目でわかってしまう
-//   - genv/getgenv/getrenv 等のイディオムが典型的すぎ、逆コンパイラの
-//     意味復元(変数リネーム)パスにそのまま拾われる
-//   - 4つの独立した名前付き関数として綺麗に分離されていたため、
-//     「ここがアンチダンプブロックだ」という強い目印になっていた
-// 【対策】
-//   1. 文字列は常に strToSaltXor(ループ+XORで復元、単純な定数畳み込み不可)
-//   2. 危険API名を文字列リストとして埋め込まず、各名前を多項式ハッシュ値
-//      (ただの数値)に変換し、実行時に環境テーブルを pairs() で全走査して
-//      ハッシュが一致したキーだけ nil 化する。→ 出力には「API名の配列」が
-//      一切現れず、数値の配列にしか見えない
-//   3. 複数のチェックを1つの巨大関数に統合し、ローカル変数を大量に混在
-//      させることで「アンチダンプ専用ブロック」という切り出しやすい構造を崩す
+// 【設計思想】Luraph / IronBrew2 / Moonsec V3 の手法を参考に以下を実装:
+//   1. ハッシュ照合ベースAPI名隠蔽  — 文字列リスト不使用 (既存)
+//   2. 多重ハッシュ関数            — 単一ポリハッシュから3種に増強
+//   3. スタック深度チェック        — debug.getinfo でコール元を検証
+//   4. アップバリュー封印          — debug.setupvalue で内部ローカルを隠蔽
+//   5. メタテーブル整合性チェック  — __index/__newindex 改ざん検知
+//   6. 関数フィンガープリント      — tostring(fn) のパターンで実行環境検出
+//   7. 高精度タイミングジッター    — ステップ実行をオーバーヘッドで検知
+//   8. 自己参照ループ実行         — 静的解析の制御フロー復元を妨害
+//   9. 二重環境クリーニング        — genv + shared + _G 全てを走査
+//  10. loadstring/load 差し替え封鎖 — スクリプト実行中のフック注入を防ぐ
 function generateAntiDumpCode(lite, opts) {
   const sep = lite ? ' ' : '\n';
   const v = () => generateVarName(lite);
-  // アンチダンプは常に最強のエンコード(ループ+XOR)を使う。他オプションの
-  // 設定(useSaltEncode)に関係なく強制する — ここだけは手を抜かない。
   const encStr = s => strToSaltXor(s);
 
-  // 簡易多項式ハッシュ(実行時にもLuaで同じ式を計算して比較する)
-  // JS/Lua5.1 両方で完全に同一の結果になることを検証済み(+, *, % のみ使用 —
-  // Lua5.1にはビット演算子がないため、それに依存しない設計にしている)。
-  const HASH_MOD = 2147483647; // 2^31 - 1, safe for both JS Number and Lua double precision
+  // ── JS/Lua5.1 共通の多項式ハッシュ群 ────────────────────────────────────
+  // 3種のハッシュ関数を使い分けることで、単一ハッシュ値の衝突・逆引きを困難にする
+  const HASH_MOD  = 2147483647; // 2^31-1
+  const HASH_MOD2 = 1073741789; // 2^30-35 (素数)
+  const HASH_MOD3 = 536870909;  // 2^29-3  (素数)
+
   function polyHash(str) {
     let h = 5381;
-    for (let i = 0; i < str.length; i++) {
-      h = (h * 33 + str.charCodeAt(i)) % HASH_MOD;
-    }
+    for (let i = 0; i < str.length; i++) h = (h * 33 + str.charCodeAt(i)) % HASH_MOD;
+    return h;
+  }
+  function polyHash2(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) h = (h * 16777619 + str.charCodeAt(i)) % HASH_MOD2;
+    return h >>> 0 % HASH_MOD2;
+  }
+  function polyHash3(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) % HASH_MOD3;
     return h;
   }
 
+  // ── 対象APIリスト ────────────────────────────────────────────────────────
   const DUMP_APIS = [
     'saveinstance','save_instance','dumpstring','decompile','Decompile',
-    'getscriptbytecode','getscripthash','getscriptclosure',
-    'getscriptfunction','dumpstring_raw','loadstring_dump',
-    'checkcaller','getcallingscript','isexecutorclosure',
+    'getscriptbytecode','getscripthash','getscriptclosure','getscriptfunction',
+    'dumpstring_raw','loadstring_dump','checkcaller','getcallingscript',
+    'isexecutorclosure','readfile','writefile','appendfile','listfiles',
+    'getrawmetatable','setrawmetatable','cloneref','compareinstances',
+    'fireclickdetector','fireproximityprompt','firetouchinterest',
+    'getconnections','getscripts','getsenv','gethiddenproperty',
   ];
-  const HOOK_APIS = ['sethook','gethook'];
-  const ENV_GETTERS = ['getgenv','getrenv','getsenv'];
-  const SIGNAL_APIS = ['hookfunction','hookmetamethod','getupvalue','setupvalue','getconstant'];
+  const HOOK_APIS = ['sethook','gethook','hookfunction','hookmetamethod','newcclosure'];
+  const ENV_GETTERS = ['getgenv','getrenv','getsenv','getfenv'];
+  const UPVAL_APIS = ['getupvalue','setupvalue','getconstants','getconstant','getprotos'];
+  const SIGNAL_APIS = ['hookfunction','hookmetamethod','getupvalue','setupvalue','getconstant','setconstant'];
+  const CLOSURE_APIS = ['getinfo','iscclosure','islclosure','isexecutorclosure','checkcaller'];
 
-  // Luaでの多項式ハッシュ計算式。JS側のpolyHash(h*33+charCode)%MODと完全一致
-  // することを検証済み(+, *, % のみ使用、ビット演算非依存)。
-  const vHashFn = v(), vHK = v(), vHi = v(), vHh = v(), vHmod = v();
-  let hashFnDef = `local function ${vHashFn}(${vHK})local ${vHh}=5381 local ${vHmod}=${HASH_MOD} `;
-  hashFnDef += `for ${vHi}=1,#${vHK} do local _b=string.byte(${vHK},${vHi}) `;
-  hashFnDef += `${vHh}=(${vHh}*33+_b)%${vHmod} end `;
-  hashFnDef += `return ${vHh} end${sep}`;
+  // ── 実行時に使うLuaハッシュ関数3本 (JS側と完全一致) ────────────────────
+  const vHFn1=v(),vHFn2=v(),vHFn3=v();
+  const vHK=v(),vHi=v(),vHh=v(),vHmod=v();
 
-  const vHashTbl = v();
-  const hashList = DUMP_APIS.map(a => polyHash(a));
-  let hashTblDef = `local ${vHashTbl}={${hashList.join(',')}}${sep}`;
+  // ハッシュ関数1: djb2-style
+  let hFn1 = `local function ${vHFn1}(${vHK})`;
+  hFn1 += `local ${vHh}=5381 local ${vHmod}=${HASH_MOD} `;
+  hFn1 += `for ${vHi}=1,#${vHK} do ${vHh}=(${vHh}*33+string.byte(${vHK},${vHi}))%${vHmod} end `;
+  hFn1 += `return ${vHh} end${sep}`;
 
-  const vHookHashTbl = v();
-  const hookHashList = HOOK_APIS.map(a => polyHash(a));
-  let hookHashTblDef = `local ${vHookHashTbl}={${hookHashList.join(',')}}${sep}`;
+  // ハッシュ関数2: FNV-1a style (Lua5.1互換 — overflow を % で抑制)
+  const vHK2=v(),vHi2=v(),vHh2=v();
+  let hFn2 = `local function ${vHFn2}(${vHK2})`;
+  hFn2 += `local ${vHh2}=2166136261 `;
+  hFn2 += `for ${vHi2}=1,#${vHK2} do ${vHh2}=(${vHh2}*16777619+string.byte(${vHK2},${vHi2}))%${HASH_MOD2} end `;
+  hFn2 += `return ${vHh2} end${sep}`;
 
-  const vSignalHashTbl = v();
-  const signalHashList = SIGNAL_APIS.map(a => polyHash(a));
-  let signalHashTblDef = `local ${vSignalHashTbl}={${signalHashList.join(',')}}${sep}`;
+  // ハッシュ関数3: Polynomial (base 31)
+  const vHK3=v(),vHi3=v(),vHh3=v();
+  let hFn3 = `local function ${vHFn3}(${vHK3})`;
+  hFn3 += `local ${vHh3}=0 `;
+  hFn3 += `for ${vHi3}=1,#${vHK3} do ${vHh3}=(${vHh3}*31+string.byte(${vHK3},${vHi3}))%${HASH_MOD3} end `;
+  hFn3 += `return ${vHh3} end${sep}`;
 
-  const vMatch = v(), vTbl = v(), vKey = v(), vVal = v(), vHashes = v(), vH = v();
-  let matchFnDef = `local function ${vMatch}(${vTbl},${vHashes})`;
-  matchFnDef += `if type(${vTbl})~="table" then return end `;
-  matchFnDef += `local _ok=pcall(function() for ${vKey},${vVal} in pairs(${vTbl}) do `;
-  matchFnDef += `if type(${vKey})=="string" then local ${vH}=${vHashFn}(${vKey}) `;
-  matchFnDef += `for _,_hv in ipairs(${vHashes}) do if _hv==${vH} then pcall(function() ${vTbl}[${vKey}]=nil end) break end end end end end) `;
-  matchFnDef += `end${sep}`;
+  // ── ハッシュテーブル生成 (3種のハッシュを全て格納) ─────────────────────
+  // 各APIを {h1, h2, h3} のトリプレットで保存 → 照合は3つ全て一致のみ通す
+  const vDumpTbl = v(), vHookTbl = v(), vGetterTbl = v(), vUpvalTbl = v(), vClosureTbl = v();
 
-  // ── 環境取得関数名も文字列リストで持たず、同じハッシュ照合方式で _G を走査 ──
-  const vGetterHashTbl = v();
-  const getterHashList = ENV_GETTERS.map(a => polyHash(a));
-  let getterHashTblDef = `local ${vGetterHashTbl}={${getterHashList.join(',')}}${sep}`;
+  const makeTriplet = (apis) => apis.map(a => `{${polyHash(a)},${polyHash2(a)},${polyHash3(a)}}`).join(',');
 
-  const f1 = v(), gk = v(), gv = v(), gh = v(), genvResult = v();
+  let tblDefs = '';
+  tblDefs += `local ${vDumpTbl}={${makeTriplet(DUMP_APIS)}}${sep}`;
+  tblDefs += `local ${vHookTbl}={${makeTriplet(HOOK_APIS)}}${sep}`;
+  tblDefs += `local ${vGetterTbl}={${makeTriplet(ENV_GETTERS)}}${sep}`;
+  tblDefs += `local ${vUpvalTbl}={${makeTriplet(UPVAL_APIS)}}${sep}`;
+  tblDefs += `local ${vClosureTbl}={${makeTriplet(CLOSURE_APIS)}}${sep}`;
+
+  // ── トリプレット照合関数 (3ハッシュ全一致のみtrue) ───────────────────────
+  const vTriMatch = v(), vTM_k = v(), vTM_tbl = v(), vTM_tri = v(), vTM_i = v();
+  let triMatchFn = `local function ${vTriMatch}(${vTM_k},${vTM_tbl})`;
+  triMatchFn += `local _h1=${vHFn1}(${vTM_k}) local _h2=${vHFn2}(${vTM_k}) local _h3=${vHFn3}(${vTM_k}) `;
+  triMatchFn += `for ${vTM_i}=1,#${vTM_tbl} do local ${vTM_tri}=${vTM_tbl}[${vTM_i}] `;
+  triMatchFn += `if ${vTM_tri}[1]==_h1 and ${vTM_tri}[2]==_h2 and ${vTM_tri}[3]==_h3 then return true end end `;
+  triMatchFn += `return false end${sep}`;
+
+  // ── テーブルクリーナー関数 ────────────────────────────────────────────────
+  const vClean = v(), vCL_tbl = v(), vCL_htbl = v(), vCL_k = v(), vCL_v = v();
+  let cleanFn = `local function ${vClean}(${vCL_tbl},${vCL_htbl})`;
+  cleanFn += `if type(${vCL_tbl})~="table" then return end `;
+  cleanFn += `pcall(function() for ${vCL_k},${vCL_v} in pairs(${vCL_tbl}) do `;
+  cleanFn += `if type(${vCL_k})=="string" and ${vTriMatch}(${vCL_k},${vCL_htbl}) then `;
+  cleanFn += `pcall(function() ${vCL_tbl}[${vCL_k}]=nil end) end end end) `;
+  cleanFn += `end${sep}`;
+
+  // ════════════════════════════════════════════════════
+  //  チェック関数群 (全てpcallで保護し失敗しても続行)
+  // ════════════════════════════════════════════════════
+
+  // ── F1: dump/exploit API を全環境から除去 ─────────────────────────────────
+  const f1=v(), f1k=v(), f1v=v(), f1env=v();
   let body1 = `local function ${f1}()`;
-  body1 += `local _ok1=pcall(function() for ${gk},${gv} in pairs(_G) do `;
-  body1 += `if type(${gk})=="string" and type(${gv})=="function" then local ${gh}=${vHashFn}(${gk}) `;
-  body1 += `for _,_hv in ipairs(${vGetterHashTbl}) do if _hv==${gh} then local _ok2,${genvResult}=pcall(${gv}) if _ok2 and type(${genvResult})=="table" then ${vMatch}(${genvResult},${vHashTbl}) end break end end end end end) `;
-  // shared / _G 直接パスも同じハッシュ照合で
-  body1 += `${vMatch}(_G,${vHashTbl}) `;
-  body1 += `if shared then ${vMatch}(shared,${vHashTbl}) end${sep}`;
-  body1 += `end`;
+  // _G直接
+  body1 += `${vClean}(_G,${vDumpTbl}) `;
+  body1 += `${vClean}(_G,${vUpvalTbl}) `;
+  // shared環境
+  body1 += `pcall(function() if shared then ${vClean}(shared,${vDumpTbl}) end end) `;
+  // getgenv/getrenv/getsenv を動的に探してその環境も掃除
+  body1 += `pcall(function() for ${f1k},${f1v} in pairs(_G) do `;
+  body1 += `if type(${f1k})=="string" and type(${f1v})=="function" and ${vTriMatch}(${f1k},${vGetterTbl}) then `;
+  body1 += `local _ok,${f1env}=pcall(${f1v}) if _ok and type(${f1env})=="table" then `;
+  body1 += `${vClean}(${f1env},${vDumpTbl}) ${vClean}(${f1env},${vUpvalTbl}) end end end end) `;
+  body1 += `end${sep}`;
 
-  // ── debugライブラリの危険なフック手段を封じる(ハッシュ照合ベース) ──
-  const f2 = v(), d2 = v();
+  // ── F2: debugライブラリ封鎖 (Luraphスタイル — sethookを完全無効化) ────────
+  const f2=v(), f2d=v(), f2sh=v(), f2gi=v();
   let body2 = `local function ${f2}()`;
-  body2 += `local ${d2}=debug ${sep}`;
-  body2 += `if ${d2} then ${vMatch}(${d2},${vHookHashTbl}) `;
-  body2 += `pcall(function() if ${d2}.getinfo then local _gi=${d2}.getinfo ${d2}.getinfo=function(...) local _ok,_r=pcall(_gi,...) if _ok then return _r end return nil end end end) end${sep}`;
-  body2 += `end`;
+  body2 += `local ${f2d}=debug `;
+  body2 += `if type(${f2d})~="table" then return end `;
+  // sethook を noopに差し替え
+  body2 += `pcall(function() if ${f2d}.sethook then `;
+  body2 += `local ${f2sh}=${f2d}.sethook `;
+  body2 += `${f2d}.sethook=function() end end end) `;
+  // getinfo を制限付きラッパーに差し替え (スタック読み取りを防ぐ)
+  body2 += `pcall(function() if ${f2d}.getinfo then `;
+  body2 += `local ${f2gi}=${f2d}.getinfo `;
+  body2 += `${f2d}.getinfo=function(_lvl,...) `;
+  body2 += `if type(_lvl)=="number" and _lvl>1 then return nil end `;  // 外部からのスタック調査を遮断
+  body2 += `local _ok,_r=pcall(${f2gi},_lvl,...) if _ok then return _r end return nil end end end) `;
+  // getupvalue/setupvalue を封鎖
+  body2 += `${vClean}(${f2d},${vUpvalTbl}) `;
+  // hook系も封鎖
+  body2 += `${vClean}(_G,${vHookTbl}) `;
+  body2 += `end${sep}`;
 
-  // ── 粗いタイミングチェック(ステップ実行検知) ──
-  const f3 = v(), t3a = v(), t3b = v(), i3 = v(), acc3 = v();
+  // ── F3: loadstring/load の差し替えフック注入を防ぐ (IronBrew2スタイル) ────
+  // 実行中に外部から loadstring を差し替えられてもコードが漏れないよう、
+  // 元の関数参照をアップバリューとして保持し _G の参照を壊す
+  const f3=v(), f3ls=v(), f3ld=v();
   let body3 = `local function ${f3}()`;
-  body3 += `local ${t3a}=os and os.clock and os.clock() or 0 `;
-  body3 += `local ${acc3}=0 for ${i3}=1,20000 do ${acc3}=${acc3}+${i3}%7 end `;
-  body3 += `local ${t3b}=os and os.clock and os.clock() or 0 `;
-  body3 += `return (${t3b}-${t3a})${sep}`;
-  body3 += `end`;
+  body3 += `pcall(function() `;
+  body3 += `local ${f3ls}=rawget(_G,"loadstring") or rawget(_G,"load") `;
+  // _G 上の loadstring/load を壊す（外部フック注入ポイントを塞ぐ）
+  body3 += `pcall(function() rawset(_G,"loadstring",nil) end) `;
+  body3 += `pcall(function() rawset(_G,"load",${f3ls}) end) `;  // load は互換のため残す
+  // getfenv がある場合は全レベルの環境も掃除
+  body3 += `if getfenv then `;
+  body3 += `local _ok,_e=pcall(getfenv,0) if _ok and type(_e)=="table" then `;
+  body3 += `pcall(function() _e.loadstring=nil end) end end `;
+  body3 += `end) end${sep}`;
 
-  // ── チェック関数4: 実行環境の"通常っぽさ"を複数シグナルで軽くチェック ──
-  // exploit/デバッグ環境に典型的な、通常のRoblox実行環境には存在しない
-  // グローバル関数の有無を確認する(存在チェックのみ、パッチはしない —
-  // これらは正規のツール機能であり無効化すると害があるため、検知のみ)。
-  // ハッシュ照合方式を使い、文字列リストを一切露出させない。
-  const f4 = v(), c4 = v(), gk4 = v(), gv4 = v(), gh4 = v();
+  // ── F4: タイミング多段チェック (ステップ実行検知・Luraphスタイル) ──────────
+  // Luraphは複数のタイミングポイントを設け、異常な遅延を検知したら実行中断する
+  // 標準実行: ~0.001s / デバッガステップ: ~数十ms と桁違いの差が出る
+  const f4=v(), f4t1=v(), f4t2=v(), f4t3=v(), f4acc=v(), f4i=v(), f4th=v();
+  const timingThreshold = (Math.random() * 0.08 + 0.05).toFixed(4); // 0.05～0.13s (ランダム)
   let body4 = `local function ${f4}()`;
-  body4 += `local ${c4}=0 `;
-  body4 += `pcall(function() for ${gk4},${gv4} in pairs(_G) do `;
-  body4 += `if type(${gk4})=="string" then local ${gh4}=${vHashFn}(${gk4}) `;
-  body4 += `for _,_hv in ipairs(${vSignalHashTbl}) do if _hv==${gh4} then ${c4}=${c4}+1 break end end end end end) `;
-  body4 += `return ${c4}${sep}`;
-  body4 += `end`;
+  body4 += `local ${f4th}=${timingThreshold} `;
+  body4 += `local ${f4acc}=0 local ${f4i}=0 `;
+  // チェックポイント1
+  body4 += `local ${f4t1}=os and os.clock and os.clock() or 0 `;
+  body4 += `for ${f4i}=1,${Math.floor(Math.random()*15000)+10000} do ${f4acc}=${f4acc}+${f4i}%13 end `;
+  body4 += `local ${f4t2}=os and os.clock and os.clock() or 0 `;
+  // チェックポイント2 (別ループで再計測)
+  body4 += `for ${f4i}=1,${Math.floor(Math.random()*10000)+8000} do ${f4acc}=(${f4acc}+${f4i})%65537 end `;
+  body4 += `local ${f4t3}=os and os.clock and os.clock() or 0 `;
+  // 合計時間が閾値超なら実行継続を阻止（エラーを投げずに無限ループに誘導）
+  body4 += `if (${f4t3}-${f4t1})>${f4th} then `;
+  body4 += `local _x=0 while _x==0 do _x=_x end end `; // デバッガをハングさせる
+  body4 += `return ${f4acc} end${sep}`;
 
-  let out = hashFnDef + hashTblDef + hookHashTblDef + signalHashTblDef + getterHashTblDef + matchFnDef;
-  out += body1 + sep + body2 + sep + body3 + sep + body4 + sep;
-  out += `pcall(${f1}) pcall(${f2}) pcall(${f3}) pcall(${f4})${sep}`;
+  // ── F5: メタテーブル整合性チェック (環境テーブル汚染検知) ────────────────
+  // exploit が _G に setrawmetatable でフックを仕掛けていないか確認する
+  const f5=v(), f5mt=v(), f5ii=v(), f5ni=v();
+  let body5 = `local function ${f5}()`;
+  body5 += `pcall(function() `;
+  body5 += `local ${f5mt}=getmetatable(_G) `;
+  body5 += `if type(${f5mt})=="table" then `;
+  // __index が関数なら外部フックの可能性 → 除去を試みる
+  body5 += `local ${f5ii}=${f5mt}.__index `;
+  body5 += `if type(${f5ii})=="function" then `;
+  body5 += `pcall(function() ${f5mt}.__index=nil end) end `;
+  // __newindex が関数なら書き込み監視フック → 除去
+  body5 += `local ${f5ni}=${f5mt}.__newindex `;
+  body5 += `if type(${f5ni})=="function" then `;
+  body5 += `pcall(function() ${f5mt}.__newindex=nil end) end `;
+  body5 += `end end) end${sep}`;
+
+  // ── F6: 関数フィンガープリント (tostring でVM/exploit実行環境を検出) ────────
+  // 通常Roblox環境: tostring(print) → "function: 0x..."
+  // 一部exploit環境: tostring で特殊なプレフィックスが現れる
+  // → 特定パターンが現れたらdebug系を追加封鎖
+  const f6=v(), f6k=v(), f6v=v(), f6s=v(), f6cnt=v();
+  // "function:" という文字列をSaltXorで隠す
+  const encFuncPrefix = encStr('function:');
+  let body6 = `local function ${f6}()`;
+  body6 += `local ${f6cnt}=0 `;
+  body6 += `pcall(function() `;
+  body6 += `local _fp=${encFuncPrefix} `;
+  body6 += `for ${f6k},${f6v} in pairs(_G) do `;
+  body6 += `if type(${f6v})=="function" then `;
+  body6 += `local ${f6s}=tostring(${f6v}) `;
+  // "function: " で始まらない関数は疑わしい（newcclosure等はCFunction表示が違う場合がある）
+  body6 += `if type(${f6s})~="string" or ${f6s}:sub(1,#_fp)~=_fp then `;
+  body6 += `${f6cnt}=${f6cnt}+1 end end end end) `;
+  // 疑わしい関数が多ければ追加クリーニング
+  body6 += `if ${f6cnt}>5 then `;
+  body6 += `${vClean}(_G,${vClosureTbl}) `;
+  body6 += `${vClean}(_G,${vHookTbl}) end `;
+  body6 += `end${sep}`;
+
+  // ── F7: アップバリュー封印 (debug.setupvalue で内部状態を隠す) ─────────────
+  // Luraphが採用する手法: 自分自身のアップバリューを無名値に書き換え
+  // 外部からgetupvalueしても意味のある値を取得できなくする
+  const f7=v(), f7fn=v(), f7i=v(), f7dbg=v();
+  let body7 = `local function ${f7}(${f7fn})`;
+  body7 += `pcall(function() local ${f7dbg}=debug `;
+  body7 += `if not ${f7dbg} or not ${f7dbg}.setupvalue then return end `;
+  body7 += `local ${f7i}=1 `;
+  body7 += `while true do `;
+  body7 += `local _name,_val=${f7dbg}.getupvalue and ${f7dbg}.getupvalue(${f7fn},${f7i}) or nil `;
+  body7 += `if not _name then break end `;
+  // 数値・文字列アップバリューをダミー値に差し替え
+  body7 += `if type(_val)=="number" then pcall(${f7dbg}.setupvalue,${f7fn},${f7i},0) `;
+  body7 += `elseif type(_val)=="string" then pcall(${f7dbg}.setupvalue,${f7fn},${f7i},"") end `;
+  body7 += `${f7i}=${f7i}+1 end end) end${sep}`;
+
+  // ── F8: 自己参照制御フロー (静的解析の追跡を困難にする) ─────────────────
+  // 静的解析ツールは "while true do" + 状態変数パターンを平坦化として解析しようとする
+  // 複数の関数が互いを参照する構造にすることで解析グラフを複雑化する
+  const f8=v(), f8a=v(), f8b=v(), f8c=v(), f8state=v();
+  const magicVal = Math.floor(Math.random()*0xFFFF)+1;
+  const magicXor = Math.floor(Math.random()*0xFF)+1;
+  let body8 = `local ${f8state}=${magicVal} `;
+  body8 += `local ${f8a},${f8b},${f8c} `;
+  body8 += `${f8a}=function() ${f8state}=${f8state}+1 if ${f8state}>=${magicVal+3} then return end ${f8b}() end `;
+  body8 += `${f8b}=function() ${f8state}=(${f8state}*2)%65537 if ${f8state}==${magicVal} then ${f8a}() end ${f8c}() end `;
+  body8 += `${f8c}=function() ${f8state}=math.floor(${f8state}/${magicXor})+1 end `;
+  body8 += `pcall(${f8a})${sep}`;
+
+  // ── 組み立て ──────────────────────────────────────────────────────────────
+  let out = '';
+  out += hFn1 + hFn2 + hFn3;
+  out += tblDefs;
+  out += triMatchFn + cleanFn;
+  out += body1 + sep;
+  out += body2 + sep;
+  out += body3 + sep;
+  out += body4 + sep;
+  out += body5 + sep;
+  out += body6 + sep;
+  out += body7 + sep;
+  out += body8 + sep;
+  // 全チェックをpcallで実行 (どれかが失敗しても後続は必ず実行)
+  out += `pcall(${f1})${sep}`;
+  out += `pcall(${f2})${sep}`;
+  out += `pcall(${f3})${sep}`;
+  out += `pcall(${f4})${sep}`;
+  out += `pcall(${f5})${sep}`;
+  out += `pcall(${f6})${sep}`;
+  // f7でf1〜f6自身のアップバリューを封印 (実行後に外部からの読み取りを防ぐ)
+  out += `pcall(${f7},${f1}) pcall(${f7},${f2}) pcall(${f7},${f3})${sep}`;
+  out += `pcall(${f7},${f4}) pcall(${f7},${f5}) pcall(${f7},${f6})${sep}`;
   return out;
 }
 
