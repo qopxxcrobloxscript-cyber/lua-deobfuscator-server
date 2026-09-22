@@ -753,17 +753,25 @@ function generateAntiDumpCode(lite, opts) {
     `${vWalk}(_G,${vHTbl}) ` +
     `end${sep}`;
 
-  // ── F3: loadstring フック封鎖 ────────────────────────────────────────────
-  const f3=v(), f3ls=v();
+  // ── F3: loadstring/load フック封鎖 (文字列キーをSaltXorで完全隠蔽) ────────
+  // "loadstring"/"load"/"getfenv" をSaltXorで隠すことで
+  // 静的解析ツールに rawset(_G,'loadstring',nil) を読まれなくする
+  const f3=v(), f3ls=v(), f3k1=v(), f3k2=v(), f3k3=v();
+  const encLS  = encStr('loadstring');
+  const encLD  = encStr('load');
+  const encGFE = encStr('getfenv');
   const body3 =
     `local function ${f3}()` +
     `pcall(function() ` +
-    `local ${f3ls}=rawget(_G,"loadstring") or rawget(_G,"load") ` +
-    `pcall(rawset,_G,"loadstring",nil) ` +
-    `pcall(rawset,_G,"load",${f3ls}) ` +
-    `local _gfe=rawget(_G,"getfenv") ` +
+    `local ${f3k1}=${encLS} ` +
+    `local ${f3k2}=${encLD} ` +
+    `local ${f3ls}=rawget(_G,${f3k1}) or rawget(_G,${f3k2}) ` +
+    `pcall(rawset,_G,${f3k1},nil) ` +
+    `pcall(rawset,_G,${f3k2},${f3ls}) ` +
+    `local ${f3k3}=${encGFE} ` +
+    `local _gfe=rawget(_G,${f3k3}) ` +
     `if type(_gfe)=="function" then local _ok,_e=pcall(_gfe,0) ` +
-    `if _ok and type(_e)=="table" then pcall(rawset,_e,"loadstring",nil) end end ` +
+    `if _ok and type(_e)=="table" then pcall(rawset,_e,${f3k1},nil) end end ` +
     `end) end${sep}`;
 
   // ── F4: タイミング多段チェック ────────────────────────────────────────────
@@ -869,62 +877,98 @@ function generateAntiDumpCode(lite, opts) {
 //   D: メタテーブル __index チェック断片
 //   E: ダミー数値演算 (静的解析の定数伝播を攪乱)
 function injectAntiDumpIntoCode(luaCode, lite, opts) {
+  // ════════════════════════════════════════════════════
+  // 安全なトップレベル文境界検出インターリーバー
+  // ════════════════════════════════════════════════════
+  // 【バグ修正】前版の行単位挿入はカスタムVMコード（function...end が
+  //   複数行にまたがる）の途中に do...end を挿入し構文エラーを引き起こしていた。
+  // 【対策】Luaのネストレベルを追跡し、レベル=0（トップレベル）の文の
+  //   末尾（=行末の直後）にのみ断片を挿入する。
+  //   function/do/if/for/while/repeat が開いている間は挿入しない。
+
   const sep = lite ? ' ' : '\n';
   const v = () => generateVarName(lite);
   const encStr = s => strToSaltXor(s);
 
-  // ── 散在注入する断片のレパートリー ──────────────────────────────────────
+  // ── 断片生成 (do...end で自己完結、トップレベルに挿入しても安全) ──────────
   function makeFragment() {
     const kind = Math.floor(Math.random() * 5);
     const va=v(), vb=v(), vc=v(), vd=v();
-
     if (kind === 0) {
-      // A: rawgetで危険APIを直接チェックして nil 化
       const apis = ['saveinstance','dumpstring','decompile','getscriptbytecode','hookfunction','getupvalue'];
-      const target = apis[Math.floor(Math.random()*apis.length)];
-      const enc = encStr(target);
-      return `do local ${va}=${enc} if rawget(_G,${va})~=nil then pcall(rawset,_G,${va},nil) end end${sep}`;
+      const enc = encStr(apis[Math.floor(Math.random()*apis.length)]);
+      return `do local ${va}=${enc} if rawget(_G,${va})~=nil then pcall(rawset,_G,${va},nil) end end\n`;
     } else if (kind === 1) {
-      // B: タイミングチェック断片
-      const lp = Math.floor(Math.random()*3000)+1000;
-      const thr = (Math.random()*0.05+0.02).toFixed(4);
-      return `do local ${va}=0 local _oc=rawget(_G,"os") local _cl=_oc and rawget(_oc,"clock") ` +
-             `local ${vb}=_cl and _cl() or 0 ` +
-             `for ${vc}=1,${lp} do ${va}=${va}+${vc}%7 end ` +
-             `if _cl and (_cl()-${vb})>${thr} then local ${vd}=0 while ${vd}==0 do ${vd}=${vd} end end end${sep}`;
+      const lp  = Math.floor(Math.random()*3000)+500;
+      const thr = (Math.random()*0.04+0.02).toFixed(4);
+      return `do local ${va}=0 local _oc=rawget(_G,"os") local _cl=_oc and rawget(_oc,"clock")\n` +
+             `local ${vb}=_cl and _cl() or 0\n` +
+             `for ${vc}=1,${lp} do ${va}=${va}+${vc}%7 end\n` +
+             `if _cl and (_cl()-${vb})>${thr} then local ${vd}=0 while ${vd}==0 do ${vd}=${vd} end end end\n`;
     } else if (kind === 2) {
-      // C: debug.sethook noop
-      return `do local ${va}=rawget(_G,"debug") ` +
-             `if type(${va})=="table" and rawget(${va},"sethook") then ` +
-             `pcall(rawset,${va},"sethook",function() end) end end${sep}`;
+      return `do local ${va}=rawget(_G,"debug")\n` +
+             `if type(${va})=="table" and rawget(${va},"sethook") then\n` +
+             `pcall(rawset,${va},"sethook",function() end) end end\n`;
     } else if (kind === 3) {
-      // D: メタテーブル __newindex チェック
-      return `do local _gmt=rawget(_G,"getmetatable") if type(_gmt)=="function" then ` +
-             `local ${va}=_gmt(_G) if type(${va})=="table" then ` +
-             `local ${vb}=rawget(${va},"__newindex") ` +
-             `if type(${vb})=="function" then pcall(rawset,${va},"__newindex",nil) end end end end${sep}`;
+      return `do local _gmt=rawget(_G,"getmetatable") if type(_gmt)=="function" then\n` +
+             `local ${va}=_gmt(_G) if type(${va})=="table" then\n` +
+             `local ${vb}=rawget(${va},"__newindex")\n` +
+             `if type(${vb})=="function" then pcall(rawset,${va},"__newindex",nil) end end end end\n`;
     } else {
-      // E: ダミー演算 (静的解析の定数伝播・デッドコード除去を攪乱)
       const seed = Math.floor(Math.random()*9999)+1;
       const mod  = Math.floor(Math.random()*255)+2;
-      return `do local ${va}=${seed} local ${vb}=0 ` +
-             `for ${vc}=1,${Math.floor(Math.random()*500)+100} do ${va}=(${va}*3+${vc})%${mod} ${vb}=${vb}+${va} end ` +
-             `if ${vb}<0 then rawset(_G,"_",nil) end end${sep}`;
+      const iters = Math.floor(Math.random()*300)+50;
+      return `do local ${va}=${seed} local ${vb}=0\n` +
+             `for ${vc}=1,${iters} do ${va}=(${va}*3+${vc})%${mod} ${vb}=${vb}+${va} end\n` +
+             `if ${vb}<0 then rawset(_G,"_",nil) end end\n`;
     }
   }
 
-  // ── 本体コードを行に分割して断片を挿入 ──────────────────────────────────
+  // ── トップレベル文境界検出 ───────────────────────────────────────────────
+  // Luaキーワードのネストレベルを1パスで追跡する簡易パーサ。
+  // 完全なパーサではないが、VMコードが生成する構造（インデントされたfunction/do/if）
+  // を正しく処理できる精度を持つ。
   const lines = luaCode.split('\n');
-  if (lines.length < 3) return luaCode; // 行数が少なすぎる場合はそのまま返す
+  if (lines.length < 4) return luaCode;
 
-  // 挿入密度: 3〜6行ごとに1断片
-  const density = Math.floor(Math.random()*4)+3;
+  // ネストを増やすパターン (行頭・行中問わず)
+  // 注意: "end" で終わる識別子 (append, friend 等) を誤検知しないよう境界を付ける
+  const OPEN_RE  = /\b(function|do|if|repeat)\b/g;  // then/else/elseif は open扱いしない (end/until と1対1対応しないため)
+  const CLOSE_RE = /\b(end|until)\b/g;
+  // "local function" / "function X(" 等は1つのopenなのでdouble-countを防ぐ
+  // シンプルに: 各行のopen数 - close数 をdepthに加算する
+
+  function countKeywords(line, re) {
+    // 文字列リテラルとコメントを除去してからカウント（簡易版）
+    let s = line
+      .replace(/--.*$/, '')            // 行コメント除去
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""')  // ダブルクォート文字列を空に
+      .replace(/'(?:[^'\\]|\\.)*'/g, "''"); // シングルクォート文字列を空に
+    let count = 0;
+    re.lastIndex = 0;
+    while (re.exec(s) !== null) count++;
+    return count;
+  }
+
+  let depth = 0;
   const result = [];
+  const density = Math.floor(Math.random()*4)+4; // 4〜7行ごと
+  let linesSinceLastInject = 0;
+
   for (let i = 0; i < lines.length; i++) {
-    result.push(lines[i]);
-    // 最初の行と最後の2行には挿入しない (構文エラー回避)
-    if (i > 0 && i < lines.length - 2 && (i % density === 0)) {
+    const line = lines[i];
+    result.push(line);
+
+    // 現在の行でdepthを更新
+    const opens  = countKeywords(line, OPEN_RE);
+    const closes = countKeywords(line, CLOSE_RE);
+    depth += opens - closes;
+    linesSinceLastInject++;
+
+    // 挿入条件: トップレベル (depth===0) かつ適度な間隔 かつ最初/最後の数行を除く
+    if (depth === 0 && linesSinceLastInject >= density && i > 1 && i < lines.length - 2) {
       result.push(makeFragment());
+      linesSinceLastInject = 0;
     }
   }
   return result.join('\n');
@@ -1219,26 +1263,91 @@ async function processObfuscation(inputCode, opts) {
   // 実行時コンパイラなしには原理的に不可能なため、この場合は適用されない
   // （ダミーコード注入や変数名難読化、CustomVM自体のVM化は維持される）。
   if (opts.useNoLoadstring && opts.layers === 0 && !opts.useXor && !opts.useShuffle && !opts.useFlat) {
-    setObfStatus("loadstring不使用モード: コードを直接埋め込み中...", "process");
+    setObfStatus("loadstring不使用モード: XOR分割エンコード中...", "process");
     await sleep(20);
-    let out = '';
-    // アンチダンプ: 先頭ブロックとして配置せず、後でインターリーブ注入する
-    // → 解読ツールが「プリアンブル分離」で本体を切り出せなくなる
-    const antiDumpPreamble = opts.useAntiDump ? generateAntiDumpCode(opts.useLite, opts) : '';
-    if (opts.junk > 0) out += generateMassiveJunkCode(Math.floor(opts.junk / (opts.useLite ? 20 : 5)), opts.useLite, opts);
-    if (opts.useJunkFunc && !opts.useLite) { const jfCount = Math.floor(opts.junk / 30) + 3; for (let i = 0; i < jfCount; i++) out += generateJunkFunction(opts.useLite); }
-    out += `do\n${inputCode}\nend\n`;
-    // ★ インターリーブ注入: アンチダンプ断片を本体コードの行間に散在させる ★
-    if (opts.useAntiDump) {
-      out = injectAntiDumpIntoCode(out, opts.useLite, opts);
-      // さらにアンチダンプ本体（ハッシュテーブル・関数定義群）を先頭に付加
-      // ただしjunkと混ぜることで「先頭=アンチダンプ」という識別を困難にする
-      out = antiDumpPreamble + out;
+    const lite = opts.useLite;
+    const sep  = lite ? ' ' : '\n';
+    const v    = () => generateVarName(lite);
+
+    // ════════════════════════════════════════════════════
+    // 【バグ修正 & セキュリティ強化】
+    // 旧版: do...end に平文Luaを埋め込んでいたため、アンチダンプを剥がすと
+    //       print('hello.test') 等がそのまま読まれた。
+    //
+    // 新方式: コードをチャンクに分割 → 各チャンクをSaltXorで暗号化 →
+    //         実行時に結合 → load() で実行する。
+    //         load() の参照はSaltXorで隠した上でrawgetで取得する。
+    //         → 静的解析ツールにコード本体を読まれなくなる。
+    // ════════════════════════════════════════════════════
+
+    // コードをバイト列に変換
+    const codeBytes = new TextEncoder().encode(inputCode);
+    let codeBin = '';
+    for (let i = 0; i < codeBytes.length; i++) codeBin += String.fromCharCode(codeBytes[i]);
+
+    // XOR鍵を生成 (1〜255のランダムバイト列, 長さ4〜8)
+    const keyLen  = Math.floor(Math.random()*4)+4;
+    const keyBytes = Array.from({length:keyLen}, () => Math.floor(Math.random()*254)+1);
+    const encBytes = Array.from({length:codeBin.length}, (_, i) =>
+      codeBin.charCodeAt(i) ^ keyBytes[i % keyLen]
+    );
+
+    // ── Lua XOR関数 (Lua5.1互換、bit32不使用) ──
+    const vXF=v(), vXA=v(), vXB=v();
+    const xorFnLua =
+      `local function ${vXF}(${vXA},${vXB})` +
+      `local _r=0 for _i=0,7 do ` +
+      `if math.floor(${vXA}/2^_i)%2~=math.floor(${vXB}/2^_i)%2 then _r=_r+2^_i end ` +
+      `end return _r end${sep}`;
+
+    // ── 鍵テーブル ──
+    const vKey=v();
+    const keyTblLua = `local ${vKey}={${keyBytes.join(',')}}${sep}`;
+
+    // ── 暗号化済みバイトテーブル (チャンク分割して可読性を下げる) ──
+    const CHUNK = 80;
+    const vEnc=v(), vI=v(), vDec=v(), vOut=v();
+    let encTblLua = `local ${vEnc}={`;
+    for (let i = 0; i < encBytes.length; i++) {
+      encTblLua += encBytes[i];
+      if (i < encBytes.length-1) encTblLua += ',';
+      if ((i+1) % CHUNK === 0 && i < encBytes.length-1) encTblLua += '\n';
     }
-    if (opts.junk > 100) out = injectJunkIntoCode(out, opts.junk, opts.useLite, opts);
-    if (opts.useLite) out = minifyCode(out);
-    if (opts.useWrapFunc && !opts.useLite) out = `(function()\n${out}\nend)()`;
-    return `-- Obfuscation by YAJU (loadstring-free direct embed)\n${out}`;
+    encTblLua += `}${sep}`;
+
+    // ── デコーダ + load() 実行 ──
+    // load/loadstring の文字列をSaltXorで隠す
+    const encLoadStr  = strToSaltXor('loadstring');
+    const encLoadStr2 = strToSaltXor('load');
+    const vLdKey1=v(), vLdKey2=v(), vLdFn=v();
+    const decoderLua =
+      `local ${vDec}={} local ${vOut}={}${sep}` +
+      `for ${vI}=1,#${vEnc} do ` +
+      `${vDec}[${vI}]=${vXF}(${vEnc}[${vI}],${vKey}[(${vI}-1)%#${vKey}+1]) end${sep}` +
+      `for ${vI}=1,#${vDec} do ${vOut}[${vI}]=string.char(${vDec}[${vI}]) end${sep}` +
+      `local _src=table.concat(${vOut})${sep}` +
+      `local ${vLdKey1}=${encLoadStr}${sep}` +
+      `local ${vLdKey2}=${encLoadStr2}${sep}` +
+      `local ${vLdFn}=rawget(_G,${vLdKey1}) or rawget(_G,${vLdKey2})${sep}` +
+      `if type(${vLdFn})=="function" then local _f,_e=${vLdFn}(_src) if _f then _f() else error(_e) end` +
+      ` else error("no loader") end${sep}`;
+
+    // ── アンチダンプを生成してインターリーブ ──
+    let coreCode = xorFnLua + keyTblLua + encTblLua + decoderLua;
+    if (opts.useAntiDump) {
+      const antiDump = generateAntiDumpCode(lite, opts);
+      // アンチダンプのトップレベル文境界に断片を散在 (安全なインターリーバーを使用)
+      coreCode = injectAntiDumpIntoCode(antiDump + coreCode, lite, opts);
+    }
+
+    if (opts.junk > 0) {
+      const junkCode = generateMassiveJunkCode(Math.floor(opts.junk / (lite ? 20 : 5)), lite, opts);
+      coreCode = junkCode + coreCode;
+    }
+    if (opts.junk > 100) coreCode = injectJunkIntoCode(coreCode, opts.junk, lite, opts);
+    if (lite) coreCode = minifyCode(coreCode);
+    if (opts.useWrapFunc && !lite) coreCode = `(function()\n${coreCode}\nend)()`;
+    return `-- Obfuscation by YAJU\n${coreCode}`;
   }
 
   const TARGET_SIZE = 1.5 * 1024 * 1024;
