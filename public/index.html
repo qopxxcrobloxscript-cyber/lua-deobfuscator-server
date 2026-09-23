@@ -856,9 +856,9 @@ function generateAntiDumpCode(lite, opts) {
   let out = luaHashes + luaTbls + luaMatch + luaWalk;
   out += body1 + body2 + body3 + body4 + body5 + body6 + body7;
   out += body8;
-  out += `pcall(${f1}) pcall(${f2}) pcall(${f3}) pcall(${f4}) pcall(${f5}) pcall(${f6})${sep}`;
-  out += `pcall(${f7},${f1}) pcall(${f7},${f2}) pcall(${f7},${f3})${sep}`;
-  out += `pcall(${f7},${f4}) pcall(${f7},${f5}) pcall(${f7},${f6})${sep}`;
+  out += `pcall(${f1});pcall(${f2});pcall(${f3});pcall(${f4});pcall(${f5});pcall(${f6})${sep}`;
+  out += `pcall(${f7},${f1});pcall(${f7},${f2});pcall(${f7},${f3})${sep}`;
+  out += `pcall(${f7},${f4});pcall(${f7},${f5});pcall(${f7},${f6})${sep}`;
   return out;
 }
 
