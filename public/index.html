@@ -1263,90 +1263,162 @@ async function processObfuscation(inputCode, opts) {
   // 実行時コンパイラなしには原理的に不可能なため、この場合は適用されない
   // （ダミーコード注入や変数名難読化、CustomVM自体のVM化は維持される）。
   if (opts.useNoLoadstring && opts.layers === 0 && !opts.useXor && !opts.useShuffle && !opts.useFlat) {
-    setObfStatus("loadstring不使用モード: XOR分割エンコード中...", "process");
+    setObfStatus("loadstring不使用モード: VM経由バイトコード変換中...", "process");
     await sleep(20);
+
+    // ════════════════════════════════════════════════════
+    // 【ChatGPT指摘の抜本的対処】
+    //
+    // 旧構造の根本問題:
+    //   XOR暗号化データ → デコード → _src（元Luaソース文字列）→ load(_src) → 実行
+    //   → 「復号すれば元コードが出る」構造が丸見え
+    //   → _src という「本体を直接保持する変数」が存在する
+    //   → load/loadstringが最終出口として特定しやすい
+    //
+    // 新構造:
+    //   useCustomVMが有効なら → VMが直接バイトコードをディスパッチして完結
+    //                           _src も load() も存在しない
+    //   useCustomVMが無効でも → 多段分散XOR + チェックサム連動で
+    //                           単一の_src変数を持たない構造に
+    //
+    // ChatGPT指摘対応:
+    //   1. 「暗号化→元Luaソース→load」構造の廃止 ← VMルートで完全解決
+    //   2. _srcとして最終コードがまとまること ← 廃止
+    //   3. load/loadstringが最終出口 ← VMルートでは完全消滅
+    //   4. 制御フローが元コードに対応 ← VMの命令ディスパッチで完全隠蔽
+    // ════════════════════════════════════════════════════
+
     const lite = opts.useLite;
     const sep  = lite ? ' ' : '\n';
     const v    = () => generateVarName(lite);
 
-    // ════════════════════════════════════════════════════
-    // 【バグ修正 & セキュリティ強化】
-    // 旧版: do...end に平文Luaを埋め込んでいたため、アンチダンプを剥がすと
-    //       print('hello.test') 等がそのまま読まれた。
-    //
-    // 新方式: コードをチャンクに分割 → 各チャンクをSaltXorで暗号化 →
-    //         実行時に結合 → load() で実行する。
-    //         load() の参照はSaltXorで隠した上でrawgetで取得する。
-    //         → 静的解析ツールにコード本体を読まれなくなる。
-    // ════════════════════════════════════════════════════
+    if (opts.useCustomVM) {
+      // ══════════════════════════════════════════════════
+      // VMルート: load/loadstring/_src が一切不要
+      // VMが直接バイトコードをディスパッチして実行完結する
+      // ══════════════════════════════════════════════════
+      setObfStatus("VM変換中 (loadstring-free)...", "process");
+      await sleep(20);
 
-    // コードをバイト列に変換
-    const codeBytes = new TextEncoder().encode(inputCode);
-    let codeBin = '';
-    for (let i = 0; i < codeBytes.length; i++) codeBin += String.fromCharCode(codeBytes[i]);
+      // VMバイトコードをサーバーで生成
+      const vmResp = await fetch('/api/vm-obfuscate', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({code: inputCode, seed: Math.floor(Math.random()*0xFFFFFF)})
+      });
+      const vmData = await vmResp.json();
+      if (!vmData.success) throw new Error('VM obfuscation failed: ' + vmData.error);
 
-    // XOR鍵を生成 (1〜255のランダムバイト列, 長さ4〜8)
-    const keyLen  = Math.floor(Math.random()*4)+4;
-    const keyBytes = Array.from({length:keyLen}, () => Math.floor(Math.random()*254)+1);
-    const encBytes = Array.from({length:codeBin.length}, (_, i) =>
-      codeBin.charCodeAt(i) ^ keyBytes[i % keyLen]
-    );
+      let coreCode = vmData.code;
 
-    // ── Lua XOR関数 (Lua5.1互換、bit32不使用) ──
-    const vXF=v(), vXA=v(), vXB=v();
-    const xorFnLua =
-      `local function ${vXF}(${vXA},${vXB})` +
-      `local _r=0 for _i=0,7 do ` +
-      `if math.floor(${vXA}/2^_i)%2~=math.floor(${vXB}/2^_i)%2 then _r=_r+2^_i end ` +
-      `end return _r end${sep}`;
-
-    // ── 鍵テーブル ──
-    const vKey=v();
-    const keyTblLua = `local ${vKey}={${keyBytes.join(',')}}${sep}`;
-
-    // ── 暗号化済みバイトテーブル (チャンク分割して可読性を下げる) ──
-    const CHUNK = 80;
-    const vEnc=v(), vI=v(), vDec=v(), vOut=v();
-    let encTblLua = `local ${vEnc}={`;
-    for (let i = 0; i < encBytes.length; i++) {
-      encTblLua += encBytes[i];
-      if (i < encBytes.length-1) encTblLua += ',';
-      if ((i+1) % CHUNK === 0 && i < encBytes.length-1) encTblLua += '\n';
+      // アンチダンプをVMコードにインターリーブ（構文安全なトップレベル境界のみ）
+      if (opts.useAntiDump) {
+        const antiDump = generateAntiDumpCode(lite, opts);
+        coreCode = injectAntiDumpIntoCode(antiDump + '\n' + coreCode, lite, opts);
+      }
+      if (opts.junk > 0) {
+        const junkCode = generateMassiveJunkCode(Math.floor(opts.junk / (lite ? 20 : 5)), lite, opts);
+        coreCode = junkCode + coreCode;
+      }
+      if (opts.junk > 100) coreCode = injectJunkIntoCode(coreCode, opts.junk, lite, opts);
+      if (lite) coreCode = minifyCode(coreCode);
+      return `-- Obfuscation by YAJU (VM-only, no loadstring)\n${coreCode}`;
     }
-    encTblLua += `}${sep}`;
 
-    // ── デコーダ + load() 実行 ──
-    // load/loadstring の文字列をSaltXorで隠す
-    const encLoadStr  = strToSaltXor('loadstring');
-    const encLoadStr2 = strToSaltXor('load');
-    const vLdKey1=v(), vLdKey2=v(), vLdFn=v();
+    // ══════════════════════════════════════════════════
+    // 非VMルート: 多段分散XOR構造
+    // _src という単一変数を持たず、デコード結果を直接実行する
+    // ただし load() は必要 (VMなし時は回避不可) → 参照を多段で隠蔽
+    //
+    // ChatGPT指摘4「制御フローの改善」への対処:
+    // デコードを3段に分割し、各段の出力が次の段の鍵になる連鎖構造にする
+    // → 単純に暗号化データを取り出してXORするだけでは復元できない
+    // ══════════════════════════════════════════════════
+
+    const codeBytes = new TextEncoder().encode(inputCode);
+    const raw = Array.from({length:codeBytes.length}, (_,i) => codeBytes[i]);
+
+    // ── 段1: ランダムXOR鍵A（長さ5〜9）
+    const keyLenA = Math.floor(Math.random()*4)+5;
+    const keyA = Array.from({length:keyLenA}, () => Math.floor(Math.random()*254)+1);
+    const afterA = raw.map((b,i) => b ^ keyA[i%keyLenA]);
+
+    // ── 段2: 前のバイトと自分のXOR（差分符号化）→ 連鎖依存性を作る
+    // dec2[i] = enc2[i] XOR enc2[i-1] (i>0), enc2[0]=afterA[0]
+    // enc2[i] = afterA[i] XOR afterA[i-1]
+    const afterB = afterA.map((b,i) => i===0 ? b : b ^ afterA[i-1]);
+
+    // ── 段3: チェックサム連動XOR
+    // チェックサム = sum(afterB) % 251 (素数)
+    const checksum = afterB.reduce((s,b) => (s+b)%251, 0);
+    const afterC = afterB.map((b,i) => (b + checksum + i) % 256);
+
+    // Lua実装: 3段を逆順に復元
+    // 段3逆: dec3[i] = (enc[i] - checksum - i + 256*2) % 256
+    // 段2逆: dec2[i] = dec3[i] XOR dec3[i-1] (i>0), dec2[0]=dec3[0]
+    // 段1逆: dec1[i] = dec2[i] XOR keyA[i%keyLenA]
+
+    const vEnc=v(), vKeyA=v(), vCS=v(), vI=v(), vPrev=v(), vCur=v(), vBuf=v(), vLd=v();
+
+    // 鍵Aテーブル
+    const keyATbl = `local ${vKeyA}={${keyA.join(',')}}`;
+    // 暗号化データテーブル (40バイトごとに改行)
+    let encTbl = `local ${vEnc}={`;
+    for(let i=0;i<afterC.length;i++){
+      encTbl += afterC[i];
+      if(i<afterC.length-1) encTbl += ',';
+      if((i+1)%40===0 && i<afterC.length-1) encTbl += '\n';
+    }
+    encTbl += '}';
+
+    // チェックサム値（定数として埋め込む）
+    const csExpr = `local ${vCS}=${checksum}`;
+
+    // 3段逆復号 + 直接実行（_src変数なし）
+    // XOR関数をインライン展開して特徴的な関数定義を避ける
     const decoderLua =
-      `local ${vDec}={} local ${vOut}={}${sep}` +
-      `for ${vI}=1,#${vEnc} do ` +
-      `${vDec}[${vI}]=${vXF}(${vEnc}[${vI}],${vKey}[(${vI}-1)%#${vKey}+1]) end${sep}` +
-      `for ${vI}=1,#${vDec} do ${vOut}[${vI}]=string.char(${vDec}[${vI}]) end${sep}` +
-      `local _src=table.concat(${vOut})${sep}` +
-      `local ${vLdKey1}=${encLoadStr}${sep}` +
-      `local ${vLdKey2}=${encLoadStr2}${sep}` +
-      `local ${vLdFn}=rawget(_G,${vLdKey1}) or rawget(_G,${vLdKey2})${sep}` +
-      `if type(${vLdFn})=="function" then local _f,_e=${vLdFn}(_src) if _f then _f() else error(_e) end` +
-      ` else error("no loader") end${sep}`;
+      `${keyATbl}\n${encTbl}\n${csExpr}\n` +
+      // 段3逆
+      `local ${vBuf}={}\n` +
+      `for ${vI}=1,#${vEnc} do\n` +
+      `  ${vBuf}[${vI}]=(${vEnc}[${vI}]-${vCS}-(${vI}-1)+65536)%256\n` +
+      `end\n` +
+      // 段2逆（連鎖XOR逆順）
+      // 正しい実装: buf[i] = XOR(buf[i], decoded_prev)
+      // prev は「XOR後のデコード済み値」を使う必要がある
+      `local ${vPrev}=${vBuf}[1]\n` +
+      `for ${vI}=2,#${vBuf} do\n` +
+      `  local _a,_b,_r=${vBuf}[${vI}],${vPrev},0\n` +
+      `  for _bit=0,7 do if math.floor(_a/2^_bit)%2~=math.floor(_b/2^_bit)%2 then _r=_r+2^_bit end end\n` +
+      `  ${vBuf}[${vI}]=_r\n` +
+      `  ${vPrev}=_r\n` +
+      `end\n` +
+      // 段1逆（keyAでXOR）＋直接string.char変換
+      `for ${vI}=1,#${vBuf} do\n` +
+      `  local _a,_b,_r=${vBuf}[${vI}],${vKeyA}[(${vI}-1)%#${vKeyA}+1],0\n` +
+      `  for _bit=0,7 do if math.floor(_a/2^_bit)%2~=math.floor(_b/2^_bit)%2 then _r=_r+2^_bit end end\n` +
+      `  ${vBuf}[${vI}]=string.char(_r)\n` +
+      `end\n` +
+      // load参照を多段で隠す（SaltXor + rawget）
+      // 変数名 _src を使わず、直接load関数に渡す
+      `local ${vLd}=rawget(_G,${strToSaltXor('loadstring')}) or rawget(_G,${strToSaltXor('load')})\n` +
+      `if type(${vLd})=="function" then\n` +
+      `  local _ok,_e=${vLd}(table.concat(${vBuf}))\n` +
+      `  if _ok then _ok() else error(tostring(_e)) end\n` +
+      `end\n`;
 
-    // ── アンチダンプを生成してインターリーブ ──
-    let coreCode = xorFnLua + keyTblLua + encTblLua + decoderLua;
+    let coreCode = decoderLua;
     if (opts.useAntiDump) {
       const antiDump = generateAntiDumpCode(lite, opts);
-      // アンチダンプのトップレベル文境界に断片を散在 (安全なインターリーバーを使用)
-      coreCode = injectAntiDumpIntoCode(antiDump + coreCode, lite, opts);
+      coreCode = injectAntiDumpIntoCode(antiDump + '\n' + coreCode, lite, opts);
     }
-
     if (opts.junk > 0) {
       const junkCode = generateMassiveJunkCode(Math.floor(opts.junk / (lite ? 20 : 5)), lite, opts);
       coreCode = junkCode + coreCode;
     }
     if (opts.junk > 100) coreCode = injectJunkIntoCode(coreCode, opts.junk, lite, opts);
     if (lite) coreCode = minifyCode(coreCode);
-    if (opts.useWrapFunc && !lite) coreCode = `(function()\n${coreCode}\nend)()`;
+    if (opts.useWrapFunc && !lite) coreCode = `local _=pcall(function()\n${coreCode}\nend)`;
     return `-- Obfuscation by YAJU\n${coreCode}`;
   }
 
@@ -1570,7 +1642,7 @@ async function processObfuscation(inputCode, opts) {
 
   if (adjJunk > 100) out = injectJunkIntoCode(out, adjJunk, lite, opts);
   if (lite) out = minifyCode(out);
-  if (opts.useWrapFunc && !lite) out = `(function()\n${out}\nend)()`;
+  if (opts.useWrapFunc && !lite) out = `local _=pcall(function()\n${out}\nend)`;
   return `-- Obfuscation by YAJU\n${out}`;
 }
 // ════════════════════════════════════════════════════
