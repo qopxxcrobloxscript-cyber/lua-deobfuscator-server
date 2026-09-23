@@ -1252,6 +1252,40 @@ function utf8Encode(str) {
   for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
   return out;
 }
+// ════════════════════════════════════════════════════
+//  VM専用セキュリティレイヤー注入
+//  （load() を一切呼ばない、VMコードへの後処理のみ）
+// ════════════════════════════════════════════════════
+// VMモードではprocessObfuscation(Base64+load)を呼ばず、
+// この関数でアンチダンプ + ジャンクのみを適用する。
+// → 「VMバイトコード → load()でデコード → 実行」という
+//   構造が根本から存在しなくなる（ChatGPT指摘の核心）
+async function processVMOnlyObfuscation(vmCode, opts) {
+  const lite = opts.useLite || false;
+  const sep  = lite ? ' ' : '\n';
+
+  // アンチダンプをVMコードにインターリーブ
+  let out = vmCode;
+
+  if (opts.useAntiDump) {
+    const antiDump = generateAntiDumpCode(lite, opts);
+    // アンチダンプ本体をVMコードの前に置き、断片をインターリーブ
+    out = injectAntiDumpIntoCode(antiDump + '\n' + out, lite, opts);
+  }
+
+  // ジャンクコードを前後に散在させる（本体には影響しない）
+  if (opts.junk > 0) {
+    const junkFront = generateMassiveJunkCode(Math.floor(opts.junk / (lite ? 40 : 10)), lite, opts);
+    out = junkFront + out;
+  }
+  if (opts.junk > 100) {
+    out = injectJunkIntoCode(out, Math.floor(opts.junk / 3), lite, opts);
+  }
+
+  if (lite) out = minifyCode(out);
+  return out;
+}
+
 async function processObfuscation(inputCode, opts) {
   __usedVarNames = new Set(); // fresh per-run collision tracker for generateVarName
 
@@ -1675,45 +1709,103 @@ async function startObfuscation(){
     let result = code;
     let labelParts = [];
 
-    // ① カスタムVM難読化（元のLuaコードに対して最初に実行）
+    // ════════════════════════════════════════════════════
+    // 【ChatGPT指摘対応: VMモードのアーキテクチャ改善】
+    //
+    // 旧フロー (問題):
+    //   VM化 → processObfuscation(Base64ラップ) → load(Base64デコード結果)
+    //   → VMは load() の中で実行される = load() が最終出口として残る
+    //
+    // 新フロー (VMモード):
+    //   VM化 → アンチダンプをインターリーブ → 完了
+    //   → load() は一切呼ばれない。VMがバイトコードをディスパッチして完結。
+    //   → 「元のLuaコードがそのまま復元できる構造」が根本から存在しない
+    //
+    // 通常モード:
+    //   processObfuscation(Base64/XOR多段) → load() で実行
+    //   ← これは避けられないが多段XOR + 分散で隠蔽を維持
+    // ════════════════════════════════════════════════════
+
     if(useCustomVM){
-      setObfStatus("① カスタムVM難読化中...","process"); updateObfProgress(5);
-      const res=await fetch('/api/vm-obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:result,seed:vmSeed})});
+      // ══════════════════════════════════════════════════
+      // VMモード: load() を一切使わず完結させる
+      // processObfuscation は呼ばない（呼ぶと load() が復活するため）
+      // ══════════════════════════════════════════════════
+      setObfStatus("① カスタムVM変換中 (load()不使用)...","process"); updateObfProgress(5);
+
+      const res=await fetch('/api/vm-obfuscate',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({code:result, seed:vmSeed})
+      });
       const data=await res.json();
-      if(data.success&&data.result){
-        result=data.result;
+
+      if(!data.success || !data.result){
+        setObfStatus("⚠️ VM難読化失敗: "+(data.error||'')+"（通常モードで続行）","error");
+        await sleep(2000);
+        // VMが失敗した場合のみ通常モードにフォールバック
+        if(prometheusSteps.length>0){
+          const res2=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:result,preset:byId('obfPreset').value,steps:prometheusSteps})});
+          const d2=await res2.json();
+          if(d2.success&&d2.result){result=d2.result;labelParts.push('Prometheus');}
+        }
+        result=await processObfuscation(result,opts);
+        labelParts.push('Browser(fallback)');
+      } else {
+        result = data.result;
         labelParts.push('CustomVM');
-      }else{
-        setObfStatus("⚠️ VM難読化失敗: "+(data.error||'')+"（スキップして続行）","error");
-        await sleep(2000);
-        result = code; // 元コードで続行
+        updateObfProgress(50);
+
+        // VMコードにアンチダンプをインターリーブ（アンチダンプONの場合のみ）
+        // ここでは processObfuscation を呼ばず、アンチダンプだけを適用する
+        if(opts.useAntiDump || opts.junk > 0){
+          setObfStatus("② セキュリティレイヤー注入中...","process"); updateObfProgress(60);
+          result = await processVMOnlyObfuscation(result, opts);
+          labelParts.push('SecLayer');
+        }
+
+        updateObfProgress(90);
+        setObfStatus("✓ VM難読化完了","success");
       }
-    }
 
-    // ② Prometheusを実行（元コード or VM済みコードに対して）
-    if(prometheusSteps.length>0){
-      const step = useCustomVM ? "②" : "①";
-      setObfStatus(`${step} Prometheusで難読化中...`,"process"); updateObfProgress(15);
-      const preset=byId('obfPreset').value;
-      const res=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:result,preset,steps:prometheusSteps})});
-      const data=await res.json();
-      if(data.success&&data.result){
-        result=data.result;
-        labelParts.push('Prometheus');
-      }else{
-        setObfStatus("⚠️ Prometheus失敗: "+(data.error||'')+"（ブラウザ難読化のみ実行）","error");
-        await sleep(2000);
+      byId('obfOutLabel').textContent=`[ 06 ] OUTPUT (${labelParts.join(' → ')})`;
+      byId('obfOutput').value=result;
+      const sz=new Blob([result]).size;
+      const szStr=sz>=1048576?`${(sz/1048576).toFixed(2)} MB`:sz>=1024?`${(sz/1024).toFixed(2)} KB`:`${sz} bytes`;
+      setObfStatus(`✓ 完了 [VM-only, no load()] (${szStr})`,"success"); updateObfProgress(100);
+
+    } else {
+      // ══════════════════════════════════════════════════
+      // 通常モード: Prometheus → processObfuscation(Base64/XOR)
+      // ══════════════════════════════════════════════════
+
+      // Prometheusを実行
+      if(prometheusSteps.length>0){
+        setObfStatus("① Prometheusで難読化中...","process"); updateObfProgress(15);
+        const preset=byId('obfPreset').value;
+        const res=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:result,preset,steps:prometheusSteps})});
+        const data=await res.json();
+        if(data.success&&data.result){
+          result=data.result;
+          labelParts.push('Prometheus');
+        }else{
+          setObfStatus("⚠️ Prometheus失敗: "+(data.error||'')+"（ブラウザ難読化のみ実行）","error");
+          await sleep(2000);
+        }
       }
+
+      const stepLabel = labelParts.length > 0 ? `${labelParts.join('→')}→ブラウザ難読化中...` : "処理中...";
+      setObfStatus(stepLabel,"process");
+      updateObfProgress(40);
+      result=await processObfuscation(result,opts);
+      labelParts.push('Browser');
+
+      if(labelParts.length>0) byId('obfOutLabel').textContent=`[ 06 ] OUTPUT (${labelParts.join(' → ')})`;
+      byId('obfOutput').value=result;
+      const sz=new Blob([result]).size;
+      const szStr=sz>=1048576?`${(sz/1048576).toFixed(2)} MB`:sz>=1024?`${(sz/1024).toFixed(2)} KB`:`${sz} bytes`;
+      setObfStatus(`✓ 完了 (${szStr})`,"success"); updateObfProgress(100);
     }
-
-    // ③ ブラウザ側の難読化（Base64/XOR等）
-    const stepLabel = labelParts.length > 0 ? `${labelParts.join('→')}→ブラウザ難読化中...` : "処理中...";
-    setObfStatus(stepLabel,"process");
-    updateObfProgress(40);
-    result=await processObfuscation(result,opts);
-
-    if(labelParts.length>0) byId('obfOutLabel').textContent=`[ 06 ] OUTPUT (${labelParts.join(' → ')} → Browser)`;
-    byId('obfOutput').value=result;
     const sz=new Blob([result]).size;
     const szStr=sz>=1048576?`${(sz/1048576).toFixed(2)} MB`:sz>=1024?`${(sz/1024).toFixed(2)} KB`:`${sz} bytes`;
     setObfStatus(`✓ 完了 (${szStr})`,"success"); updateObfProgress(100);
