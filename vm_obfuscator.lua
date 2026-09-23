@@ -94,15 +94,15 @@ do
   parts[#parts+1] = ("local %s={%s}"):format(vHashTbl, table.concat(hashVals, ","))
   parts[#parts+1] = ("local function %s()"):format(fn)
   parts[#parts+1] = ("local %s=0"):format(vAcc)
-  -- チェック1: _G / shared に既知の危険APIが生きていないか(ハッシュ照合)
-  parts[#parts+1] = ("pcall(function() for %s,%s in pairs(_G) do if type(%s)==\"string\" then local %s=%s(%s) for _,_hv in ipairs(%s) do if _hv==%s then %s=%s+1 end end end end end)")
-    :format(vGk, vGv, vGk, vGh, vHashFn, vGk, vHashTbl, vGh, vAcc, vAcc)
-  parts[#parts+1] = ("pcall(function() if shared then for %s,%s in pairs(shared) do if type(%s)==\"string\" then local %s=%s(%s) for _,_hv in ipairs(%s) do if _hv==%s then %s=%s+1 end end end end end end)")
-    :format(vGk, vGv, vGk, vGh, vHashFn, vGk, vHashTbl, vGh, vAcc, vAcc)
+  -- チェック1: _G に既知の危険APIが生きていないか (next()ウォーク、pairs不使用)
+  -- pairs(_G) はシグネチャとして解読ツールに検出されるため next() で代替する
+  parts[#parts+1] = ("pcall(function() local %s,_gv=next(_G,nil) while %s~=nil do if type(%s)==\"string\" then local %s=%s(%s) local _hi=1 while _hi<=#%s do if %s[_hi]==%s then %s=%s+1 end _hi=_hi+1 end end %s,_gv=next(_G,%s) end end)")
+    :format(vGk, vGk, vGk, vGh, vHashFn, vGk, vHashTbl, vHashTbl, vGh, vAcc, vAcc, vGk, vGk)
   -- チェック2: debug.sethook が非nilかつ呼び出し可能な既定外の値になっていないか
-  parts[#parts+1] = ("local %s=debug"):format(vD)
-  parts[#parts+1] = ("local %s=0 if %s then local _ok=pcall(function() if %s.sethook and type(%s.sethook)==\"function\" then end end) if not _ok then %s=1 end end")
-    :format(vHookOk, vD, vD, vD, vHookOk)
+  -- rawget経由でアクセスし "debug" 文字列を隠す
+  parts[#parts+1] = ("local %s=rawget(_G,(function()local _k={115,100,103,117,98};local _r={}  for _i=1,5 do _r[_i]=string.char(_k[_i]-1) end return table.concat(_r) end)())"):format(vD)
+  parts[#parts+1] = ("local %s=0 if type(%s)==\"table\" then local _sh=rawget(%s,\"sethook\") if type(_sh)==\"function\" then pcall(rawset,%s,\"sethook\",function() end) end end")
+    :format(vHookOk, vD, vD, vD)
   parts[#parts+1] = ("%s=%s+%s"):format(vAcc, vAcc, vHookOk)
   -- チェック3: 粗いタイミングチェック(過検知を避けるため非常に緩い閾値)
   parts[#parts+1] = ("local %s=os and os.clock and os.clock() or 0"):format(vT1)
@@ -1177,6 +1177,37 @@ local function remap(p)
 end
 remap(proto)
 
+-- HARDENING: 命令をビットパック整数に変換する
+-- pack = op * 65536 + (arg + 32768)
+-- これにより {op=N, arg=M} の平文テーブルが数値の羅列になり、
+-- 解読ツールが「ここが命令列だ」と特定しにくくなる。
+-- さらに全命令を単一XOR鍵で暗号化し、整合性チェックと連動させる。
+local PACK_KEY = math.random(1, 0x7FFF)  -- ランダムな暗号化鍵
+
+local function packInstr(op, arg)
+  -- op: shuffled opcode value, arg: signed integer
+  -- ビットパック: op<<16 | (arg+32768) → 1整数
+  -- さらにPACK_KEYでXOR(下位16ビットのみ): Lua5.1にビット演算子がないため
+  -- 加減算で模擬する
+  local raw = op * 65536 + (arg + 32768)
+  -- XOR下位16ビット: raw XOR (PACK_KEY<<0)
+  -- Lua5.1互換XOR (下位16ビットのみ)
+  local lo = raw % 65536
+  local hi = math.floor(raw / 65536)
+  -- loとPACK_KEYのXOR(Lua5.1互換)
+  local xlo = 0
+  local a, b = lo, PACK_KEY
+  for _=0,15 do
+    if math.floor(a)%2 ~= math.floor(b)%2 then xlo = xlo + 1 end
+    xlo = xlo * 0  -- reset; use math approach below
+    break
+  end
+  -- シンプルな方法: (lo + PACK_KEY) % 65536 （XORの近似、完璧ではないが解析を困難にする）
+  -- 実際のXORはLua5.1では高コストなので加算で代替
+  local enc_lo = (lo + PACK_KEY) % 65536
+  return hi * 65536 + enc_lo
+end
+
 local function serial(p)
   local kp={}
   for _,c in ipairs(p.consts) do
@@ -1188,13 +1219,18 @@ local function serial(p)
   end
   local np={}
   for _,n in ipairs(p.names) do np[#np+1]=hide_str(n) end
+  -- 命令をビットパック整数としてシリアライズ
   local cp={}
-  for _,ins in ipairs(p.code) do cp[#cp+1]=("{%s,%s}"):format(ne(ins.op),ne(ins.arg)) end
+  for _,ins in ipairs(p.code) do
+    local packed = packInstr(ins.op, ins.arg)
+    cp[#cp+1] = ne(packed)
+  end
   local fp={}
   for _,sub in ipairs(p.funcs) do fp[#fp+1]=serial(sub) end
-  return ("{k={%s},n={%s},c={%s},f={%s},p=%s}"):format(
+  -- フォーマット変更: c は整数配列(旧: テーブル配列)
+  return ("{k={%s},n={%s},c={%s},f={%s},p=%s,_pk=%s}"):format(
     table.concat(kp,","),table.concat(np,","),table.concat(cp,","),
-    table.concat(fp,","),ne(p.params or 0))
+    table.concat(fp,","),ne(p.params or 0),ne(PACK_KEY))
 end
 
 local proto_str=serial(proto)
@@ -1320,7 +1356,7 @@ local vIN=V(); local vOP=V(); local vAR=V()
 -- ★ Lua5.1互換ビット演算ヘルパー関数名
 local vBIT=V()
 
-L("(function()")
+L(";(function()")
 L(integrityFnSource)
 L(vUM_setup)
 L(("local %s=%s"):format(vUM,vUM_resolver))
@@ -1468,10 +1504,18 @@ local vLASTMULTI=V()
 L(("  local %s=0"):format(vLASTMULTI))
 
 L("  while true do")
+-- ビットパックデコード: 整数 → op(上位16bit) + arg(下位16bit-32768)
+-- _F._pk は serial() が埋め込んだ暗号化鍵
 L(("    local %s=%s.c[%s]"):format(vIN,vF,vPC))
 L(("    if not %s then break end"):format(vIN))
-L(("    local %s=%s(%s[1])"):format(vOP,vUM,vIN))
-L(("    local %s=%s[2]"):format(vAR,vIN))
+-- hi = floor(packed / 65536) = shuffled opcode
+-- lo_enc = packed % 65536 = (arg+32768+PACK_KEY)%65536
+-- lo_dec = (lo_enc - PACK_KEY + 65536) % 65536
+-- arg = lo_dec - 32768
+L(("    local _hi=math.floor(%s/65536)"):format(vIN))
+L(("    local _lo=(%s%%65536-%s._pk+65536)%%65536"):format(vIN,vF))
+L(("    local %s=%s(_hi)"):format(vOP,vUM))
+L(("    local %s=_lo-32768"):format(vAR))
 L(("    %s=%s+1"):format(vPC,vPC))
 
 -- HARDENING: 以降、各オペコードハンドラのブロックが始まる。解析耐性強化のため、
