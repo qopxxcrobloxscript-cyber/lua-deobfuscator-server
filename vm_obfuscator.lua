@@ -1356,7 +1356,7 @@ local vIN=V(); local vOP=V(); local vAR=V()
 -- ★ Lua5.1互換ビット演算ヘルパー関数名
 local vBIT=V()
 
-L(";(function()")
+L("local _=pcall(function()")
 L(integrityFnSource)
 L(vUM_setup)
 L(("local %s=%s"):format(vUM,vUM_resolver))
@@ -1849,7 +1849,7 @@ L(("local %s=function()"):format(vEntry))
 L(("  %s(%s,{},_G,{})"):format(vVM,vPR))
 L("end")
 L(("%s()"):format(vEntry))
-L("end)()")
+L("end)")
 
 -- HARDENING: ディスパッチハンドラの出現順をシャッフルする。
 -- DISPATCH_BLOCK_START..DISPATCH_BLOCK_END の範囲には、各オペコードの
