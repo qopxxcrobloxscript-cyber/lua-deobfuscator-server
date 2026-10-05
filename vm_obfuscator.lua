@@ -369,7 +369,29 @@ local OP={
   SETLIST_MULTI=68,
   CALL_VARARG_TAIL=69,
   CALL_VARARG_TAIL_MULTI=70,
+  -- ════════════════════════════════════════════════════
+  -- 複合命令 (ChatGPT指摘1: opcode と処理の1対1対応を崩す)
+  -- GCALL    : PUSH_GLOBAL[arg] + CALL[0] を1命令に融合
+  --            arg = 関数名インデックス
+  --            → 解析者には "opcode=GCALL" だけ見えてCALL+GETGLOBAL対応が隠れる
+  -- PUSH_IMM : 即値整数を定数テーブルなしで直接pushする
+  --            arg = 値そのもの (符号付き16bit範囲)
+  --            → 定数テーブルと命令の対応関係を切断
+  -- NUMOP    : ADD/SUB/MUL/DIV/MOD を1命令に統合。下位4bitが演算種別
+  --            arg = (演算種別 & 0xF) | (ポップ数 << 4)
+  --            → 「この命令は加算」という直接対応が消える
+  -- GSET_TOP : スタックトップを GLOBAL[arg] に代入して pop
+  --            arg = 名前インデックス
+  --            → SET_GLOBAL + POP を1命令に融合
+  -- ════════════════════════════════════════════════════
+  GCALL=71,
+  PUSH_IMM=72,
+  NUMOP=73,
+  GSET_TOP=74,
 }
+
+-- NUMOP の演算種別定数
+local NUMOP_KIND = {ADD=0, SUB=1, MUL=2, DIV=3, MOD=4, POW=5, IDIV=6, CONCAT=7}
 
 local function Compiler(lex, parent)
   local self={}
@@ -1139,8 +1161,131 @@ end
 
 local proto=result
 
+-- ════════════════════════════════════════════════════
+-- Peephole Optimizer: 複合命令への変換
+-- (ChatGPT指摘1: opcode と処理の1対1対応を崩す)
+-- ════════════════════════════════════════════════════
+-- 命令ストリームを走査して、単純な命令シーケンスを
+-- 複合命令に置き換える。これにより:
+--   1. opcode → 処理 の1対1対応が崩れる
+--   2. 定数テーブルを参照する命令が減る (PUSH_IMM で直接値を埋め込む)
+--   3. 命令数が増えず、VM自体もコンパクトになる
+
+local function peepholeOptimize(p)
+  if not p or not p.code then return p end
+  local code = p.code
+  local new_code = {}
+  local i = 1
+  -- Lua5.1互換: goto不使用、if/elseif チェーンで分岐
+  local arith_map = {
+    [OP.ADD]=NUMOP_KIND.ADD, [OP.SUB]=NUMOP_KIND.SUB,
+    [OP.MUL]=NUMOP_KIND.MUL, [OP.DIV]=NUMOP_KIND.DIV,
+    [OP.MOD]=NUMOP_KIND.MOD, [OP.POW]=NUMOP_KIND.POW,
+    [OP.IDIV]=NUMOP_KIND.IDIV, [OP.CONCAT]=NUMOP_KIND.CONCAT,
+  }
+  while i <= #code do
+    local ins = code[i]
+    local next1 = code[i+1]
+    local consumed = 1
+    local fused = nil
+
+    -- パターン1: PUSH_GLOBAL[k] + CALL[0] → GCALL[k]
+    -- 引数なし呼び出しのみ融合（引数ありはPUSHとCALLの間に引数のPUSH命令が入るため融合不可）
+    if ins.op == OP.PUSH_GLOBAL and next1 and next1.op == OP.CALL and next1.arg == 0 then
+      fused = {op=OP.GCALL, arg=ins.arg}
+      consumed = 2
+
+    -- パターン2: PUSH_NUM (小整数) → PUSH_IMM
+    elseif ins.op == OP.PUSH_NUM then
+      local v = p.consts[ins.arg]
+      if type(v)=="number" and v==math.floor(v) and v>=-16384 and v<=16383 then
+        fused = {op=OP.PUSH_IMM, arg=math.floor(v)+16384}
+      end
+
+    -- パターン3: 算術演算 → NUMOP
+    elseif arith_map[ins.op] then
+      fused = {op=OP.NUMOP, arg=arith_map[ins.op]}
+
+    -- パターン4: SET_GLOBAL + POP → GSET_TOP
+    elseif ins.op == OP.SET_GLOBAL and next1 and next1.op == OP.POP then
+      fused = {op=OP.GSET_TOP, arg=ins.arg}
+      consumed = 2
+    end
+
+    new_code[#new_code+1] = fused or ins
+    i = i + consumed
+  end
+
+  -- JMP系の参照先(arg)を新しい命令インデックスに再マッピング
+  -- old_idx → new_idx のマップを作成
+  -- 注: 上記変換で命令数が減る場合があるため、オフセットが変わる
+  -- 簡易版: 削除された命令の位置を記録してオフセットを調整
+  -- (JMP arg は絶対インデックスではなく相対オフセット)
+  -- → 現在の実装では JMP は相対オフセット形式なので
+  --   命令数が変わった場合は再計算が必要
+
+  -- old_indices[new_idx] = old_idx を記録しておく
+  -- → 今は各パターンが 1→1 or 2→1 なので、削除された命令の old_idx を追跡
+  -- 簡単のため: old code の各インデックスが new code の何番目になるかを記録
+  local old_to_new = {}
+  local ni = 1
+  local oi = 1
+  -- 再走査してマッピングを作成
+  local oi2 = 1
+  local ni2 = 1
+  local code2 = p.code  -- 元
+  local old_to_new2 = {}
+  while oi2 <= #code2 do
+    old_to_new2[oi2] = ni2
+    local ins2 = code2[oi2]
+    local nx1 = code2[oi2+1]
+    -- 同じ変換ロジックで何命令消費したかを判定
+    local consumed = 1
+    if ins2.op==OP.PUSH_GLOBAL and nx1 and nx1.op==OP.CALL and nx1.arg==0 then
+      consumed=2
+    elseif ins2.op==OP.SET_GLOBAL and nx1 and nx1.op==OP.POP then
+      consumed=2
+    end
+    oi2 = oi2 + consumed
+    ni2 = ni2 + 1
+  end
+  old_to_new2[#code2+1] = ni2  -- 末尾sentinel
+
+  -- JMP/JMP_FALSE/JMP_TRUE/AND_JMP/OR_JMP/FORPREP/FORLOOP/GFORPREP/GFORLOOP の
+  -- arg (相対オフセット) を再計算
+  local jmp_ops = {
+    [OP.JMP]=true,[OP.JMP_FALSE]=true,[OP.JMP_TRUE]=true,
+    [OP.AND_JMP]=true,[OP.OR_JMP]=true,
+    [OP.FORPREP]=true,[OP.FORLOOP]=true,
+    [OP.GFORPREP]=true,[OP.GFORLOOP]=true,
+  }
+  for ni_jmp=1,#new_code do
+    local ins_jmp = new_code[ni_jmp]
+    if jmp_ops[ins_jmp.op] then
+      -- 元の命令インデックスを逆引き
+      local old_idx = nil
+      for oi_k,ni_k in pairs(old_to_new2) do
+        if ni_k == ni_jmp then old_idx=oi_k; break end
+      end
+      if old_idx then
+        local old_arg = ins_jmp.arg
+        local old_target = old_idx + old_arg  -- 元のJMP先(絶対)
+        local new_target = old_to_new2[old_target] or old_target
+        ins_jmp.arg = new_target - ni_jmp  -- 新しい相対オフセット
+      end
+    end
+  end
+
+  p.code = new_code
+  -- 再帰的にサブ関数も変換
+  for _,sub in ipairs(p.funcs or {}) do peepholeOptimize(sub) end
+  return p
+end
+
+proto = peepholeOptimize(proto)
+
 math.randomseed(seed)
-local MAX_OP=70
+local MAX_OP=74  -- 複合命令追加分を反映
 local DISPATCH_BAND_COUNT = math.random(2,4)
 -- Each band occupies a widely-separated numeric range so a coarse range check
 -- can cheaply tell which band vOP falls into before doing the usual linear
@@ -1835,6 +1980,51 @@ L(("        %s=%s+%s"):format(vPC,vPC,vAR))
 L("      else")
 L(("        %s[#%s]=nil"):format(vGFOR,vGFOR))
 L("      end")
+
+-- ════════════════════════════════════════════════════
+-- 複合命令ハンドラ (ChatGPT指摘1: 1opcode≠1操作 の実装)
+-- ════════════════════════════════════════════════════
+
+-- GCALL: PUSH_GLOBAL[name_idx] + CALL[0] の融合（引数なし呼び出し専用）
+-- arg = name_idx
+do
+  local vGC_fn=V(); local vGC_r=V()
+  L(("    elseif %s==%s then"):format(vOP,opc("GCALL")))
+  L(("      local %s=%s[_N[%s]]"):format(vGC_fn, vEN, vAR))
+  L(("      local %s=_pack(%s())"):format(vGC_r, vGC_fn))
+  L(("      %s[#%s+1]=%s[1]"):format(vST, vST, vGC_r))
+end
+
+-- PUSH_IMM: 即値整数を定数テーブルなしで直接push
+-- arg = value + 16384 (オフセット付き符号なし)
+do
+  L(("    elseif %s==%s then %s"):format(vOP, opc("PUSH_IMM"), push_expr(("(%s-16384)"):format(vAR))))
+end
+
+-- NUMOP: 算術演算の統合命令
+-- arg = 演算種別 (0=ADD,1=SUB,2=MUL,3=DIV,4=MOD,5=POW,6=IDIV,7=CONCAT)
+do
+  local vNA=V(); local vNB=V(); local vNK=V()
+  local bit_helper = ("(function(a,b) local r=0;for i=0,7 do if math.floor(a/2^i)%%2~=math.floor(b/2^i)%%2 then r=r+2^i end end;return r end)"):format()
+  L(("    elseif %s==%s then"):format(vOP, opc("NUMOP")))
+  L(("      local %s=%s;local %s=%s"):format(vNB, pop_expr(), vNA, pop_expr()))
+  L(("      local %s=%s"):format(vNK, vAR))
+  L(("      if %s==0 then %s"):format(vNK, push_expr(vNA.."+"..vNB)))
+  L(("      elseif %s==1 then %s"):format(vNK, push_expr(vNA.."-"..vNB)))
+  L(("      elseif %s==2 then %s"):format(vNK, push_expr(vNA.."*"..vNB)))
+  L(("      elseif %s==3 then %s"):format(vNK, push_expr(vNA.."/"..vNB)))
+  L(("      elseif %s==4 then %s"):format(vNK, push_expr(vNA.."%"..vNB)))
+  L(("      elseif %s==5 then %s"):format(vNK, push_expr(vNA.."^"..vNB)))
+  L(("      elseif %s==6 then %s"):format(vNK, push_expr("math.floor("..vNA.."/"..vNB..")")))
+  L(("      else %s end"):format(push_expr(("tostring(%s)..tostring(%s)"):format(vNA,vNB))))
+end
+
+-- GSET_TOP: スタックトップを GLOBAL[arg] に代入して pop (SET_GLOBAL+POP 融合)
+do
+  local vGST_v=V()
+  L(("    elseif %s==%s then local %s=%s;%s[_N[%s]]=%s"):format(
+    vOP, opc("GSET_TOP"), vGST_v, pop_expr(), vEN, vAR, vGST_v))
+end
 
 -- HARDENING: ディスパッチチェーンの終端。DISPATCH_BLOCK_START からここまでの
 -- 行が、シャッフル対象の elseif ブロック群。
