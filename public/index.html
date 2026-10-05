@@ -250,6 +250,7 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
         <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkWrapFunc" checked> 関数ラップ</label>
         <label class="chk-label" style="color:#66bb6a"><input type="checkbox" id="chkNoLoadstring"> loadstring不使用モード（Luau/サンドボックス対応）</label>
         <label class="chk-label" style="color:var(--deobf)"><input type="checkbox" id="chkLite"> 軽量化モード</label>
+        <label class="chk-label" style="color:#e040fb"><input type="checkbox" id="chkOneLiner"> [1行] 1行難読化（全コードを1行に圧縮）</label>
         <!-- Prometheus連携 -->
         <label class="chk-label" style="color:#bb86fc"><input type="checkbox" id="chkPEncStr"> [P] EncryptStrings</label>
         <label class="chk-label" style="color:#bb86fc"><input type="checkbox" id="chkPConstArr"> [P] ConstantArray</label>
@@ -1112,6 +1113,100 @@ function minifyCode(code){
 }
 
 // ════════════════════════════════════════════════════
+//  1行難読化
+// ════════════════════════════════════════════════════
+// 【設計】minifyCode より強力な1行圧縮。
+//   1. コメントを完全除去（行コメント・ブロックコメント両方）
+//   2. 文字列リテラルを保護しながら改行を半角スペースに置換
+//   3. 連続スペース・セミコロンを正規化
+//   4. Lua的に危険な改行（return, break の後）を ; で区切る
+//   5. 最終的に全体を1行にまとめる
+//
+// 注意: VM出力コードには適用しない（VMコード内の文字列テーブルが
+//       改行を含む場合があるため）。アンチダンプ + 通常難読化層にのみ適用。
+function oneLinerCode(code) {
+  // Step1: コメント除去 + 文字列保護
+  let out = '';
+  let i = 0;
+  const n = code.length;
+  while (i < n) {
+    const ch = code[i];
+    // 長括弧文字列 [=*[...]=*]
+    if (ch === '[') {
+      let j = i+1, eq = 0;
+      while (code[j] === '=') { eq++; j++; }
+      if (code[j] === '[') {
+        const close = ']'+'='.repeat(eq)+']';
+        const end = code.indexOf(close, j+1);
+        const stop = end === -1 ? n : end + close.length;
+        // 長括弧文字列内の改行をスペースに（安全）
+        out += code.slice(i, stop).replace(/\n/g, ' ');
+        i = stop; continue;
+      }
+    }
+    // 通常文字列 " or '
+    if (ch === '"' || ch === "'") {
+      const q = ch; let j = i+1;
+      while (j < n) {
+        if (code[j] === '\\') { j += 2; continue; }
+        if (code[j] === q) { j++; break; }
+        j++;
+      }
+      out += code.slice(i, j); i = j; continue;
+    }
+    // コメント
+    if (ch === '-' && code[i+1] === '-') {
+      let j = i+2;
+      // 長括弧コメント
+      if (code[j] === '[') {
+        let k = j+1, eq = 0;
+        while (code[k] === '=') { eq++; k++; }
+        if (code[k] === '[') {
+          const close = ']'+'='.repeat(eq)+']';
+          const end = code.indexOf(close, k+1);
+          i = end === -1 ? n : end + close.length;
+          continue;
+        }
+      }
+      // 行コメント: 改行まで飛ばす
+      const nl = code.indexOf('\n', j);
+      // 改行は ; で置き換えて文の区切りを保持
+      if (nl !== -1) { out += ';'; i = nl+1; }
+      else i = n;
+      continue;
+    }
+    // 改行 → ; に変換（文の区切りを保持）
+    if (ch === '\n') {
+      out += ';'; i++; continue;
+    }
+    out += ch; i++;
+  }
+
+  // Step2: セミコロンの正規化
+  out = out
+    .replace(/;+/g, ';')          // 連続セミコロン → 1つ
+    .replace(/\s*;\s*/g, ';')     // ;前後のスペース除去
+    .replace(/;\s*([,)}\]])/g, '$1') // ,)]} の前の;は不要
+    .replace(/([{(,])\s*;/g, '$1')    // {(, の後の;は不要
+    .replace(/^;|;$/g, '')        // 先頭・末尾の;除去
+    .replace(/\s+/g, ' ')         // 連続スペース → 1つ
+    .trim();
+
+  // Step3: Lua 特有の安全化
+  // "then;" → "then " （thenの後にセミコロンは不要）
+  // "do;" → "do " / "else;" → "else " / "repeat;" → "repeat "
+  out = out
+    .replace(/\b(then|do|else|repeat)\s*;/g, '$1 ')
+    .replace(/\b(function\s*\([^)]*\))\s*;/g, '$1 ')
+    // "end;" は OK（次の文の区切り）
+    // "local X;=Y" は不正 → "local X=Y"（セミコロンが入り込む場合）
+    .replace(/;\s*=/g, '=')
+    .replace(/=\s*;/g, '=');
+
+  return out;
+}
+
+// ════════════════════════════════════════════════════
 //  メイン難読化処理
 // ════════════════════════════════════════════════════
 
@@ -1282,7 +1377,8 @@ async function processVMOnlyObfuscation(vmCode, opts) {
     out = injectJunkIntoCode(out, Math.floor(opts.junk / 3), lite, opts);
   }
 
-  if (lite) out = minifyCode(out);
+  if (opts.useOneLiner) out = oneLinerCode(out);
+  else if (lite) out = minifyCode(out);
   return out;
 }
 
@@ -1451,8 +1547,9 @@ async function processObfuscation(inputCode, opts) {
       coreCode = junkCode + coreCode;
     }
     if (opts.junk > 100) coreCode = injectJunkIntoCode(coreCode, opts.junk, lite, opts);
-    if (lite) coreCode = minifyCode(coreCode);
-    if (opts.useWrapFunc && !lite) coreCode = `local _=pcall(function()\n${coreCode}\nend)`;
+    if (opts.useOneLiner) coreCode = oneLinerCode(coreCode);
+    else if (lite) coreCode = minifyCode(coreCode);
+    if (opts.useWrapFunc && !lite && !opts.useOneLiner) coreCode = `local _=pcall(function()\n${coreCode}\nend)`;
     return `-- Obfuscation by YAJU\n${coreCode}`;
   }
 
@@ -1675,8 +1772,9 @@ async function processObfuscation(inputCode, opts) {
   }
 
   if (adjJunk > 100) out = injectJunkIntoCode(out, adjJunk, lite, opts);
-  if (lite) out = minifyCode(out);
-  if (opts.useWrapFunc && !lite) out = `local _=pcall(function()\n${out}\nend)`;
+  if (opts.useOneLiner) out = oneLinerCode(out);
+  else if (lite) out = minifyCode(out);
+  if (opts.useWrapFunc && !lite && !opts.useOneLiner) out = `local _=pcall(function()\n${out}\nend)`;
   return `-- Obfuscation by YAJU\n${out}`;
 }
 // ════════════════════════════════════════════════════
@@ -1695,6 +1793,7 @@ async function startObfuscation(){
     useProxyVars:byId('chkProxyVars').checked, useWrapFunc:byId('chkWrapFunc').checked,
     useNoLoadstring:byId('chkNoLoadstring').checked,
     useLite:byId('chkLite').checked,
+    useOneLiner:byId('chkOneLiner').checked,
   };
   const prometheusSteps=[];
   if(byId('chkPEncStr').checked) prometheusSteps.push('EncryptStrings');
