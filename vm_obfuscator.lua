@@ -12,16 +12,21 @@ end
 local args = {...}
 local input_file, output_file = nil, nil
 local seed = math.random(100000, 999999)
+local strength = 5 -- カスタムVM強度 (1=軽量 〜 15=最重量, 既定5)
 do
   local i = 1
   while i <= #args do
     if args[i]=="--out" and args[i+1] then i=i+1; output_file=args[i]
     elseif args[i]=="--seed" and args[i+1] then i=i+1; seed=tonumber(args[i]) or seed
+    elseif args[i]=="--strength" and args[i+1] then i=i+1; strength=tonumber(args[i]) or strength
     elseif not input_file then input_file=args[i]
     end
     i=i+1
   end
 end
+-- 強度を 1〜15 にクランプ（不正値はデフォルト5相当として扱う）
+if type(strength)~="number" then strength=5 end
+if strength<1 then strength=1 elseif strength>15 then strength=15 end
 if not input_file then die("usage: lua vm_obfuscator.lua input.lua --out out.lua") end
 if not output_file then output_file=input_file:gsub("%.lua$","").."_vm.lua" end
 
@@ -1286,7 +1291,9 @@ proto = peepholeOptimize(proto)
 
 math.randomseed(seed)
 local MAX_OP=74  -- 複合命令追加分を反映
-local DISPATCH_BAND_COUNT = math.random(2,4)
+-- strength(1〜15)に応じてディスパッチバンド数をスケーリング（strength=5で従来値(2,4)相当）
+local DISPATCH_BAND_MAX = math.max(2, math.floor(2 + strength*0.5))
+local DISPATCH_BAND_COUNT = math.random(2, DISPATCH_BAND_MAX)
 -- Each band occupies a widely-separated numeric range so a coarse range check
 -- can cheaply tell which band vOP falls into before doing the usual linear
 -- opcode comparison within that band. Band 0 keeps the original 1..MAX_OP
@@ -1391,7 +1398,9 @@ local function buildShardedResolver()
   -- shuffle key order so shard membership doesn't correlate with opcode value
   for i=#keys,2,-1 do local j=math.random(1,i); keys[i],keys[j]=keys[j],keys[i] end
 
-  local shardCount = math.random(3,6)
+  -- strength(1〜15)に応じてシャード数をスケーリング（strength=5で従来値(3,6)相当）
+  local shardMax = math.max(3, math.floor(3 + strength*0.6))
+  local shardCount = math.random(3, shardMax)
   local shards = {}
   for i=1,shardCount do shards[i] = {} end
   for i,k in ipairs(keys) do
@@ -2077,7 +2086,9 @@ do
   -- ハンドラと見分けがつかない(同じ "if/elseif <vOP>==<num> then <本体>" の形)。
   -- 本体は既存のオペコード実装パターンを模した無害などこにも影響しないローカル
   -- 変数操作にする。
-  local DECOY_COUNT = math.random(8, 16)
+  -- strength(1〜15)に応じてデコイ分岐数をスケーリング（strength=5で従来値(8,16)相当）
+  local DECOY_MAX = math.max(8, math.floor(8 + strength*1.6))
+  local DECOY_COUNT = math.random(8, DECOY_MAX)
   for _=1,DECOY_COUNT do
     -- Pick a comparison value guaranteed to never equal any real op2c value
     -- (those are all in 1..MAX_OP after shuffling). Use a random large offset.
