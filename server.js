@@ -516,9 +516,13 @@ app.post('/api/obfuscate', async (req, res) => {
 //  POST /api/vm-obfuscate  — カスタムVM難読化
 // ════════════════════════════════════════════════════════
 app.post('/api/vm-obfuscate', async (req, res) => {
-  const { code, seed } = req.body;
+  const { code, seed, strength } = req.body;
   if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
-  res.json(await obfuscateWithCustomVM(code, { seed }));
+  // strength(VM強度): 1〜15の範囲にクランプ。未指定・不正値は既定値5。
+  let vmStrength = parseInt(strength, 10);
+  if (!Number.isFinite(vmStrength)) vmStrength = 5;
+  vmStrength = Math.min(15, Math.max(1, vmStrength));
+  res.json(await obfuscateWithCustomVM(code, { seed, strength: vmStrength }));
 });
 
 // ════════════════════════════════════════════════════════
@@ -1328,11 +1332,14 @@ function obfuscateWithCustomVM(code, options = {}) {
     if (!fs.existsSync(vmScript)) { resolve({ success: false, error: 'vm_obfuscator.luaが見つかりません' }); return; }
 
     const seed   = options.seed || (Math.floor(Math.random() * 900000) + 100000);
+    let strength = parseInt(options.strength, 10);
+    if (!Number.isFinite(strength)) strength = 5;
+    strength = Math.min(15, Math.max(1, strength));
     const tmpIn  = path.join(tempDir, `vm_in_${makeTempId()}.lua`);
     const tmpOut = path.join(tempDir, `vm_out_${makeTempId()}.lua`);
     fs.writeFileSync(tmpIn, code, 'utf8');
 
-    const cmd = `${luaBin} ${vmScript} ${tmpIn} --out ${tmpOut} --seed ${seed}`;
+    const cmd = `${luaBin} ${vmScript} ${tmpIn} --out ${tmpOut} --seed ${seed} --strength ${strength}`;
     console.log('[VM] cmd:', cmd);
 
     exec(cmd, { timeout: 30000, cwd: __dirname }, (err, stdout, stderr) => {
