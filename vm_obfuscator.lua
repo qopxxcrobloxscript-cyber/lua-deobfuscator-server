@@ -13,12 +13,19 @@ local args = {...}
 local input_file, output_file = nil, nil
 local seed = math.random(100000, 999999)
 local strength = 5 -- カスタムVM強度 (1=軽量 〜 15=最重量, 既定5)
+-- ROBLOX-FINGERPRINT-HARDENING: 既定では有効(出力はRoblox実行環境以外では
+-- 文字列定数が壊れて正常動作しなくなる)。standalone Lua上でのCI回帰テスト
+-- 等、意図的にRoblox環境なしで「難読化前後の出力一致」を検証したい場合の
+-- ためだけに --no-roblox-check で無効化できるようにする(本番の配布物を
+-- 作るときは絶対に付けないこと)。
+local robloxCheckEnabled = true
 do
   local i = 1
   while i <= #args do
     if args[i]=="--out" and args[i+1] then i=i+1; output_file=args[i]
     elseif args[i]=="--seed" and args[i+1] then i=i+1; seed=tonumber(args[i]) or seed
     elseif args[i]=="--strength" and args[i+1] then i=i+1; strength=tonumber(args[i]) or strength
+    elseif args[i]=="--no-roblox-check" then robloxCheckEnabled=false
     elseif not input_file then input_file=args[i]
     end
     i=i+1
@@ -174,6 +181,80 @@ do
   parts[#parts+1] = ("local %s=0 if type(%s)==\"table\" then local _sh=rawget(%s,\"sethook\") if type(_sh)==\"function\" then pcall(rawset,%s,\"sethook\",function() end) end end")
     :format(vHookOk, vD, vD, vD)
   parts[#parts+1] = ("%s=%s+%s"):format(vAcc, vAcc, vHookOk)
+
+  -- ROBLOX-FINGERPRINT-HARDENING: Robloxにしか存在しない関数・型の「有無」
+  -- だけでなく「実際の挙動」までチェックし、どれか1つでも欠けている/
+  -- 偽物(スタブ)だった場合に vAcc を増やす。vAcc は後段で復号キーに
+  -- 加算されるため、standalone Lua(5.1/5.4のコマンドラインインタプリタ等)
+  -- や、関数名だけ用意した偽の"game"テーブルを持つエミュレータ/サンドボックス
+  -- 上で実行された場合、文字列定数(=プログラム本体)が静かに全て破損し、
+  -- 正常に動かなくなる。これは「見つかったら即os.exit()」のような分かり
+  -- やすい分岐にしない: 分かりやすい分岐は見つけ次第パッチされて無効化
+  -- されてしまうため、check1/check2と同じく「無効化しても実行結果が
+  -- 壊れたままになる」設計にしている。
+  -- 文字列はすべて byte+1 のテーブルから都度組み立て、"game" "workspace"
+  -- 等の平文を出力コードに残さない。
+  local function hideLit(s)
+    local vk, vr, vi = V(), V(), V()
+    local bytes = {}
+    for i=1,#s do bytes[#bytes+1] = s:byte(i)+1 end
+    return ("(function()local %s={%s};local %s={} for %s=1,#%s do %s[%s]=string.char(%s[%s]-1) end return table.concat(%s) end)()")
+      :format(vk, table.concat(bytes, ","), vr, vi, vk, vr, vi, vk, vi, vr)
+  end
+  local vRC = V() -- Roblox-check 用アキュムレータ
+  parts[#parts+1] = ("local %s=0"):format(vRC)
+  if robloxCheckEnabled then
+  -- a) game がInstanceであること(typeofはRoblox/Luau専用関数)
+  do
+    local vGame, vTypeof, vOk = V(), V(), V()
+    parts[#parts+1] = ("local %s=rawget(_G,%s)"):format(vGame, hideLit("game"))
+    parts[#parts+1] = ("local %s=rawget(_G,%s)"):format(vTypeof, hideLit("typeof"))
+    parts[#parts+1] = ("local %s=false if type(%s)==\"function\" and %s~=nil then local _ok,_ty=pcall(%s,%s); if _ok and _ty==%s then %s=true end end")
+      :format(vOk, vTypeof, vGame, vTypeof, vGame, hideLit("Instance"), vOk)
+    parts[#parts+1] = ("if not %s then %s=%s+1 end"):format(vOk, vRC, vRC)
+  end
+  -- b) Instance.new が本物のRobloxインスタンスを生成できること
+  do
+    local vInst, vNewFn, vOk, vObj, vCN = V(), V(), V(), V(), V()
+    parts[#parts+1] = ("local %s=rawget(_G,%s)"):format(vInst, hideLit("Instance"))
+    parts[#parts+1] = ("local %s=nil if type(%s)==\"table\" then %s=rawget(%s,%s) end"):format(vNewFn, vInst, vNewFn, vInst, hideLit("new"))
+    parts[#parts+1] = ("local %s=false if type(%s)==\"function\" then local _ok,%s=pcall(%s,%s) if _ok and %s then local _ok2,%s=pcall(function() return %s[%s] end) if _ok2 and %s==%s then %s=true end end end")
+      :format(vOk, vNewFn, vObj, vNewFn, hideLit("Part"), vObj, vCN, vObj, hideLit("ClassName"), vCN, hideLit("Part"), vOk)
+    parts[#parts+1] = ("if not %s then %s=%s+1 end"):format(vOk, vRC, vRC)
+  end
+  -- c) Vector3の算術演算が本物のRoblox datatypeとして機能していること
+  --    (ただの{x=..,y=..,z=..}なテーブルを偽装したスタブは + 演算子で
+  --    __add メタメソッドを正しく実装していないことが多い)
+  do
+    local vV3, vOk, vA, vB, vC, vX = V(), V(), V(), V(), V(), V()
+    parts[#parts+1] = ("local %s=rawget(_G,%s)"):format(vV3, hideLit("Vector3"))
+    parts[#parts+1] = ("local %s=false if type(%s)==\"table\" then local _new=rawget(%s,%s) if type(_new)==\"function\" then local _ok,%s=pcall(_new,1,2,3) local _ok2,%s=pcall(_new,1,1,1) if _ok and _ok2 then local _ok3,%s=pcall(function() return %s+%s end) if _ok3 and %s then local _ok4,%s=pcall(function() return %s[%s] end) if _ok4 and %s==2 then %s=true end end end end end")
+      :format(vOk, vV3, vV3, hideLit("new"), vA, vB, vC, vA, vB, vC, vX, vC, hideLit("X"), vX, vOk)
+    parts[#parts+1] = ("if not %s then %s=%s+1 end"):format(vOk, vRC, vRC)
+  end
+  -- d) RobloxのtaskライブラリはLua5.1/5.4のstandalone処理系には存在しない
+  do
+    local vTask, vOk = V(), V()
+    parts[#parts+1] = ("local %s=rawget(_G,%s)"):format(vTask, hideLit("task"))
+    parts[#parts+1] = ("local %s=false if type(%s)==\"table\" then local _w=rawget(%s,%s) local _s=rawget(%s,%s) if type(_w)==\"function\" and type(_s)==\"function\" then %s=true end end")
+      :format(vOk, vTask, vTask, hideLit("wait"), vTask, hideLit("spawn"), vOk)
+    parts[#parts+1] = ("if not %s then %s=%s+1 end"):format(vOk, vRC, vRC)
+  end
+  -- e) game:GetService("Players") が workspace 等と同じ "本物のゲーム木" に
+  --    紐づいていること(game.Players と GetService("Players") の実体一致)
+  do
+    local vGame, vGS, vOk, vP1, vP2 = V(), V(), V(), V(), V()
+    parts[#parts+1] = ("local %s=rawget(_G,%s)"):format(vGame, hideLit("game"))
+    parts[#parts+1] = ("local %s=false if type(%s)==\"userdata\" or type(%s)==\"table\" then local _ok,%s=pcall(function() return %s[%s] end) local _ok2,%s=pcall(function() local _f=%s[%s] return _f(%s,%s) end) if _ok and _ok2 and %s~=nil and %s==%s then %s=true end end")
+      :format(vOk, vGame, vGame, vP1, vGame, hideLit("Players"), vP2, vGame, hideLit("GetService"), vGame, hideLit("Players"), vP1, vP1, vP2, vOk)
+    parts[#parts+1] = ("if not %s then %s=%s+1 end"):format(vOk, vRC, vRC)
+  end
+  end -- robloxCheckEnabled
+  -- Roblox専用チェックは誤検知コストが高い(Studioのコマンドバー、プラグイン、
+  -- server/clientの文脈差など)ため、1つの失敗だけでは重くしすぎず、
+  -- 複数(目安2つ以上)同時に失敗した場合にだけ強く効かせる。
+  parts[#parts+1] = ("if %s>=2 then %s=%s+%s else %s=%s+(%s%%1) end"):format(vRC, vAcc, vAcc, vRC, vAcc, vAcc, vRC)
+
   -- チェック3: 粗いタイミングチェック(過検知を避けるため非常に緩い閾値)
   parts[#parts+1] = ("local %s=os and os.clock and os.clock() or 0"):format(vT1)
   parts[#parts+1] = ("local %s=0 for %s=1,20000 do %s=%s+%s%%7 end"):format(vAcc2, vI, vAcc2, vAcc2, vI)
