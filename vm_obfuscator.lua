@@ -36,13 +36,39 @@ local source = fh:read("*a"); fh:close()
 if not source or #source==0 then die("empty input") end
 
 local rng_s = seed
+-- BUGFIX: LCG(線形合同法)は下位ビットほど統計的な質が悪く、周期が極端に
+-- 短くなることが知られている。rng_s をそのまま %N に使うと、Nが2の累乗
+-- (例: 8, 16)のときに特定のseedで極端に短い周期に陥り、"同じ名前しか
+-- 生成されない"→ repeat-until が無限ループする、という実際の不具合が
+-- 発生した(例: --seed 999)。
+-- 対策として、下位16bitを捨てて上位ビット側(統計的な質が良い)だけを
+-- 返すようにする。rng_sの値域は[0,2^32-1]なので、返り値は[0,65535]と
+-- なり、本ファイル内の用途(名前生成・定数分解パターン選択など、
+-- 必要な値域はせいぜい数百〜数千)に対して十分な幅を持つ。
 local function rng()
-  rng_s=(rng_s*1664525+1013904223)%4294967296; return rng_s
+  rng_s=(rng_s*1664525+1013904223)%4294967296
+  return math.floor(rng_s/65536)
 end
+-- FINGERPRINT-HARDENING: 変数名の文字構成パターンをビルド(=生成1回)ごとに
+-- ランダムで選ぶ。従来は常に I/l/O/_/1/0 のみで構成される固定パターンだった
+-- ため、2つの出力を見比べるだけで「同一ツール製」だと即座に特定できて
+-- しまっていた。複数の命名スタイルを用意し、--seedごとに1つを選ぶことで、
+-- 出力ごとに見た目の異なる命名規則になるようにする。
+local NAME_STYLES = {
+  -- スタイル1(従来): 紛らわしい大文字I/小文字l/大文字Oだけで構成
+  {conf={"I","l","O","Il","lI","IO","OI","lO","Ol"}, fill={"I","l","O","_","1","0"}},
+  -- スタイル2: アンダースコア主体、l/O抜き(異なる視覚パターン)
+  {conf={"_","__","_v","_x","_k"}, fill={"_","a","b","c","d","e","f"}},
+  -- スタイル3: 16進数風(0-9,a-f)の識別子。他ツールの"_0x..."系命名に近い見た目
+  {conf={"a","b","c","d","e","f","_a","_b"}, fill={"a","b","c","d","e","f","0","1","2","3","4","5","6","7","8","9"}},
+  -- スタイル4: O/0混在+記号多め、l/Iを使わない(スタイル1と対照的な見た目)
+  {conf={"O","Q","D","OQ","QD","DO"}, fill={"O","Q","D","_","8","9"}},
+}
+local nameStyle = NAME_STYLES[(rng()%#NAME_STYLES)+1]
 local used_v={}
 local function V()
-  local conf={"I","l","O","Il","lI","IO","OI","lO","Ol"}
-  local fill={"I","l","O","_","1","0"}
+  local conf=nameStyle.conf
+  local fill=nameStyle.fill
   local n
   repeat
     n=conf[(rng()%#conf)+1]
@@ -184,6 +210,27 @@ local F_VARIANTS = {
 -- 上記バリアントは最大でも (10*2)=20 程度なので、余裕を持って40とする。
 local F_MAXABS = 40
 
+-- STRUCTURE-HARDENING: 文字列を復号するIIFEの「全体構造」も複数用意し、
+-- 文字列ごとにランダムで選ぶ。従来はf(i)の数式だけがバリアントで、
+-- IIFEの構造(forループ+table+table.concat)自体は常に同一だったため、
+-- その構造1つにマッチする正規表現を書くだけで全文字列を機械的に
+-- 抽出できてしまっていた(実際に提供された解析レポートで指摘された
+-- 弱点)。ループの種類(for/while)や結果の組み立て方(table.concat /
+-- 直接文字列連結)を変えた3種の構造を用意し、ランダムに混在させる。
+local function buildDecodeBody_ForTable(vt,vr,vi,vick,key,fiExpr,n)
+  return ("local %s={};for %s=1,%d do %s[%s]=string.char((%s[%s]-1-%d-(%s)-%s+1020+%d*255)%%255+1)end;return table.concat(%s)")
+    :format(vr, vi, n, vr, vi, vt, vi, key, fiExpr, vick, F_MAXABS, vr)
+end
+local function buildDecodeBody_WhileTable(vt,vr,vi,vick,key,fiExpr,n)
+  return ("local %s={};%s=1;while %s<=%d do %s[%s]=string.char((%s[%s]-1-%d-(%s)-%s+1020+%d*255)%%255+1);%s=%s+1 end;return table.concat(%s)")
+    :format(vr, vi, vi, n, vr, vi, vt, vi, key, fiExpr, vick, F_MAXABS, vi, vi, vr)
+end
+local function buildDecodeBody_ForConcat(vt,vr,vi,vick,key,fiExpr,n)
+  return ("local %s=\"\";for %s=1,%d do %s=%s..string.char((%s[%s]-1-%d-(%s)-%s+1020+%d*255)%%255+1)end;return %s")
+    :format(vr, vi, n, vr, vr, vt, vi, key, fiExpr, vick, F_MAXABS, vr)
+end
+local DECODE_BODY_BUILDERS = {buildDecodeBody_ForTable, buildDecodeBody_WhileTable, buildDecodeBody_ForConcat}
+
 -- 1個の文字列チャンクをエンコードしたIIFE式(文字列)を返す。
 local function encode_chunk(s)
   if #s==0 then return '""' end
@@ -194,7 +241,7 @@ local function encode_chunk(s)
   for i=1,#s do
     enc[i]=ne((s:byte(i)+key+f(i)-1)%255+1)
   end
-  local vt,vr,vi,vick=V(),V(),V(),V()
+  local vt,vi,vick=V(),V(),V()
   -- f(i)を復号式に埋め込む(variantごとに式テキストを変える)
   local fiExpr
   if variant==1 then fiExpr = ("%s%%7*3"):format(vi)
@@ -210,8 +257,11 @@ local function encode_chunk(s)
   -- これにより、整合性チェックが「副作用のない除去可能なコード」ではなく
   -- 「実際の出力(文字列定数)に影響する必須ロジック」になり、静的解析による
   -- 到達不能/無害コード除去で無効化することができなくなる。
-  return("(function()local %s={%s};local %s={};local %s=%s();for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-(%s)-%s+1020+%d*255)%%255+1)end;return table.concat(%s)end)()"):format(
-    vt,table.concat(enc,","),vr,vick,vIntegrityFnName or "(function() return 0 end)",vi,vt,vr,vi,vt,vi,key,fiExpr,vick,F_MAXABS,vr)
+  local vr = V()
+  local builder = DECODE_BODY_BUILDERS[math.random(1,#DECODE_BODY_BUILDERS)]
+  local body = builder(vt, vr, vi, vick, key, fiExpr, #s)
+  return("(function()local %s={%s};local %s=%s();%s end)()"):format(
+    vt, table.concat(enc,","), vick, vIntegrityFnName or "(function() return 0 end)", body)
 end
 
 -- STRING-HARDENING: 一定長を超える文字列は複数チャンクに分割し、チャンクごとに
