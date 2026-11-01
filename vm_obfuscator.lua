@@ -50,13 +50,52 @@ local function V()
   until not used_v[n]
   used_v[n]=true; return n
 end
+-- CONST-HARDENING: 整数定数の分解パターンを4種類に増やし、ランダムに
+-- 使い分ける。加算型(a*b+c)の形だけだと解析者はその1パターンだけ認識すれば
+-- 全ての整数定数を読めてしまうため、減算型(a*b-c)も混在させて形を崩す。
 local function ne(n)
   if type(n)~="number" then return tostring(n) end
   if n==0 then return "0" end
-  local r=rng()%3
+  local r=rng()%4
   if r==0 then local a=(rng()%40)+2;local b=math.floor(n/a);local c=n-a*b;return("(%d*%d+%d)"):format(a,b,c)
   elseif r==1 then local o=(rng()%80)+5;return("(%d-%d)"):format(n+o,o)
-  else local f=(rng()%6)+2;local q=math.floor(n/f);local c=n-f*q;return("(%d*%d+%d)"):format(f,q,c) end
+  elseif r==2 then local f=(rng()%6)+2;local q=math.floor(n/f);local c=n-f*q;return("(%d*%d+%d)"):format(f,q,c)
+  else local a=(rng()%30)+2;local b=math.ceil(n/a);local c=a*b-n;return("(%d*%d-%d)"):format(a,b,c) end
+end
+
+-- CONST-HARDENING: 浮動小数点定数の保護。
+-- 従来は数値定数のうち整数値のみ ne() で分解され、小数(例: 3.14, 0.5)は
+-- tostring(c) によってソースにそのまま平文で出力されていた。
+-- ここでは %.17g (倍精度を誤差なく文字列化できる精度)で10進表現を取り出し、
+-- 「整数部+小数部」を1つの整数Mとみなして ne(M) で分解した上で、
+-- 10^E (Eは小数桁数)で割って元の値を再構成する式を生成する。
+-- M/10^E が元の%.17g表現と完全に一致するため精度は保たれ、Mの部分は
+-- 既存の整数定数保護と同じ強度で保護される。桁数が大きすぎて整数Mが
+-- doubleの精度(2^53)を超える場合は、安全側に倒して平文のまま出力する
+-- (保護より数値精度の正確さを優先)。
+local function obfuscate_float(c)
+  local s = string.format("%.17g", c)
+  if s:find("[eEnN]") then return s end -- 指数表記/inf/nanは手を出さずそのまま
+  local neg = false
+  if s:sub(1,1)=="-" then neg=true; s=s:sub(2) end
+  local intPart, fracPart = s:match("^(%d*)%.?(%d*)$")
+  if not intPart then return (neg and "-" or "")..s end
+  intPart = (intPart=="") and "0" or intPart
+  local digits = intPart..fracPart
+  -- 先頭の余分な0を除去(tonumberで数値化するだけなので実害はないが整形)
+  local E = #fracPart
+  if #digits > 15 then return (neg and "-" or "")..s end -- 精度境界を超える場合は保護を諦める
+  local M = tonumber(digits)
+  if not M then return (neg and "-" or "")..s end
+  local expr
+  if E==0 then
+    expr = ne(M)
+  else
+    local D=1; for _=1,E do D=D*10 end
+    expr = ("(%s)/(%s)"):format(ne(M), ne(D))
+  end
+  if neg then expr = "-("..expr..")" end
+  return expr
 end
 
 -- HARDENING: 整合性チェック関数を生成する。この関数の戻り値は正常環境では
@@ -1341,7 +1380,60 @@ end
 
 proto = peepholeOptimize(proto)
 
+-- DATAFLOW-HARDENING: ジャンク(無害な無意味)命令をバイトコード中に挿入する。
+-- 挿入するのは「即値をpushして直後にpopするだけ」のスタック中立な2命令
+-- (PUSH_IMM + POP)で、実行結果・スタック状態・変数の値には一切影響しない。
+-- これにより、バイトコードを逐次読んでいる解析者から見ると、実際のデータの
+-- 流れ(push→演算→storeの連鎖)の間に本物らしい無関係な命令が混ざることに
+-- なり、「どの命令が実際の計算に寄与しているか」の判別が難しくなる
+-- (Data Flow Obfuscation)。JMP系命令の相対オフセットは、挿入前後の命令
+-- インデックス対応表(old_to_new)を使って正確に再計算するため、挿入によって
+-- 制御フロー(if/while/forの分岐先)が壊れることはない。
+local function injectDataFlowJunk(p, strength_)
+  if not p or not p.code then return p end
+  local code = p.code
+  if #code==0 then return p end
+  -- strength(1〜15)に応じて挿入確率をスケーリングする
+  -- strength=1で約3%、strength=15で約20%の命令位置の直前にジャンクが挿入される
+  local chance = 0.03 + (strength_-1) * 0.012
+  local new_code = {}
+  local old_to_new = {}
+  for oi=1,#code do
+    if math.random() < chance then
+      -- PUSH_IMM(16bit符号付き範囲をoffset+16384で表現、0..32767で全域カバー)
+      new_code[#new_code+1] = {op=OP.PUSH_IMM, arg=math.random(0,32767)}
+      new_code[#new_code+1] = {op=OP.POP, arg=0}
+    end
+    old_to_new[oi] = #new_code+1
+    new_code[#new_code+1] = code[oi]
+  end
+  old_to_new[#code+1] = #new_code+1 -- 末尾(ブロック末尾へのジャンプ)用のsentinel
+
+  local jmp_ops = {
+    [OP.JMP]=true,[OP.JMP_FALSE]=true,[OP.JMP_TRUE]=true,
+    [OP.AND_JMP]=true,[OP.OR_JMP]=true,
+    [OP.FORPREP]=true,[OP.FORLOOP]=true,
+    [OP.GFORPREP]=true,[OP.GFORLOOP]=true,
+  }
+  for oi=1,#code do
+    local ins = code[oi]
+    if jmp_ops[ins.op] then
+      local old_target = oi + ins.arg
+      local new_target = old_to_new[old_target] or old_target
+      local new_self = old_to_new[oi]
+      new_code[new_self].arg = new_target - new_self
+    end
+  end
+
+  p.code = new_code
+  for _,sub in ipairs(p.funcs or {}) do injectDataFlowJunk(sub, strength_) end
+  return p
+end
+
 math.randomseed(seed)
+-- ジャンク命令挿入はシード依存の乱数を使うため、randomseed()の後に実行し
+-- --seed指定時の再現性を保つ。
+proto = injectDataFlowJunk(proto, strength)
 local MAX_OP=74  -- 複合命令追加分を反映
 -- strength(1〜15)に応じてディスパッチバンド数をスケーリング（strength=5で従来値(2,4)相当）
 local DISPATCH_BAND_MAX = math.max(2, math.floor(2 + strength*0.5))
@@ -1417,7 +1509,7 @@ local function serial(p)
   for _,c in ipairs(p.consts) do
     if type(c)=="number" then
       if c==math.floor(c) and math.abs(c)<1e12 then kp[#kp+1]=ne(math.floor(c))
-      else kp[#kp+1]=tostring(c) end
+      else kp[#kp+1]=obfuscate_float(c) end
     elseif type(c)=="string" then kp[#kp+1]=hide_str(c)
     else kp[#kp+1]=tostring(c) end
   end
@@ -2200,33 +2292,6 @@ do
   end
   local totalCount = #blocks
 
-  -- HARDENING (CFF強化・階層ディスパッチ): vOPの値空間を、実Opcodeが
-  -- 占める [1, MAX_OP] の範囲でTIER_COUNT個の連続した数値レンジへ分割し、
-  -- デコイが占める [DECOY_BASE+1, ...] の範囲をもう1つの専用レンジとして
-  -- 加える。各ブロックは自身の実際の比較値(blockVal)がどのレンジに
-  -- 収まるかで一意に、かつ常に正しく振り分けられる(値そのもので判定する
-  -- ため、シャッフル・デコイ混入があっても経路は数学的に保証される)。
-  -- strength(1〜15)に応じてTIER_COUNTを増やし、ネストの深さ・外側の
-  -- レンジ判定の分岐数を増加させる(strength=1で1=実質フラット、
-  -- strength=15で最大6分割)。
-  local TIER_COUNT = math.min(6, math.max(1, math.floor(1 + (strength-1)/3)))
-  local tierSize = math.ceil(MAX_OP / TIER_COUNT)
-  local function tierOf(val)
-    if val <= MAX_OP then
-      local t = math.ceil(val / tierSize)
-      if t<1 then t=1 elseif t>TIER_COUNT then t=TIER_COUNT end
-      return t
-    end
-    return TIER_COUNT + 1 -- デコイ専用レンジ
-  end
-  local tiers = {}
-  for t=1,TIER_COUNT+1 do tiers[t] = {} end
-  for i=1,totalCount do
-    local t = mappingOk and tierOf(blockVal[i]) or 1
-    local lst = tiers[t]
-    lst[#lst+1] = blocks[i]
-  end
-
   -- ブロック先頭行を "if" / "elseif" に正規化するヘルパー。元の行がどちらの
   -- キーワードで書かれていても対応する(シャッフルで任意の位置に来るため)。
   local function normalizeHead(firstLine, isFirst)
@@ -2238,46 +2303,92 @@ do
     return rewritten
   end
 
-  -- 各ティア内をシャッフルし、内側のif/elseif鎖を個別に組み立てる
-  local tierChainLines = {}
-  local activeTiers = {}
-  local lastTierIndex = mappingOk and (TIER_COUNT+1) or 1
-  for t=1,lastTierIndex do
-    local lst = tiers[t]
-    if #lst>0 then
-      for i=#lst,2,-1 do local j=math.random(1,i); lst[i],lst[j]=lst[j],lst[i] end
-      local inner = {}
-      for bi,block in ipairs(lst) do
-        inner[#inner+1] = normalizeHead(block[1], bi==1)
-        for k=2,#block do inner[#inner+1]=block[k] end
-      end
-      inner[#inner+1] = "      end"
-      tierChainLines[t] = inner
-      activeTiers[#activeTiers+1] = t
+  -- CFF強化(ブロック分割の粒度アップ): 値域[lo,hi]とその範囲に属するブロック
+  -- 集合(items, 各要素は{val=比較値, lines=ブロック本体行})を受け取り、
+  -- 再帰的に2分割しながらネストしたif/elseifディスパッチを構築する。
+  --   - items数がLEAF_MAX以下、または最大深さに達したら、その場でシャッフル
+  --     した上でフラットなif/elseif/endの葉(リーフ)として確定する。
+  --   - そうでなければ[lo,hi]を中点で左右に分割し、各ブロックを実際の値
+  --     (val)がどちら側に属するかで振り分け、両側を再帰的に構築した上で
+  --     外側をレンジ判定(if vOP>=lo and vOP<=mid then ... elseif ... end)
+  --     で包む。
+  -- 前段(前回実装)の単純な等分割ティアを一般化したもので、同じ「値その
+  -- ものでの範囲判定」という検証済みの手法を再帰適用するため、正確性は
+  -- 数学的に保証される(ブロックのvalは必ずlo..hiの範囲内にあり、中点で
+  -- 分けた片方に必ず属する)。strength(1〜15)に応じて最大深さを増やし、
+  -- ネストの深さ・分岐の総数を大幅に増加させる。
+  local MAX_DEPTH = math.min(6, math.max(1, math.floor(1 + (strength-1)/2.5)))
+  local LEAF_MAX = 4
+  local function buildLeaf(items)
+    for i=#items,2,-1 do local j=math.random(1,i); items[i],items[j]=items[j],items[i] end
+    local out = {}
+    for bi,it in ipairs(items) do
+      out[#out+1] = normalizeHead(it.lines[1], bi==1)
+      for k=2,#it.lines do out[#out+1]=it.lines[k] end
     end
+    out[#out+1] = "      end"
+    return out
+  end
+  local function buildRangeDispatch(items, lo, hi, depth)
+    if #items<=LEAF_MAX or depth>=MAX_DEPTH or hi<=lo then
+      return buildLeaf(items)
+    end
+    local mid = lo + math.floor((hi-lo)/2)
+    local leftItems, rightItems = {}, {}
+    for _,it in ipairs(items) do
+      if it.val<=mid then leftItems[#leftItems+1]=it else rightItems[#rightItems+1]=it end
+    end
+    -- 分割しても片側に全て偏った場合(境界の取り方次第であり得る)は、
+    -- 無限再帰を避けるためその場でリーフ化する。
+    if #leftItems==0 or #rightItems==0 then
+      return buildLeaf(items)
+    end
+    local branches = {
+      {lo=lo, hi=mid, items=leftItems},
+      {lo=mid+1, hi=hi, items=rightItems},
+    }
+    local out = {}
+    for idx,br in ipairs(branches) do
+      local kw = (idx==1) and "      if " or "      elseif "
+      out[#out+1] = ("%s%s>=%s and %s<=%s then"):format(kw, vOP, ne(br.lo), vOP, ne(br.hi))
+      local inner = buildRangeDispatch(br.items, br.lo, br.hi, depth+1)
+      for _,ln in ipairs(inner) do out[#out+1]=ln end
+    end
+    out[#out+1] = "      end"
+    return out
   end
 
-  -- ティアを巡回する外側ゲートを安価なレンジ判定で構築する。tierOf()で
-  -- 使った境界(tierSize刻み)と完全に同じ式を使うことで、各ブロックの実際の
-  -- 比較値(blockVal)が必ずどれか1つのティアのレンジに収まることを保証する。
-  -- マッピングに失敗した場合(mappingOk=false)は安全側に倒し、1つの巨大な
-  -- レンジでラップするだけにする(=従来のフラットな挙動と等価)。
+  -- 実Opcode用ドメイン[1,MAX_OP]とデコイ用ドメイン[DECOY_BASE+1, 999999999]
+  -- の2つに分け、それぞれ独立に再帰ディスパッチ木を構築する。
+  -- マッピングに失敗した場合(mappingOk=false)は安全側に倒し、全ブロックを
+  -- 1つの巨大なレンジ[1,999999999]でまとめて1つの木として構築する
+  -- (=従来のフラットな挙動と等価、壊れた構造を生成しない)。
   local outer = {}
-  for idx,t in ipairs(activeTiers) do
-    local lo, hi
-    if not mappingOk then
-      lo, hi = 1, 999999999
-    elseif t <= TIER_COUNT then
-      lo, hi = (t-1)*tierSize+1, t*tierSize
-    else
-      lo, hi = DECOY_BASE+1, 999999999 -- デコイ専用レンジ
+  if not mappingOk then
+    local allItems = {}
+    for i=1,totalCount do allItems[#allItems+1] = {val=blockVal[i] or 1, lines=blocks[i]} end
+    outer[#outer+1] = ("    if %s>=%s and %s<=%s then"):format(vOP, ne(1), vOP, ne(999999999))
+    local tree = buildRangeDispatch(allItems, 1, 999999999, 0)
+    for _,ln in ipairs(tree) do outer[#outer+1]=ln end
+  else
+    local realItems, decoyItems = {}, {}
+    for i=1,totalCount do
+      local it = {val=blockVal[i], lines=blocks[i]}
+      if blockVal[i] <= MAX_OP then realItems[#realItems+1]=it
+      else decoyItems[#decoyItems+1]=it end
     end
-    local kw = (idx==1) and "    if " or "    elseif "
-    outer[#outer+1] = ("%s%s>=%s and %s<=%s then"):format(kw, vOP, ne(lo), vOP, ne(hi))
-    for _,ln in ipairs(tierChainLines[t]) do outer[#outer+1]=ln end
+    local domains = {}
+    if #realItems>0 then domains[#domains+1] = {lo=1, hi=MAX_OP, items=realItems} end
+    if #decoyItems>0 then domains[#domains+1] = {lo=DECOY_BASE+1, hi=999999999, items=decoyItems} end
+    for idx,d in ipairs(domains) do
+      local kw = (idx==1) and "    if " or "    elseif "
+      outer[#outer+1] = ("%s%s>=%s and %s<=%s then"):format(kw, vOP, ne(d.lo), vOP, ne(d.hi))
+      local tree = buildRangeDispatch(d.items, d.lo, d.hi, 0)
+      for _,ln in ipairs(tree) do outer[#outer+1]=ln end
+    end
   end
-  -- VM Coreハードニング: 未定義Opcode検出。どのティアにも一致しない値が
-  -- 来た場合は、意味不明な状態で実行を継続させず安全に停止する。
+  -- VM Coreハードニング: 未定義Opcode検出。どのドメイン/レンジにも一致
+  -- しない値が来た場合は、意味不明な状態で実行を継続させず安全に停止する。
   outer[#outer+1] = "    else"
   outer[#outer+1] = "      error(\"VM: invalid opcode\")"
   outer[#outer+1] = "    end"
