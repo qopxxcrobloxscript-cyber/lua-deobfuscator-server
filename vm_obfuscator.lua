@@ -125,17 +125,45 @@ do
 end
 
 -- ★ FIX: %255+1 方式（値域1..255、\0絶対なし）
--- enc = (byte + key + i%7*3 - 1) % 255 + 1 → 値域1..255
--- dec = (enc - 1 - key - i%7*3 + 1020) % 255 + 1 → 値域1..255
+-- enc = (byte + key + f(i) - 1) % 255 + 1 → 値域1..255
+-- dec = (enc - 1 - key - f(i) + 1020) % 255 + 1 → 値域1..255
 -- 入力のLua識別子・文字列リテラルにbyte=0は来ないので情報落ちなし
-local function hide_str(s)
-  if not s or #s==0 then return '""' end
+--
+-- STRING-HARDENING: 位置依存項f(i)の形を複数用意し、文字列ごとにランダムで
+-- 選ぶ。全ての文字列が同じ1つの復号パターンを使っていると、解析者はその
+-- パターンを一度覚えるだけで全ての文字列を一括復号できてしまう。f(i)の
+-- 形を(i%7)*3以外にも複数用意しランダムに混在させることで、「1つの復号器」
+-- では読めない文字列が混在するようにする。数式は加減算のみで必ず可逆。
+local F_VARIANTS = {
+  function(i) return (i%7)*3 end,
+  function(i) return (i%5)*7+(i%3) end,
+  function(i) return (i%11)*2 end,
+  function(i) return ((i*3)%13)+(i%4) end,
+  function(i) return (i%9)*5-(i%2) end,
+}
+-- f(i)が取りうる値の絶対上限(全バリアント共通の安全マージンとして使う)。
+-- 上記バリアントは最大でも (10*2)=20 程度なので、余裕を持って40とする。
+local F_MAXABS = 40
+
+-- 1個の文字列チャンクをエンコードしたIIFE式(文字列)を返す。
+local function encode_chunk(s)
+  if #s==0 then return '""' end
   local key=(rng()%50)+3
+  local variant=math.random(1,#F_VARIANTS)
+  local f=F_VARIANTS[variant]
   local enc={}
   for i=1,#s do
-    enc[i]=ne((s:byte(i)+key+(i%7)*3-1)%255+1)
+    enc[i]=ne((s:byte(i)+key+f(i)-1)%255+1)
   end
   local vt,vr,vi,vick=V(),V(),V(),V()
+  -- f(i)を復号式に埋め込む(variantごとに式テキストを変える)
+  local fiExpr
+  if variant==1 then fiExpr = ("%s%%7*3"):format(vi)
+  elseif variant==2 then fiExpr = ("%s%%5*7+%s%%3"):format(vi,vi)
+  elseif variant==3 then fiExpr = ("%s%%11*2"):format(vi)
+  elseif variant==4 then fiExpr = ("(%s*3)%%13+%s%%4"):format(vi,vi)
+  else fiExpr = ("%s%%9*5-%s%%2"):format(vi,vi)
+  end
   -- HARDENING: 復号キーに整合性チェック関数(vIntegrityFnName, 後述で定義)の
   -- 戻り値を加える。正常環境では常に0を返すため通常の復号結果には一切影響
   -- しないが、既知のダンプ/デバッグAPIが有効な状態(=改ざん・解析ツール
@@ -143,8 +171,32 @@ local function hide_str(s)
   -- これにより、整合性チェックが「副作用のない除去可能なコード」ではなく
   -- 「実際の出力(文字列定数)に影響する必須ロジック」になり、静的解析による
   -- 到達不能/無害コード除去で無効化することができなくなる。
-  return("(function()local %s={%s};local %s={};local %s=%s();for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3-%s+1020)%%255+1)end;return table.concat(%s)end)()"):format(
-    vt,table.concat(enc,","),vr,vick,vIntegrityFnName or "(function() return 0 end)",vi,vt,vr,vi,vt,vi,key,vi,vick,vr)
+  return("(function()local %s={%s};local %s={};local %s=%s();for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-(%s)-%s+1020+%d*255)%%255+1)end;return table.concat(%s)end)()"):format(
+    vt,table.concat(enc,","),vr,vick,vIntegrityFnName or "(function() return 0 end)",vi,vt,vr,vi,vt,vi,key,fiExpr,vick,F_MAXABS,vr)
+end
+
+-- STRING-HARDENING: 一定長を超える文字列は複数チャンクに分割し、チャンクごとに
+-- 別々の鍵・別々の数式バリアントで独立に暗号化してから ".." で連結する。
+-- これにより、長い(=意味のある可能性が高い)文字列ほど「1箇所にまとまった
+-- 復号処理」を持たなくなり、部分的な解析だけでは全体を読めなくなる。
+local CHUNK_THRESHOLD = 24
+local function hide_str(s)
+  if not s or #s==0 then return '""' end
+  if #s <= CHUNK_THRESHOLD then
+    return encode_chunk(s)
+  end
+  -- 2〜4分割(文字列長に応じて分割数を増やす)
+  local chunkCount = math.min(4, math.max(2, math.floor(#s / CHUNK_THRESHOLD) + 1))
+  local baseLen = math.floor(#s / chunkCount)
+  local pieces = {}
+  local pos = 1
+  for c=1,chunkCount do
+    local len = (c==chunkCount) and (#s-pos+1) or baseLen
+    local part = s:sub(pos, pos+len-1)
+    pieces[#pieces+1] = encode_chunk(part)
+    pos = pos + len
+  end
+  return "("..table.concat(pieces, "..")..")"
 end
 
 local TK = {
