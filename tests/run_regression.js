@@ -110,7 +110,11 @@ function main() {
         try {
           execFileSync(
             luaBin,
-            [VM_OBFUSCATOR, fixturePath, "--out", outPath, "--seed", String(seed), "--strength", String(strength)],
+            // --no-roblox-check: このテストはRoblox環境を持たないstandalone
+            // Luaで実行するため、ROBLOX-FINGERPRINT-HARDENING(非Roblox環境
+            // での意図的な文字列破損)を無効化する。実運用の配布物には
+            // 絶対に付けないこと。
+            [VM_OBFUSCATOR, fixturePath, "--out", outPath, "--seed", String(seed), "--strength", String(strength), "--no-roblox-check"],
             { timeout: 20000, stdio: "pipe" }
           );
         } catch (e) {
