@@ -801,10 +801,20 @@ local function Compiler(lex, parent)
     lex:expect(TK.RBRACE)
   end
 
-  function parseFuncBody()
+  -- BUGFIX: is_method(`function t:method(...)`のコロン定義)の場合、Luaの
+  -- 仕様では暗黙の第1引数 "self" が自動的にパラメータ先頭へ挿入される。
+  -- これまでこの関数は is_method を一切受け取っておらず、常に明示された
+  -- パラメータ名だけで BIND_PARAM していたため、コロン定義のメソッドは
+  -- 呼び出し時に積まれる self 引数ぶん全パラメータが1つずつズレて
+  -- (self→1番目の仮引数名に入り、本来の最後の引数が1個あぶれて捨てられる)
+  -- しまっていた。implicitSelf=true のときだけ params の先頭に "self" を
+  -- 足す(ユーザーが書いた名前は一切変えず、あくまで仮引数リストの先頭に
+  -- 追加するだけ)。
+  function parseFuncBody(implicitSelf)
     local sub=Compiler(lex, self)
     lex:expect(TK.LPAREN)
     local params={}
+    if implicitSelf then params[#params+1]="self" end
     local hasVararg=false
     if not lex:check(TK.RPAREN) then
       if lex:check(TK.DOTS) then lex:next(); hasVararg=true
@@ -1253,14 +1263,25 @@ local function Compiler(lex, parent)
       local fields={}; local is_method=false
       while lex:match(TK.DOT) do fields[#fields+1]=lex:expect(TK.NAME).value end
       if lex:match(TK.COLON) then fields[#fields+1]=lex:expect(TK.NAME).value; is_method=true end
-      local fi=parseFuncBody(); emit(OP.CLOSURE,fi)
+      -- BUGFIX: 以前はここで「先にCLOSUREをpush → 後からテーブルをpush」という
+      -- 順序になっており、SET_FIELD(value,table を pop する命令)が
+      -- value=テーブル、table=クロージャ、という逆順で受け取ってしまい、
+      -- 「関数値にインデックスを付けようとしてエラー」になるバグがあった
+      -- (`function t.method(...) ... end` や `function t:method(...) ... end`
+      -- という、ドット/コロン付きの関数定義文すべてが壊れていた)。
+      -- SET_FIELD は「value→pop, table→pop」の順で読むため、スタックには
+      -- 先にtable側、最後にvalue(クロージャ)を積まなければならない。
+      -- ここでは「テーブル+中間フィールドのGET_FIELD」を先に積んでから、
+      -- parseFuncBody()でクロージャを生成・pushする順序に直す。
       if #fields==0 then
+        local fi=parseFuncBody(is_method); emit(OP.CLOSURE,fi)
         if isLocal(name.value) then emit(OP.SET_LOCAL,addName(name.value))
         else emit(OP.SET_GLOBAL,addName(name.value)) end
       else
         if isLocal(name.value) then emit(OP.PUSH_VAR,addName(name.value))
         else emit(OP.PUSH_GLOBAL,addName(name.value)) end
         for i=1,#fields-1 do emit(OP.GET_FIELD,addName(fields[i])) end
+        local fi=parseFuncBody(is_method); emit(OP.CLOSURE,fi)
         emit(OP.SET_FIELD,addName(fields[#fields]))
       end
     elseif t.type==TK.LOCAL then
