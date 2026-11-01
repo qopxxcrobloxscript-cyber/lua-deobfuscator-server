@@ -1499,7 +1499,13 @@ end
 
 local vUM_resolver, vUM_setup = buildShardedResolver()
 
-local function opc(name) return ne(OP[name]) end
+-- CFF-HARDENING: opc()が呼ばれた順序(=各オペコードハンドラブロックが
+-- lines[]へ出力される順序と1対1)を記録しておく。これにより、後段の
+-- ディスパッチ再構築フェーズで「このブロックがどのOpcodeのハンドラか」を
+-- テキスト解析（数値リテラル抽出）に頼らず正確に特定でき、Opcodeの
+-- 所属バンドに基づいた階層的(ネスト)ディスパッチを安全に構築できる。
+local opcCallOrder = {}
+local function opc(name) opcCallOrder[#opcCallOrder+1]=name; return ne(OP[name]) end
 
 local lines={}; local function L(s) lines[#lines+1]=s end
 
@@ -2050,14 +2056,15 @@ L("end")
 L(("%s()"):format(vEntry))
 L("end)()")
 
--- HARDENING: ディスパッチハンドラの出現順をシャッフルする。
--- DISPATCH_BLOCK_START..DISPATCH_BLOCK_END の範囲には、各オペコードの
--- "if/elseif ... then ... (本体行...)" ブロックが順番に並んでいる。
--- 各ブロックの境界は「行頭が (whitespace) if/elseif <vOP>==<num> then」に
--- マッチする行を新ブロックの開始とみなすことで検出できる。この境界情報だけを
--- 使ってブロック単位に分割し、シャッフルしてから、先頭ブロックだけ"if"に、
--- それ以降を全て"elseif"に統一して書き戻す。ブロック内部の行は一切変更しない
--- ため、各オペコードの実行ロジックは完全に元のまま — 変わるのは並び順だけ。
+-- HARDENING (CFF強化): ディスパッチハンドラを単純な1本のif/elseif鎖で並べる
+-- のではなく、各Opcodeが所属するバンド(band)ごとにグループ化し、
+--   外側: vOPの数値レンジ判定で「どのバンドか」を粗く振り分け (安価なレンジ比較)
+--   内側: バンド内のOpcodeに対してのみ個別の厳密一致判定を行う
+-- という2階層のネスト構造に再構築する。strength(1〜15)に応じてバンド数
+-- (DISPATCH_BAND_COUNT)が増減するため、strengthが高いほど木構造が深く・
+-- 枝分かれが多くなり、CFGの複雑さ(基本ブロック数・分岐数・ネスト深さ)が
+-- 大幅に増加する。各ハンドラ内部の実行ロジック自体は一切変更しないため、
+-- 挙動は完全に保たれる。
 do
   local blockStartPattern = "^%s*e?lseif%s+"..vOP.."=="
   local blockStartPatternIf = "^%s*if%s+"..vOP.."=="
@@ -2080,19 +2087,42 @@ do
   end
   if cur then blocks[#blocks+1]=cur end
 
+  -- 実ブロックの数とopc()呼び出し回数が一致する場合のみ、呼び出し順
+  -- (=opcCallOrder)から各ブロックの実際の比較値(vOP==の右辺、すなわち
+  -- 生のOP[name]、1..MAX_OPの範囲)を正確に求める。
+  -- 注意: ディスパッチ時のvOPは、パック済みバイトコードに埋め込まれた
+  -- シャッフル済みop2c値を vUM(=buildShardedResolver()の逆引き)で
+  -- 復元した「生のOpcode番号」であり、op2c/opBand(バイトコード自体の
+  -- 難読化用)とは別の数値空間である。そのため階層化の範囲分けは
+  -- OP[name](1..MAX_OP)の値そのものを直接使う必要がある。
+  -- 万一呼び出し回数が一致しない場合は安全側に倒し、全ブロックを
+  -- 単一チェーンにまとめる(=従来のフラットな挙動にフォールバックし、
+  -- 壊れた構造を生成しない)。
+  local realCount = #blocks
+  local blockVal = {}
+  local mappingOk = (#opcCallOrder == realCount)
+  if mappingOk then
+    for i=1,realCount do
+      local rawOp = OP[opcCallOrder[i]]
+      if not rawOp then mappingOk=false; break end
+      blockVal[i] = rawOp
+    end
+  end
+
   -- HARDENING: デコイ(実行されない偽)ハンドラブロックを混入する。
-  -- 比較値はMAX_OPの範囲外(実際の命令のarg/opには絶対に現れない値)からランダムに
-  -- 選ぶため、実行時に絶対にマッチせず完全なデッドコードだが、構造的には本物の
-  -- ハンドラと見分けがつかない(同じ "if/elseif <vOP>==<num> then <本体>" の形)。
-  -- 本体は既存のオペコード実装パターンを模した無害などこにも影響しないローカル
-  -- 変数操作にする。
+  -- 比較値は実在するop2c値(c2opに登録済みの値)とも、実在する生Opcode値
+  -- (1..MAX_OP)とも重複しないことを保証した上でランダムに選ぶため、実行時に
+  -- 絶対にマッチせず完全なデッドコードだが、構造的には本物のハンドラと
+  -- 見分けがつかない(同じ "if/elseif <vOP>==<num> then <本体>" の形)。
+  -- 本体は既存のオペコード実装パターンを模した無害などこにも影響しない
+  -- ローカル変数操作にする。
   -- strength(1〜15)に応じてデコイ分岐数をスケーリング（strength=5で従来値(8,16)相当）
   local DECOY_MAX = math.max(8, math.floor(8 + strength*1.6))
   local DECOY_COUNT = math.random(8, DECOY_MAX)
+  local DECOY_BASE = MAX_OP + 1000
   for _=1,DECOY_COUNT do
-    -- Pick a comparison value guaranteed to never equal any real op2c value
-    -- (those are all in 1..MAX_OP after shuffling). Use a random large offset.
-    local decoyVal = MAX_OP + 1000 + math.random(1, 900000)
+    local decoyVal
+    repeat decoyVal = DECOY_BASE + math.random(1, 900000) until not c2op[decoyVal]
     local pattern = math.random(1,4)
     local decoyLines = {}
     local vTmp1, vTmp2, vTmp3 = V(), V(), V()
@@ -2114,49 +2144,100 @@ do
       decoyLines[4] = ("      %s=(%s+%s)%%%s"):format(vTmp3, vTmp1, vTmp2, ne(math.random(2,9)))
     end
     blocks[#blocks+1] = decoyLines
+    blockVal[#blocks] = decoyVal
   end
+  local totalCount = #blocks
 
-  -- Fisher-Yates shuffle of the block order
-  for i=#blocks,2,-1 do
-    local j=math.random(1,i)
-    blocks[i],blocks[j]=blocks[j],blocks[i]
-  end
-
-  -- Rewrite first line of each block: first block in the new order uses "if",
-  -- every other block uses "elseif" — regardless of which opcode it originally
-  -- represented or where it originally sat in the chain.
-  -- IMPORTANT: exactly one block in the whole chain was originally written with
-  -- bare "if" (the first one emitted, PUSH_NIL) and all the rest with "elseif".
-  -- The rewrite must handle a block whose firstLine starts with EITHER keyword,
-  -- since shuffling can place the "if"-originated block anywhere in the new
-  -- order, and can place any "elseif"-originated block into position 1.
-  local rebuilt = {}
-  for bi,block in ipairs(blocks) do
-    local firstLine = block[1]
-    local rewritten
-    if bi==1 then
-      -- Normalize to "if", whether the source line started with "if" or "elseif".
-      rewritten = firstLine:gsub("^(%s*)elseif%s+", "%1if ", 1)
-      if rewritten == firstLine then
-        rewritten = firstLine:gsub("^(%s*)if%s+", "%1if ", 1)
-      end
-    else
-      -- Normalize to "elseif", whether the source line started with "if" or "elseif".
-      rewritten = firstLine:gsub("^(%s*)elseif%s+", "%1elseif ", 1)
-      if rewritten == firstLine then
-        rewritten = firstLine:gsub("^(%s*)if%s+", "%1elseif ", 1)
-      end
+  -- HARDENING (CFF強化・階層ディスパッチ): vOPの値空間を、実Opcodeが
+  -- 占める [1, MAX_OP] の範囲でTIER_COUNT個の連続した数値レンジへ分割し、
+  -- デコイが占める [DECOY_BASE+1, ...] の範囲をもう1つの専用レンジとして
+  -- 加える。各ブロックは自身の実際の比較値(blockVal)がどのレンジに
+  -- 収まるかで一意に、かつ常に正しく振り分けられる(値そのもので判定する
+  -- ため、シャッフル・デコイ混入があっても経路は数学的に保証される)。
+  -- strength(1〜15)に応じてTIER_COUNTを増やし、ネストの深さ・外側の
+  -- レンジ判定の分岐数を増加させる(strength=1で1=実質フラット、
+  -- strength=15で最大6分割)。
+  local TIER_COUNT = math.min(6, math.max(1, math.floor(1 + (strength-1)/3)))
+  local tierSize = math.ceil(MAX_OP / TIER_COUNT)
+  local function tierOf(val)
+    if val <= MAX_OP then
+      local t = math.ceil(val / tierSize)
+      if t<1 then t=1 elseif t>TIER_COUNT then t=TIER_COUNT end
+      return t
     end
-    rebuilt[#rebuilt+1]=rewritten
-    for k=2,#block do rebuilt[#rebuilt+1]=block[k] end
+    return TIER_COUNT + 1 -- デコイ専用レンジ
+  end
+  local tiers = {}
+  for t=1,TIER_COUNT+1 do tiers[t] = {} end
+  for i=1,totalCount do
+    local t = mappingOk and tierOf(blockVal[i]) or 1
+    local lst = tiers[t]
+    lst[#lst+1] = blocks[i]
   end
 
-  -- Splice the shuffled+rewritten lines back into the original `lines` array
-  -- in place of the original DISPATCH_BLOCK_START..DISPATCH_BLOCK_END range.
+  -- ブロック先頭行を "if" / "elseif" に正規化するヘルパー。元の行がどちらの
+  -- キーワードで書かれていても対応する(シャッフルで任意の位置に来るため)。
+  local function normalizeHead(firstLine, isFirst)
+    local kw = isFirst and "if " or "elseif "
+    local rewritten = firstLine:gsub("^(%s*)elseif%s+", "%1"..kw, 1)
+    if rewritten == firstLine then
+      rewritten = firstLine:gsub("^(%s*)if%s+", "%1"..kw, 1)
+    end
+    return rewritten
+  end
+
+  -- 各ティア内をシャッフルし、内側のif/elseif鎖を個別に組み立てる
+  local tierChainLines = {}
+  local activeTiers = {}
+  local lastTierIndex = mappingOk and (TIER_COUNT+1) or 1
+  for t=1,lastTierIndex do
+    local lst = tiers[t]
+    if #lst>0 then
+      for i=#lst,2,-1 do local j=math.random(1,i); lst[i],lst[j]=lst[j],lst[i] end
+      local inner = {}
+      for bi,block in ipairs(lst) do
+        inner[#inner+1] = normalizeHead(block[1], bi==1)
+        for k=2,#block do inner[#inner+1]=block[k] end
+      end
+      inner[#inner+1] = "      end"
+      tierChainLines[t] = inner
+      activeTiers[#activeTiers+1] = t
+    end
+  end
+
+  -- ティアを巡回する外側ゲートを安価なレンジ判定で構築する。tierOf()で
+  -- 使った境界(tierSize刻み)と完全に同じ式を使うことで、各ブロックの実際の
+  -- 比較値(blockVal)が必ずどれか1つのティアのレンジに収まることを保証する。
+  -- マッピングに失敗した場合(mappingOk=false)は安全側に倒し、1つの巨大な
+  -- レンジでラップするだけにする(=従来のフラットな挙動と等価)。
+  local outer = {}
+  for idx,t in ipairs(activeTiers) do
+    local lo, hi
+    if not mappingOk then
+      lo, hi = 1, 999999999
+    elseif t <= TIER_COUNT then
+      lo, hi = (t-1)*tierSize+1, t*tierSize
+    else
+      lo, hi = DECOY_BASE+1, 999999999 -- デコイ専用レンジ
+    end
+    local kw = (idx==1) and "    if " or "    elseif "
+    outer[#outer+1] = ("%s%s>=%s and %s<=%s then"):format(kw, vOP, ne(lo), vOP, ne(hi))
+    for _,ln in ipairs(tierChainLines[t]) do outer[#outer+1]=ln end
+  end
+  -- VM Coreハードニング: 未定義Opcode検出。どのティアにも一致しない値が
+  -- 来た場合は、意味不明な状態で実行を継続させず安全に停止する。
+  outer[#outer+1] = "    else"
+  outer[#outer+1] = "      error(\"VM: invalid opcode\")"
+  outer[#outer+1] = "    end"
+
+  -- Splice the rebuilt nested dispatch back into the original `lines` array,
+  -- replacing DISPATCH_BLOCK_START..(DISPATCH_BLOCK_END+1): the "+1" absorbs
+  -- the original flat chain's closing "    end" (index DISPATCH_BLOCK_END+1),
+  -- since the new nested structure supplies its own closing "end" lines.
   local newLines = {}
   for i=1,DISPATCH_BLOCK_START-1 do newLines[#newLines+1]=lines[i] end
-  for _,ln in ipairs(rebuilt) do newLines[#newLines+1]=ln end
-  for i=DISPATCH_BLOCK_END+1,#lines do newLines[#newLines+1]=lines[i] end
+  for _,ln in ipairs(outer) do newLines[#newLines+1]=ln end
+  for i=DISPATCH_BLOCK_END+2,#lines do newLines[#newLines+1]=lines[i] end
   lines = newLines
 
 end
