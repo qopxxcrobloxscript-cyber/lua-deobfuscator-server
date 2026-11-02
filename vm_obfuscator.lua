@@ -371,6 +371,13 @@ end
 
 local TK = {
   NUMBER="NUMBER", STRING="STRING", NAME="NAME", EOF="EOF",
+  -- BUGFIX: LuauのcontinueはRoblox/Luauスクリプトで非常によく使われる
+  -- ループ制御構文だが、これまでキーワードとして一切認識されておらず、
+  -- 単なる識別子(NAME)としてパースされていた。`if ... then continue end`
+  -- のような文は「式文として continue を読み、次にENDが来て構文エラー」
+  -- になるか、最悪の場合パーサーの読み取り位置がズレて以降の関数定義が
+  -- 軒並み壊れる原因になっていた。break文と同様の専用トークンとして追加する。
+  CONTINUE="continue",
   AND="and",BREAK="break",DO="do",ELSE="else",ELSEIF="elseif",
   END="end",FALSE="false",FOR="for",FUNCTION="function",GOTO="goto",
   IF="if",IN="in",LOCAL="local",NIL="nil",NOT="not",
@@ -390,7 +397,7 @@ local TK = {
   DSLASHEQ="//=",PERCENTEQ="%=",CARETEQ="^=",CONCATEQ="..=",
 }
 local KEYWORDS={}
-for _,k in ipairs({"and","break","do","else","elseif","end","false","for",
+for _,k in ipairs({"and","break","continue","do","else","elseif","end","false","for",
   "function","goto","if","in","local","nil","not","or","repeat","return",
   "then","true","until","while"}) do KEYWORDS[k]=k end
 
@@ -631,6 +638,12 @@ local function Compiler(lex, parent)
   -- ループ開始時にbreakStackへ新しいリストをpushし、break文はそこへジャンプ命令の
   -- インデックスを記録、ループ終了時にそれら全てをループの外側へpatchする。
   self.breakStack={}
+  -- continueStack: breakStackと同じ構造(入れ子ループごとに未解決ジャンプの
+  -- リストをpush)。ただしbreakが「ループの外(終端)」へ飛ぶのに対し、
+  -- continueは「ループの再判定/増分部分(while:条件再評価, 数値for/generic
+  -- for:FORLOOP直前, repeat:until式の直前)」へ飛ぶため、ジャンプ先は
+  -- ループの種類ごとに別々に計算してpatchする。
+  self.continueStack={}
 
   local function emit(op,arg) self.code[#self.code+1]={op=op,arg=arg or 0}; return #self.code end
   local function patch(i,v) self.code[i].arg=v end
@@ -1179,12 +1192,16 @@ local function Compiler(lex, parent)
       local jf=emit(OP.JMP_FALSE,0)
       lex:expect(TK.DO)
       self.breakStack[#self.breakStack+1]={}
+      self.continueStack[#self.continueStack+1]={}
       pushScope(); parseBlock(); popScope()
       lex:expect(TK.END)
       emit(OP.JMP, ls-here()-1)
       patch(jf,here()-jf)
       local bl=table.remove(self.breakStack)
       for _,bi in ipairs(bl) do patch(bi, here()-bi) end
+      -- continue(while): 条件の再評価(ls)へ戻ればよい
+      local cl=table.remove(self.continueStack)
+      for _,ci in ipairs(cl) do patch(ci, ls-ci) end
     elseif t.type==TK.DO then
       lex:next(); pushScope(); parseBlock(); popScope(); lex:expect(TK.END)
     elseif t.type==TK.FOR then
@@ -1205,13 +1222,20 @@ local function Compiler(lex, parent)
         -- 範囲(=毎周実行される範囲)に含める。
         local lb=here()
         self.breakStack[#self.breakStack+1]={}
+        self.continueStack[#self.continueStack+1]={}
         pushScope()
         emit(OP.BIND_FORVAR, addName(var.value))
         parseBlock(); popScope(); lex:expect(TK.END)
+        -- continue(数値for): 増分・ループ判定を行うFORLOOP命令自体へ飛ばす
+        -- (ここを飛ばすとFORLOOPが来るはずの位置へ戻ってしまい増分が
+        -- 行われなくなるため、必ずFORLOOP命令そのものをジャンプ先にする)
+        local contTarget=here()
         emit(OP.FORLOOP, lb-here()-1)
         patch(fp,here()-fp)
         local bl=table.remove(self.breakStack)
         for _,bi in ipairs(bl) do patch(bi, here()-bi) end
+        local cl=table.remove(self.continueStack)
+        for _,ci in ipairs(cl) do patch(ci, contTarget-ci) end
       else
         local names={var.value}
         while lex:match(TK.COMMA) do names[#names+1]=lex:expect(TK.NAME).value end
@@ -1240,23 +1264,35 @@ local function Compiler(lex, parent)
         -- (数値forと同じ理由: 初回しかENTER_SCOPEが走らないとスコープが枯渇する)。
         local lb=here()
         self.breakStack[#self.breakStack+1]={}
+        self.continueStack[#self.continueStack+1]={}
         pushScope()
         for _,n in ipairs(names) do emit(OP.BIND_GFORVARS, addName(n)) end
         parseBlock(); popScope(); lex:expect(TK.END)
+        -- continue(generic for): イテレータを進めるGFORLOOP命令自体へ飛ばす
+        local contTarget=here()
         emit(OP.GFORLOOP, lb-here()-1)
         patch(gfp,here()-gfp)
         local bl=table.remove(self.breakStack)
         for _,bi in ipairs(bl) do patch(bi, here()-bi) end
+        local cl=table.remove(self.continueStack)
+        for _,ci in ipairs(cl) do patch(ci, contTarget-ci) end
       end
     elseif t.type==TK.REPEAT then
       lex:next()
       local ls=here()
       self.breakStack[#self.breakStack+1]={}
+      self.continueStack[#self.continueStack+1]={}
       pushScope(); parseBlock()
+      -- continue(repeat/until): Luau仕様上、本体内のローカル変数は
+      -- until式からも参照できるため、ループ先頭(ls)まで戻すのではなく
+      -- 「until式の評価そのもの」へ飛ばす(ここ=until式の直前)。
+      local contTarget=here()
       lex:expect(TK.UNTIL); parseExpr(); popScope()
       emit(OP.JMP_FALSE, ls-here()-1)
       local bl=table.remove(self.breakStack)
       for _,bi in ipairs(bl) do patch(bi, here()-bi) end
+      local cl=table.remove(self.continueStack)
+      for _,ci in ipairs(cl) do patch(ci, contTarget-ci) end
     elseif t.type==TK.FUNCTION then
       lex:next()
       local name=lex:expect(TK.NAME)
@@ -1334,6 +1370,11 @@ local function Compiler(lex, parent)
       local bi=emit(OP.JMP,0)
       local bl=self.breakStack[#self.breakStack]
       if bl then bl[#bl+1]=bi end
+    elseif t.type==TK.CONTINUE then
+      lex:next()
+      local ci=emit(OP.JMP,0)
+      local cl=self.continueStack[#self.continueStack]
+      if cl then cl[#cl+1]=ci end
     elseif t.type==TK.GOTO then
       lex:next(); lex:next()
     elseif t.type==TK.DCOLON then
