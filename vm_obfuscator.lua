@@ -2052,7 +2052,14 @@ local function top_expr() return ("%s[#%s]"):format(vST,vST) end
 
 local DISPATCH_BLOCK_START = #lines + 1
 
-L(("    if %s==%s then %s"):format(vOP,opc("PUSH_NIL"),push_expr("nil")))
+-- BUGFIX: t[#t+1]=nil はLuaの仕様上「何もしない」(配列長が伸びない)ため、
+-- PUSH_NILがスタックに何も積まずに素通りしてしまい、`local x = nil`や
+-- `return nil, nil`のような「明示的にnilを積む」コードでスタックが1個
+-- ズレて以降の処理が全て壊れるバグがあった。他の全てのnil生成箇所
+-- (ADJUST/CALL_MULTI/可変長引数など)は既に番兵値(vNILSENT)を使うよう
+-- 修正済みだったが、最も基本的なPUSH_NIL自体だけが素のnilのままになって
+-- いたので、ここも番兵値を積むように統一する。
+L(("    if %s==%s then %s"):format(vOP,opc("PUSH_NIL"),push_expr(vNILSENT)))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_TRUE"),push_expr("true")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_FALSE"),push_expr("false")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("PUSH_NUM"),push_expr("_K["..vAR.."]")))
@@ -2072,10 +2079,16 @@ L(("    elseif %s==%s then local _vn=#%s; %s={n=_vn}; for _vi=1,_vn do %s[_vi]=%
 -- 後続のPUSH/CALL命令のスタック位置がズレる。
 L(("    elseif %s==%s then local %s=table.remove(%s,1);%s(_N[%s],%s)"):format(
   vOP,opc("BIND_PARAM"),"_bp",vST,vSET_L,vAR,"_bp"))
+-- BUGFIX: 変数(ローカル/アップバリュー)やグローバルの値が実際にnilで
+-- あることは普通にあり得る(未代入のローカル、存在しないグローバル、
+-- 意図的にnilを代入した変数など)。それをそのままpush_expr()で積むと、
+-- PUSH_NILと全く同じ理由(t[#t+1]=nilは何もしない)でスタックが1個
+-- ズレて以降の処理が壊れる。読み出した値が実際にnilかどうかをその場で
+-- 判定し、nilなら番兵値を積む。
 local vv1=V()
-L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr(vv1)))
+L(("    elseif %s==%s then local %s=%s(_N[%s]);%s"):format(vOP,opc("PUSH_VAR"),vv1,vGET_L,vAR,push_expr("("..vv1.."==nil and "..vNILSENT.." or "..vv1..")")))
 local vv2=V()
-L(("    elseif %s==%s then local %s=%s[_N[%s]];%s"):format(vOP,opc("PUSH_GLOBAL"),vv2,vEN,vAR,push_expr(vv2)))
+L(("    elseif %s==%s then local %s=%s[_N[%s]];%s"):format(vOP,opc("PUSH_GLOBAL"),vv2,vEN,vAR,push_expr("("..vv2.."==nil and "..vNILSENT.." or "..vv2..")")))
 L(("    elseif %s==%s then %s"):format(vOP,opc("POP"),pop_expr()))
 local vv3=V()
 L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc("DUP"),vv3,top_expr(),push_expr(vv3)))
@@ -2095,13 +2108,18 @@ L(("    elseif %s==%s then local %s=%s;%s[_N[%s]]=%s"):format(vOP,opc("SET_GLOBA
 local vdl=V()
 L(("    elseif %s==%s then local %s=%s;%s[#%s][_N[%s]]=%s"):format(vOP,opc("DEF_LOCAL"),vdl,pop_expr(),vSCOPE,vSCOPE,vAR,vdl))
 L(("    elseif %s==%s then %s"):format(vOP,opc("NEW_TABLE"),push_expr("{}")))
-local vgt_k=V(); local vgt_t=V()
-L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(vOP,opc("GET_TABLE"),vgt_k,pop_expr(),vgt_t,pop_expr(),push_expr(vgt_t.."["..vgt_k.."]")))
+-- BUGFIX: テーブルのフィールドが存在しない/明示的にnil、というのは
+-- 現実のコードでは日常的に起こる(例: Config.something が未設定、
+-- instance:FindFirstChild(...)が見つからない等)。読み出した値が
+-- nilならPUSH_VAR/PUSH_GLOBALと同じ理由でスタックが壊れるため、
+-- 番兵値でガードする。
+local vgt_k=V(); local vgt_t=V(); local vgt_v=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s;local %s=%s;%s"):format(vOP,opc("GET_TABLE"),vgt_k,pop_expr(),vgt_t,pop_expr(),vgt_v,vgt_t.."["..vgt_k.."]",push_expr("("..vgt_v.."==nil and "..vNILSENT.." or "..vgt_v..")")))
 local vst_v=V(); local vst_k=V(); local vst_t=V()
 L(("    elseif %s==%s then local %s=%s;local %s=%s;local %s=%s;%s[%s]=%s"):format(
   vOP,opc("SET_TABLE"),vst_v,pop_expr(),vst_k,pop_expr(),vst_t,pop_expr(),vst_t,vst_k,vst_v))
-local vgf_t=V()
-L(("    elseif %s==%s then local %s=%s;%s"):format(vOP,opc("GET_FIELD"),vgf_t,pop_expr(),push_expr(vgf_t.."[_N["..vAR.."]]")))
+local vgf_t=V(); local vgf_v=V()
+L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(vOP,opc("GET_FIELD"),vgf_t,pop_expr(),vgf_v,vgf_t.."[_N["..vAR.."]]",push_expr("("..vgf_v.."==nil and "..vNILSENT.." or "..vgf_v..")")))
 local vsf_v=V(); local vsf_t=V()
 L(("    elseif %s==%s then local %s=%s;local %s=%s;%s[_N[%s]]=%s"):format(
   vOP,opc("SET_FIELD"),vsf_v,pop_expr(),vsf_t,pop_expr(),vsf_t,vAR,vsf_v))
@@ -2201,7 +2219,10 @@ L(("      local %s=_pack(%s(_unpack(%s)))"):format(vres,vfn,vargs))
 -- このVMは「1つの式=1つのスタック値」という前提で命令のarg(個数)を決めているため、
 -- 呼び出し結果は常に先頭の戻り値1個だけをpushする(Luaの「非末尾式は1値に切り詰め」
 -- 仕様に相当)。複数戻り値をそのまま使いたい場合(a,b=f() 等)は別途対応が必要。
-L(("      %s"):format(push_expr(vres.."[1]")))
+-- BUGFIX: 呼び出した関数の戻り値がnilであることは普通にある(例: pcallの
+-- 結果、FindFirstChild系のラッパー関数など)。vres[1]が実際にnilの場合、
+-- 他のpush箇所と同じ理由でスタックが壊れるため番兵値でガードする。
+L(("      %s"):format(push_expr("("..vres.."[1]==nil and "..vNILSENT.." or "..vres.."[1])")))
 
 -- FIX: CALL_MULTI — CALLと同じ呼び出し処理だが、戻り値をすべてpushする。
 -- generic forの `in` 節 (例: in ipairs(t) do) のように、Lua仕様で多値展開が
@@ -2256,7 +2277,8 @@ L(("      local %s=%s"):format(vcvtfixed,vAR))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti,vcvtfixed,vcvtv,pop_expr()))
 L(("      local %s=%s"):format(vcvtfn,pop_expr()))
 L(("      local %s=_pack(%s(_unpack(%s)))"):format(vcvtres,vcvtfn,vcvtv))
-L(("      %s"):format(push_expr(vcvtres.."[1]")))
+-- BUGFIX: CALLの単一結果pushと同じ理由でnilガードが必要。
+L(("      %s"):format(push_expr("("..vcvtres.."[1]==nil and "..vNILSENT.." or "..vcvtres.."[1])")))
 
 -- FIX: CALL_VARARG_TAIL_MULTI — CALL_VARARG_TAILと同じ引数収集ロジックだが、
 -- この呼び出し自体がさらに外側の呼び出しの末尾可変引数として使われる場合
