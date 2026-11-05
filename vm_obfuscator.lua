@@ -2193,12 +2193,25 @@ end
 cmp("EQ","=="); cmp("NEQ","~="); cmp("LT","<"); cmp("GT",">");
 cmp("LEQ","<="); cmp("GEQ",">=")
 
+-- BUGFIX: and/or の短絡評価は、左辺の値を「真偽判定」する必要がある。
+-- 左辺がnil(=番兵値として積まれている)の場合、番兵値はただのtableで
+-- 真(truthy)なので、素の `if not X` / `if X` ではnilを誤って真と
+-- 判定してしまい、`nil and ...` が右辺を評価してしまったり
+-- `nil or ...` が右辺を評価しなかったりする(Luaの仕様では逆でなければ
+-- ならない)。番兵値も偽として扱うよう判定条件に加える。
+-- BUGFIX(二重push): top_expr()はスタックtopを「覗くだけ」でpopしない。
+-- ジャンプする側の分岐で push_expr(vajmp) してしまうと、元々あった値は
+-- まだスタックに残ったままなので、同じ値がもう1個余計に積まれて
+-- ネットで1個スタックが伸びてしまう(= このand/or式の後に残骸が1個
+-- 残り続け、以降の命令のスタック計算がすべて1個ズレる)。ジャンプする
+-- 側は何もせず(値は既にそこにある)、ジャンプしない側だけpopして
+-- 右辺の評価に進む、が正しい。
 local vajmp=V()
-L(("    elseif %s==%s then local %s=%s;if not %s then %s=%s+%s;%s else %s end"):format(
-  vOP,opc("AND_JMP"),vajmp,top_expr(),vajmp,vPC,vPC,vAR,push_expr(vajmp),pop_expr()))
+L(("    elseif %s==%s then local %s=%s;if %s==nil or %s==false or %s==%s then %s=%s+%s else %s end"):format(
+  vOP,opc("AND_JMP"),vajmp,top_expr(),vajmp,vajmp,vajmp,vNILSENT,vPC,vPC,vAR,pop_expr()))
 local vojmp=V()
-L(("    elseif %s==%s then local %s=%s;if %s then %s=%s+%s;%s else %s end"):format(
-  vOP,opc("OR_JMP"),vojmp,top_expr(),vojmp,vPC,vPC,vAR,push_expr(vojmp),pop_expr()))
+L(("    elseif %s==%s then local %s=%s;if %s~=nil and %s~=false and %s~=%s then %s=%s+%s else %s end"):format(
+  vOP,opc("OR_JMP"),vojmp,top_expr(),vojmp,vojmp,vojmp,vNILSENT,vPC,vPC,vAR,pop_expr()))
 L(("    elseif %s==%s then %s=%s+%s"):format(vOP,opc("JMP"),vPC,vPC,vAR))
 local vjf=V()
 L(("    elseif %s==%s then local %s=%s;if not %s then %s=%s+%s end"):format(
@@ -2212,7 +2225,11 @@ L(("    elseif %s==%s then"):format(vOP,opc("CALL")))
 L(("      local %s={}"):format(vargs))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vci,vAR,vargs,pop_expr()))
 L(("      local %s=%s"):format(vfn,pop_expr()))
-L(("      local %s=_pack(%s(_unpack(%s)))"):format(vres,vfn,vargs))
+-- BUGFIX: _unpack(t)は既定で#tを使うため、引数にnilが含まれていると
+-- (例: f(a, nil, b))、そこで長さが打ち切られて以降の引数が実際の関数
+-- 呼び出しに渡らなくなる(RETURN命令で既に修正済みだったのと同じ問題)。
+-- 引数の個数はこの命令のarg(AR)として既知なので明示的に範囲指定する。
+L(("      local %s=_pack(%s(_unpack(%s,1,%s)))"):format(vres,vfn,vargs,vAR))
 -- FIX: 呼び出し結果を複数値そのままpushしていたため、CALLの結果を式の途中で
 -- 使う場合(例: print(ipairs(t)) の内側呼び出し)に、外側の命令のnargsカウントと
 -- 実際に積まれた値の数がズレてスタックが崩壊するバグがあった。
@@ -2232,7 +2249,8 @@ L(("    elseif %s==%s then"):format(vOP,opc("CALL_MULTI")))
 L(("      local %s={}"):format(vargs2))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vci2,vAR,vargs2,pop_expr()))
 L(("      local %s=%s"):format(vfn2,pop_expr()))
-L(("      local %s=_pack(%s(_unpack(%s)))"):format(vres2,vfn2,vargs2))
+-- BUGFIX: CALLと同じ理由でunpackの範囲を明示する。
+L(("      local %s=_pack(%s(_unpack(%s,1,%s)))"):format(vres2,vfn2,vargs2,vAR))
 -- FIX: 戻り値にnilが含まれていても正しくpushできるよう、nilの代わりに番兵値を積む。
 L(("      for %s=1,%s.n do local _v=%s[%s]; %s end"):format(
   vci2,vres2,vres2,vci2, push_expr("(_v==nil and "..vNILSENT.." or _v)")))
@@ -2276,7 +2294,9 @@ L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti,vLASTMULTI,vcv
 L(("      local %s=%s"):format(vcvtfixed,vAR))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti,vcvtfixed,vcvtv,pop_expr()))
 L(("      local %s=%s"):format(vcvtfn,pop_expr()))
-L(("      local %s=_pack(%s(_unpack(%s)))"):format(vcvtres,vcvtfn,vcvtv))
+-- BUGFIX: 同じくnilを含む引数リストの打ち切り対策。総個数は
+-- vLASTMULTI(末尾呼び出しが実際に返した個数)+vcvtfixed(固定引数の個数)。
+L(("      local %s=_pack(%s(_unpack(%s,1,%s+%s)))"):format(vcvtres,vcvtfn,vcvtv,vLASTMULTI,vcvtfixed))
 -- BUGFIX: CALLの単一結果pushと同じ理由でnilガードが必要。
 L(("      %s"):format(push_expr("("..vcvtres.."[1]==nil and "..vNILSENT.." or "..vcvtres.."[1])")))
 
@@ -2293,7 +2313,8 @@ L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti2,vLASTMULTI,vc
 L(("      local %s=%s"):format(vcvtfixed2,vAR))
 L(("      for %s=1,%s do table.insert(%s,1,%s) end"):format(vcvti2,vcvtfixed2,vcvtv2,pop_expr()))
 L(("      local %s=%s"):format(vcvtfn2,pop_expr()))
-L(("      local %s=_pack(%s(_unpack(%s)))"):format(vcvtres2,vcvtfn2,vcvtv2))
+-- BUGFIX: CALL_VARARG_TAILと同じ理由でunpackの範囲を明示する。
+L(("      local %s=_pack(%s(_unpack(%s,1,%s+%s)))"):format(vcvtres2,vcvtfn2,vcvtv2,vLASTMULTI,vcvtfixed2))
 L(("      for %s=1,%s.n do %s end"):format(vcvti2,vcvtres2,push_expr("(function() local _v="..vcvtres2.."["..vcvti2.."]; return (_v==nil and "..vNILSENT.." or _v) end)()")))
 L(("      %s=%s.n"):format(vLASTMULTI,vcvtres2))
 
@@ -2309,7 +2330,13 @@ L(("      local %s=%s"):format(vcenv,vEN))
 --  ようにするため)
 L(("      local %s={}"):format("_capScope"))
 L(("      for _csi=1,#%s do %s[_csi]=%s[_csi] end"):format(vSCOPE,"_capScope",vSCOPE))
-L(("      %s"):format(push_expr("(function(...) local _fa={...}; local _cs={}; for _i=1,#_capScope do _cs[_i]=_capScope[_i] end; return "..vVM.."("..vcls..",_fa,"..vcenv..",_cs) end)")))
+-- BUGFIX: `local _fa={...}` は可変長引数の途中にnilがあると(例:
+-- f(1, nil, 3))そこから先の個数が#演算子で正しく取れなくなり、BIND_PARAM
+-- (table.remove(ST,1)で1個ずつ取り出す)が壊れる。select('#',...)で
+-- 本当の引数個数を取ってから、その範囲内のnilだけ番兵値に置き換えて
+-- VM内部スタック(=この関数の初期ST)を構築する。
+L(("      %s"):format(push_expr(
+  "(function(...) local _an=select('#',...); local _araw={...}; local _fa={}; for _ai=1,_an do local _av=_araw[_ai]; _fa[_ai]=(_av==nil and "..vNILSENT.." or _av) end; local _cs={}; for _i=1,#_capScope do _cs[_i]=_capScope[_i] end; return "..vVM.."("..vcls..",_fa,"..vcenv..",_cs) end)")))
 
 L(("    elseif %s==%s then %s[#%s+1]={}"):format(vOP,opc("ENTER_SCOPE"),vSCOPE,vSCOPE))
 L(("    elseif %s==%s then %s[#%s]=nil"):format(vOP,opc("LEAVE_SCOPE"),vSCOPE,vSCOPE))
