@@ -1013,9 +1013,39 @@ local function Compiler(lex, parent)
                 emit(OP.CALL,na)
               end
             elseif q.type==TK.DOT then
-              lex:next(); local f=lex:expect(TK.NAME); emit(OP.GET_FIELD,addName(f.value))
+              lex:next(); local f=lex:expect(TK.NAME)
+              -- BUGFIX: 呼び出し式の後ろにさらに `.field = value` と続く形
+              -- (例: `getgenv().request = hookedRequest`, `getrenv().x = y`)
+              -- は、関数呼び出しの戻り値のテーブルへフィールドを代入する、
+              -- ごく普通の(かつRobloxスクリプトで多用される)構文だが、
+              -- これまでここに到達した時点で常にGET_FIELDを発行して
+              -- 「この文字列は式文であって代入対象ではない」として
+              -- 呼び出し元へnilを返しており、直後に"="が来ると
+              -- その"="も右辺も一切消費されないまま親のパーサーへ戻って
+              -- しまい、"expected 'end' got '='"のような構文エラーに
+              -- なっていた。ここがこのフィールドアクセスの「最後」で、
+              -- かつ直後が"="(複合代入"=="ではない単純な代入)であれば、
+              -- GET_FIELDではなくSET_FIELDとして処理する。
+              if lex:peek().type==TK.ASSIGN then
+                lex:next() -- consume '='
+                parseExpr()
+                emit(OP.SET_FIELD,addName(f.value))
+                return "handled"
+              end
+              emit(OP.GET_FIELD,addName(f.value))
             elseif q.type==TK.LBRACKET then
-              lex:next(); parseExpr(); lex:expect(TK.RBRACKET); emit(OP.GET_TABLE)
+              lex:next(); parseExpr(); lex:expect(TK.RBRACKET)
+              -- BUGFIX: 同上。`getgenv()["request"] = value` のような形。
+              -- ここでのparseExpr()はキー式であり、まだGET_TABLE/SET_TABLEの
+              -- どちらにも使われていない状態(スタックは[container, key])
+              -- なので、"="が続くならそのままSET_TABLEへ渡せる。
+              if lex:peek().type==TK.ASSIGN then
+                lex:next()
+                parseExpr()
+                emit(OP.SET_TABLE)
+                return "handled"
+              end
+              emit(OP.GET_TABLE)
             else break end
           end
           return nil
@@ -1024,6 +1054,14 @@ local function Compiler(lex, parent)
       return base
     end
     local first=parseLhsOne()
+    -- BUGFIX: parseLhsOne()は`getgenv().field = value`のような
+    -- 「呼び出し式の後に続くフィールド/添字への単純代入」を検出した場合、
+    -- その場で"="以降(右辺・SET_FIELD/SET_TABLE)まで全部消費・発行して
+    -- 文字列"handled"を返す。この場合は既に文全体が完結しているので、
+    -- (nilの場合のようにPOPを発行したり、この下の複合代入/複数代入/
+    -- 通常代入の処理に進んで既に消費済みの"="をもう一度探しに行ったり
+    -- せず)ここで即座に抜ける。
+    if first=="handled" then return end
     if first==nil then emit(OP.POP); return end
     lhs[1]=first
 
